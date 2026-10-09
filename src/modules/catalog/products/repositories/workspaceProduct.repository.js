@@ -103,29 +103,6 @@ const getWorkspaceProducts = async (
     }
   }
 
-  if (filters.branchId) {
-    if (!mongoose.Types.ObjectId.isValid(filters.branchId)) {
-      query._id = { $in: [] };
-    } else {
-      const [facilityProducts, batchProducts] = await Promise.all([
-        ProductFacility.distinct("product_id", {
-          workspaceId,
-          facility_id: filters.branchId,
-          isDeleted: false,
-        }),
-        Batch.distinct("product", {
-          workspaceId,
-          branch_id: filters.branchId,
-          isDeleted: false,
-        }),
-      ]);
-      const branchProducts = new Set([
-        ...facilityProducts.map(String),
-        ...batchProducts.map(String),
-      ]);
-      query._id = { $in: [...branchProducts] };
-    }
-  }
 
   const page = Math.max(1, parseInt(options.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(options.limit) || 20));
