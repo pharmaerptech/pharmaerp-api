@@ -75,6 +75,49 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
     query.branchId = new mongoose.Types.ObjectId(filters.branchId);
   }
 
+  if (filters.status && filters.status !== "all") {
+    query.status = filters.status;
+  }
+
+  if (filters.paymentMethod && filters.paymentMethod !== "all") {
+    query.paymentMethod = filters.paymentMethod;
+  }
+
+  if (filters.startDate || filters.endDate) {
+    query.date = {};
+    if (filters.startDate) {
+      query.date.$gte = new Date(filters.startDate);
+    }
+    if (filters.endDate) {
+      const end = new Date(filters.endDate);
+      end.setHours(23, 59, 59, 999);
+      query.date.$lte = end;
+    }
+  }
+
+  if (filters.searchQuery) {
+    const rawSearch = filters.searchQuery.trim();
+    // Lookup matching customers
+    const matchingCustomers = await mongoose.model('Customer').find({
+      companyId: new mongoose.Types.ObjectId(companyId),
+      $or: [
+        { name: { $regex: rawSearch, $options: "i" } },
+        { mobile: { $regex: rawSearch, $options: "i" } },
+        { alternateMobile: { $regex: rawSearch, $options: "i" } }
+      ]
+    }).select('_id').lean();
+    
+    const customerIds = matchingCustomers.map(c => c._id);
+
+    query.$or = [
+      { invoiceNo: { $regex: rawSearch, $options: "i" } },
+    ];
+    
+    if (customerIds.length > 0) {
+      query.$or.push({ customerId: { $in: customerIds } });
+    }
+  }
+
   const [invoices, total] = await Promise.all([
     SalesInvoice.find(query).populate("customerId", "name mobile alternateMobile").sort({ date: -1 }).skip(skip).limit(limit).lean(),
     SalesInvoice.countDocuments(query),

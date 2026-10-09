@@ -871,11 +871,11 @@ const getCustomerSales = async (customerId, companyId, workspaceId, branchId = n
   };
 };
 
-const getAllCustomerSales = async (companyId, workspaceId, branchId = null, pagination = {}) => {
+const getAllCustomerSales = async (companyId, workspaceId, filters = {}, pagination = {}) => {
   const result = await invoiceRepository.getAllInvoices(
     companyId,
     workspaceId,
-    { branchId },
+    filters,
     pagination
   );
 

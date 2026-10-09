@@ -11,7 +11,7 @@ import {
 
 const router = Router();
 
-// Middleware chain for dashboard overview
+// Middleware chain for dashboard overview.
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);

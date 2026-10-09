@@ -10,7 +10,11 @@ import { WORKSPACE_PRODUCT_STATUS } from "../constants/workspaceProduct.constant
 // Finders
 // ---------------------
 
-const findWorkspaceProductById = async (productId, workspaceId, options = {}) => {
+const findWorkspaceProductById = async (
+  productId,
+  workspaceId,
+  options = {},
+) => {
   if (!mongoose.Types.ObjectId.isValid(productId)) {
     return null;
   }
@@ -23,7 +27,10 @@ const findWorkspaceProductById = async (productId, workspaceId, options = {}) =>
     .populate("HsnMaster", "code description gstRate cessRate isActive")
     .populate("manufacturer", "name description isActive")
     .populate("uom", "name abbreviation description isActive")
-    .populate("category", "name slug parentCategory level description imageUrl isActive")
+    .populate(
+      "category",
+      "name slug parentCategory level description imageUrl isActive",
+    )
     .populate("productForm", "name description isActive")
     .populate("composition.salt", "name description isActive")
     .select(options.select || "");
@@ -42,7 +49,10 @@ const findWorkspaceProductByCode = async (
     .populate("HsnMaster", "code description gstRate cessRate isActive")
     .populate("manufacturer", "name description isActive")
     .populate("uom", "name abbreviation description isActive")
-    .populate("category", "name slug parentCategory level description imageUrl isActive")
+    .populate(
+      "category",
+      "name slug parentCategory level description imageUrl isActive",
+    )
     .populate("productForm", "name description isActive")
     .populate("composition.salt", "name description isActive")
     .select(options.select || "");
@@ -121,7 +131,10 @@ const getWorkspaceProducts = async (
       .populate("HsnMaster", "code description gstRate cessRate isActive")
       .populate("manufacturer", "name description isActive")
       .populate("uom", "name abbreviation description isActive")
-      .populate("category", "name slug parentCategory level description imageUrl isActive")
+      .populate(
+        "category",
+        "name slug parentCategory level description imageUrl isActive",
+      )
       .populate("productForm", "name description isActive")
       .populate("composition.salt", "name description isActive");
   }

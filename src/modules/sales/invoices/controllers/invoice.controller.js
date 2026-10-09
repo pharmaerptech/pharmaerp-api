@@ -55,11 +55,20 @@ export const getAllCustomerSales = asyncHandler(async (req, res) => {
 
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;
+  
+  const filters = {
+    branchId,
+    searchQuery: req.query.search,
+    status: req.query.status,
+    paymentMethod: req.query.paymentMethod,
+    startDate: req.query.startDate,
+    endDate: req.query.endDate,
+  };
 
   const result = await invoiceService.getAllCustomerSales(
     req.companyId,
     req.workspaceId,
-    branchId,
+    filters,
     { page, limit }
   );
 
