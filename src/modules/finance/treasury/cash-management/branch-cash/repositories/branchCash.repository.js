@@ -6,6 +6,21 @@ import BranchCashBalance from "../models/branchCashBalance.model.js";
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
+const STANDARD_DENOMINATIONS = [500, 200, 100, 50, 20, 10, 5, 2, 1];
+
+const decomposeCashAmount = (amount) => {
+  let rem = Math.max(0, Math.round(Number(amount) || 0));
+  const result = [];
+  for (const denom of STANDARD_DENOMINATIONS) {
+    if (rem >= denom) {
+      const count = Math.floor(rem / denom);
+      rem = rem % denom;
+      result.push({ denomination: denom, quantity: count, subtotal: denom * count });
+    }
+  }
+  return result;
+};
+
 /**
  * Merge a denomination delta into an existing denominations array.
  * mode = "add" | "subtract"
@@ -166,6 +181,62 @@ const subtractRunningDenominations = async (
       $set: {
         runningDenominations: merged,
         runningTotal,
+        lastUpdatedAt: new Date(),
+        lastUpdatedBy: userId,
+      },
+    },
+    { new: true, session },
+  );
+};
+
+/**
+ * Deduct running cash for a refund, cash dispensing, or withdrawal.
+ * Handles exact note deductions and customer change.
+ * If the drawer does not contain enough of those specific smaller note denominations,
+ * it decomposes the target remaining balance so that runningTotal decreases accurately
+ * without negative note quantities or denomination drift.
+ */
+const deductRunningCash = async (
+  branchId,
+  companyId,
+  netAmount,
+  dispensedDenoms = [],
+  changeDenoms = [],
+  userId = null,
+  options = {},
+) => {
+  const { session } = options;
+  const bal = await BranchCashBalance.findOne({ branchId, companyId }).session(session);
+  if (!bal) return null;
+
+  const oldTotal = (bal.runningDenominations || []).reduce(
+    (s, d) => s + (Number(d.denomination) || 0) * (Number(d.quantity) || 0),
+    0
+  );
+  const targetTotal = Math.max(0, Math.round((oldTotal - Number(netAmount || 0)) * 100) / 100);
+
+  // 1. Try standard denomination subtraction and addition
+  let merged = mergeDenominations(bal.runningDenominations, dispensedDenoms, "subtract");
+  if (Array.isArray(changeDenoms) && changeDenoms.length > 0) {
+    merged = mergeDenominations(merged, changeDenoms, "add");
+  }
+
+  const mergedTotal = merged.reduce((s, d) => s + d.subtotal, 0);
+
+  let finalDenoms = merged;
+  if (Math.abs(mergedTotal - targetTotal) >= 0.01) {
+    // If exact notes weren't present in the drawer to cover the full deduction,
+    // decompose targetTotal into standard denominations so the runningTotal
+    // accurately reflects the cash dispensed
+    finalDenoms = decomposeCashAmount(targetTotal);
+  }
+
+  return BranchCashBalance.findOneAndUpdate(
+    { branchId, companyId },
+    {
+      $set: {
+        runningDenominations: finalDenoms,
+        runningTotal: targetTotal,
         lastUpdatedAt: new Date(),
         lastUpdatedBy: userId,
       },
@@ -407,6 +478,8 @@ export default {
   // Denomination-only mutations (single source of truth)
   addRunningDenominations,
   subtractRunningDenominations,
+  deductRunningCash,
+  subtractRunningAmount: deductRunningCash,
   addFrozenDenominations,
   subtractFrozenDenominations,
   moveDenominationsRunningToFrozen,

@@ -3,6 +3,7 @@ import { DayClosing } from "../day-closings/dayClosing.model.js";
 import { BusinessDay } from "../business-days/businessDay.model.js";
 import { getOpenBusinessDay } from "../business-days/businessDay.service.js";
 import SalesInvoice from "../../sales/invoices/models/invoice.model.js";
+import SalesReturn from "../../sales/returns/models/salesReturn.model.js";
 import BankTransaction from "../../finance/treasury/bank-management/bank-transactions/models/bankTransaction.model.js";
 import branchCashService from "../../finance/treasury/cash-management/branch-cash/services/branchCash.service.js";
 import ApiError from "../../../utils/ApiError.js";
@@ -142,7 +143,11 @@ export const closeShift = async (
 
   if (shift.branchId) query.branchId = shift.branchId;
 
-  const invoices = await SalesInvoice.find(query).populate("customerId", "name phone");
+  const [salesInvoices, salesReturns] = await Promise.all([
+    SalesInvoice.find(query).populate("customerId", "name phone"),
+    SalesReturn.find(query).populate("customerId", "name phone").catch(() => []),
+  ]);
+  const invoices = [...salesInvoices, ...salesReturns];
 
   let totalCashSales = 0;
   let upiSalesTotal = 0;
@@ -156,8 +161,25 @@ export const closeShift = async (
   let pureUpiCount = 0;
   let creditSalesTotal = 0;
   let creditInvoiceCount = 0;
-  let advanceSalesTotal = 0;
   let advanceInvoiceCount = 0;
+
+  // Return metrics tracking
+  let returnInvoiceCount = 0;
+  let returnSalesTotal = 0;
+  let returnCashTotal = 0;
+  let returnUpiTotal = 0;
+  let returnAdvanceTotal = 0;
+  let returnCreditTotal = 0;
+  let returnSplitTotal = 0;
+  const returnInvoices = [];
+  const returnBreakdown = {
+    cash: { count: 0, amount: 0 },
+    advance: { count: 0, amount: 0 },
+    credit: { count: 0, amount: 0 },
+    upi: { count: 0, amount: 0 },
+    split: { count: 0, amount: 0 },
+    other: { count: 0, amount: 0 },
+  };
 
   // Cancelled metrics tracking
   let cancelledInvoiceCount = 0;
@@ -201,6 +223,10 @@ export const closeShift = async (
   };
 
   for (const inv of invoices) {
+    if (inv.shiftId && shift._id && String(inv.shiftId._id || inv.shiftId) !== String(shift._id)) {
+      continue;
+    }
+
     if (inv.status === "Cancelled") {
       cancelledInvoiceCount += 1;
       const billTotal = Number(inv.grandTotal || 0);
@@ -251,6 +277,96 @@ export const closeShift = async (
         cancelledAt: inv.cancelledAt || inv.updatedAt || new Date(),
         cancelledBy: inv.cancelledBy || null,
         customerName: inv.customerId?.name || "Walk-in Customer",
+      });
+      continue;
+    }
+
+    const isReturn = Boolean(
+      inv.isReturn ||
+      inv.returnNo ||
+      inv.status === "Returned" ||
+      inv.grandTotal < 0 ||
+      (inv.constructor && inv.constructor.modelName === "SalesReturn")
+    );
+
+    if (isReturn) {
+      returnInvoiceCount += 1;
+      const billTotal = Math.abs(Number(inv.grandTotal || 0));
+      returnSalesTotal += billTotal;
+      const isSplit = inv.paymentMethod === "Split";
+      const pMethod = String(inv.paymentMethod || "CASH").toUpperCase();
+      const retType = String(inv.returnType || "").toLowerCase();
+
+      if (isSplit) {
+        returnSplitTotal += billTotal;
+        returnBreakdown.split.count += 1;
+        returnBreakdown.split.amount += billTotal;
+        if (Array.isArray(inv.payments)) {
+          for (const p of inv.payments) {
+            const pt = String(p.paymentType || p.mode || "").toUpperCase();
+            const amt = Math.abs(Number(p.amount || 0));
+            if (pt.includes("CASH")) {
+              totalCashSales -= amt;
+              returnCashTotal += amt;
+            } else if (pt.includes("UPI") || pt.includes("QR")) {
+              upiSalesTotal -= amt;
+              returnUpiTotal += amt;
+            } else if (pt.includes("ADVANCE") || pt.includes("WALLET")) {
+              returnAdvanceTotal += amt;
+            } else if (pt.includes("CREDIT")) {
+              returnCreditTotal += amt;
+            }
+          }
+        }
+      } else if (retType === "advance_credit" || pMethod.includes("ADVANCE") || pMethod.includes("WALLET")) {
+        returnAdvanceTotal += billTotal;
+        returnBreakdown.advance.count += 1;
+        returnBreakdown.advance.amount += billTotal;
+      } else if (retType === "credit_note" || pMethod.includes("CREDIT")) {
+        returnCreditTotal += billTotal;
+        returnBreakdown.credit.count += 1;
+        returnBreakdown.credit.amount += billTotal;
+      } else if (pMethod.includes("UPI") || pMethod.includes("QR")) {
+        upiSalesTotal -= billTotal;
+        returnUpiTotal += billTotal;
+        returnBreakdown.upi.count += 1;
+        returnBreakdown.upi.amount += billTotal;
+      } else if (pMethod.includes("CASH") || retType === "cash_refund") {
+        totalCashSales -= billTotal;
+        returnCashTotal += billTotal;
+        returnBreakdown.cash.count += 1;
+        returnBreakdown.cash.amount += billTotal;
+      } else {
+        returnBreakdown.other.count += 1;
+        returnBreakdown.other.amount += billTotal;
+      }
+
+      returnInvoices.push({
+        invoiceId: inv._id,
+        returnId: inv._id,
+        invoiceNo: inv.returnNo || inv.invoiceNo,
+        returnNo: inv.returnNo || inv.invoiceNo,
+        originalInvoiceNo: inv.originalInvoiceNo || inv.returnRefInvoiceNo || "—",
+        originalInvoiceId: inv.originalInvoiceId || null,
+        grandTotal: billTotal,
+        returnType: inv.returnType || (retType === "advance_credit" ? "advance_credit" : retType === "credit_note" ? "credit_note" : "cash_refund"),
+        paymentMethod: inv.paymentMethod || (retType === "advance_credit" ? "Advance Deposit" : retType === "credit_note" ? "Credit Note" : "Cash"),
+        payments: inv.payments || [],
+        returnedAt: inv.date || inv.createdAt || new Date(),
+        returnedBy: inv.createdBy || null,
+        createdByName: inv.createdByName || null,
+        customerName: inv.customerId?.name || inv.customerName || "Walk-in Customer",
+        customerPhone: inv.customerId?.phone || inv.customerPhone || "",
+        itemsCount: Array.isArray(inv.items) ? inv.items.length : 0,
+        items: (inv.items || []).map((it) => ({
+          itemId: it.productId || it.itemId,
+          itemName: it.name || it.itemName,
+          quantity: it.qty || it.returnQty || it.quantity,
+          price: it.price || it.saleRate,
+          total: it.total || it.amount,
+          batchNumber: it.batchNo || it.batch || it.batchNumber,
+        })),
+        notes: inv.notes || "",
       });
       continue;
     }
@@ -559,6 +675,17 @@ export const closeShift = async (
   shift.cancelledSplitTotal = cancelledSplitTotal;
   shift.cancelledInvoices = cancelledInvoices;
   shift.cancelledBreakdown = cancelledBreakdown;
+
+  // Persist sales return metrics & breakdown
+  shift.returnInvoiceCount = returnInvoiceCount;
+  shift.returnSalesTotal = returnSalesTotal;
+  shift.returnCashTotal = returnCashTotal;
+  shift.returnUpiTotal = returnUpiTotal;
+  shift.returnAdvanceTotal = returnAdvanceTotal;
+  shift.returnCreditTotal = returnCreditTotal;
+  shift.returnSplitTotal = returnSplitTotal;
+  shift.returnInvoices = returnInvoices;
+  shift.returnBreakdown = returnBreakdown;
 
   // Persist customer advance & credit settlement totals
   shift.advanceCashTotal = advanceCashTotal;

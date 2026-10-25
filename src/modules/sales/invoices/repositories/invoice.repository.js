@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import SalesInvoice from "../models/invoice.model.js";
+import SalesReturn from "../../returns/models/salesReturn.model.js";
 import "../../../parties/customers/models/customer.model.js";
 import "../../../operations/shifts/shift.model.js";
 import "../../../finance/treasury/payment-qr/models/paymentQr.model.js";
@@ -78,6 +79,70 @@ const getInvoiceById = async (invoiceId, companyId, workspaceId, session = null)
   const inv = await queryBuilder.exec();
   if (!inv) return null;
 
+  // Fallback / legacy sync: if invoice doesn't have returnInvoices embedded, check SalesReturn collection
+  if (!inv.returnInvoices || inv.returnInvoices.length === 0) {
+    try {
+      const linkedReturns = await SalesReturn.find({
+        workspaceId: inv.workspaceId,
+        companyId: inv.companyId,
+        $or: [
+          { originalInvoiceId: inv._id },
+          { originalInvoiceNo: inv.invoiceNo },
+        ],
+        isDeleted: false,
+      })
+        .select("returnNo invoiceNo date grandTotal returnType refundMethod paymentMethod items")
+        .sort({ date: 1, createdAt: 1 })
+        .lean();
+
+      if (linkedReturns.length > 0) {
+        inv.returnInvoices = linkedReturns.map((r) => ({
+          returnId: r._id,
+          returnNo: r.returnNo || r.invoiceNo,
+          date: r.date,
+          returnAmount: r.grandTotal,
+          returnType: r.returnType,
+          refundMethod: r.refundMethod || r.paymentMethod,
+          items: r.items,
+        }));
+        inv.returnInvoiceIds = linkedReturns.map((r) => r._id);
+        inv.totalReturnedAmount = linkedReturns.reduce((sum, r) => sum + Number(r.grandTotal || 0), 0);
+        inv.isReturned = true;
+
+        if (Array.isArray(inv.items)) {
+          inv.items = inv.items.map((item) => {
+            let retQty = Number(item.returnedQty || 0);
+            if (retQty === 0) {
+              for (const ret of linkedReturns) {
+                for (const rIt of (ret.items || [])) {
+                  const matchById = rIt.productId && item.productId && rIt.productId.toString() === item.productId.toString();
+                  const matchByName = rIt.name && item.name && rIt.name.trim().toLowerCase() === item.name.trim().toLowerCase();
+                  const matchBatch = !rIt.batchNo || !item.batch || rIt.batchNo === item.batch;
+                  if ((matchById || matchByName) && matchBatch) {
+                    retQty += Number(rIt.qty || rIt.quantity || 0);
+                  }
+                }
+              }
+            }
+            const soldQty = Number(item.qty || 1);
+            return {
+              ...item,
+              returnedQty: retQty,
+              isReturned: retQty >= soldQty,
+              returnStatus: retQty >= soldQty ? "FULL" : (retQty > 0 ? "PARTIAL" : "NONE"),
+            };
+          });
+
+          const isAllFullyReturned = inv.items.length > 0 && inv.items.every((it) => (Number(it.returnedQty) || 0) >= Number(it.qty || 1));
+          inv.returnStatus = isAllFullyReturned ? "FULL" : "PARTIAL";
+          inv.isFullyReturned = isAllFullyReturned;
+        }
+      }
+    } catch (retFetchErr) {
+      console.warn("[InvoiceRepository] Error fetching linked sales returns for invoice:", retFetchErr.message);
+    }
+  }
+
   const resolvedPaymentQr = inv.paymentQrId ? formatPaymentQr(inv.paymentQrId) : null;
   const mappedPayments = (Array.isArray(inv.payments) ? inv.payments : []).map((p) => {
     const subQr = p.paymentQrId ? formatPaymentQr(p.paymentQrId) : resolvedPaymentQr;
@@ -153,7 +218,7 @@ const getInvoicesByCustomerId = async (customerId, companyId, workspaceId, filte
 
   const [invoices, total, aggregate] = await Promise.all([
     SalesInvoice.find(query)
-      .select("invoiceNo date billingMode subtotal discount tax grandTotal paymentMethod status items customerId branchId createdAt")
+      .select("invoiceNo date billingMode subtotal discount tax grandTotal paymentMethod status items customerId branchId createdAt returnInvoiceIds returnInvoices returnStatus isReturned totalReturnedAmount isFullyReturned")
       .populate("customerId", "name mobile customerCode gender")
       .populate("branchId", "name branchCode")
       .sort({ date: -1 })
@@ -381,6 +446,8 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
     const customerIds = matchingCustomers.map((c) => c._id);
     const searchOr = [
       { invoiceNo: { $regex: rawSearch, $options: "i" } },
+      { customerName: { $regex: rawSearch, $options: "i" } },
+      { customerPhone: { $regex: rawSearch, $options: "i" } },
     ];
     if (customerIds.length > 0) {
       searchOr.push({ customerId: { $in: customerIds } });

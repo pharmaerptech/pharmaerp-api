@@ -446,6 +446,91 @@ const shiftSchema = new mongoose.Schema(
         amount: { type: Number, default: 0 },
       },
     },
+
+    // ── Returned Bills Tracking ──────────────────────────────────────────
+    returnInvoiceCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    returnSalesTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    returnCashTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    returnUpiTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    returnAdvanceTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    returnCreditTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    returnSplitTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    returnInvoices: [
+      {
+        invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: "SalesInvoice", default: null },
+        returnId: { type: mongoose.Schema.Types.ObjectId, ref: "SalesReturn", default: null },
+        invoiceNo: { type: String, default: "" },
+        returnNo: { type: String, default: "" },
+        originalInvoiceNo: { type: String, default: "" },
+        originalInvoiceId: { type: mongoose.Schema.Types.ObjectId, ref: "SalesInvoice", default: null },
+        grandTotal: { type: Number, default: 0 },
+        returnType: { type: String, default: "cash_refund" },
+        paymentMethod: { type: String, default: "Cash" },
+        payments: { type: Array, default: [] },
+        returnedAt: { type: Date, default: Date.now },
+        returnedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+        createdByName: { type: String, default: null },
+        customerName: { type: String, default: "" },
+        customerPhone: { type: String, default: "" },
+        itemsCount: { type: Number, default: 0 },
+        items: { type: Array, default: [] },
+        notes: { type: String, default: "" },
+      }
+    ],
+    returnBreakdown: {
+      cash: {
+        count: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+      },
+      advance: {
+        count: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+      },
+      credit: {
+        count: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+      },
+      upi: {
+        count: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+      },
+      split: {
+        count: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+      },
+      other: {
+        count: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+      },
+    },
   },
   { timestamps: true }
 );

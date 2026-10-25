@@ -3,6 +3,7 @@ import ApiError from "../../../utils/ApiError.js";
 import { DayClosing } from "./dayClosing.model.js";
 import { Shift } from "../shifts/shift.model.js";
 import SalesInvoice from "../../sales/invoices/models/invoice.model.js";
+import SalesReturn from "../../sales/returns/models/salesReturn.model.js";
 import FundTransfer from "../../finance/treasury/fund-transfers/models/fundTransfer.model.js";
 import { FUND_TRANSFER_STATUS } from "../../finance/treasury/fund-transfers/constants/fundTransfer.constant.js";
 import PaymentQr from "../../finance/treasury/payment-qr/models/paymentQr.model.js";
@@ -25,7 +26,11 @@ const calculateShiftSummary = async (shift) => {
   
   if (shift.branchId) query.branchId = shift.branchId;
 
-  const invoices = await SalesInvoice.find(query);
+  const [salesInvoices, salesReturns] = await Promise.all([
+    SalesInvoice.find(query),
+    SalesReturn.find(query).catch(() => []),
+  ]);
+  const invoices = [...salesInvoices, ...salesReturns];
 
   let invoiceCount = 0;
   let cashInvoiceCount = 0;
@@ -45,7 +50,43 @@ const calculateShiftSummary = async (shift) => {
   };
 
   for (const inv of invoices) {
+    if (inv.shiftId && shift._id && String(inv.shiftId._id || inv.shiftId) !== String(shift._id)) {
+      continue;
+    }
     if (inv.status === "Cancelled") continue;
+
+    const isReturn = Boolean(
+      inv.isReturn ||
+      inv.returnNo ||
+      inv.status === "Returned" ||
+      inv.grandTotal < 0 ||
+      (inv.constructor && inv.constructor.modelName === "SalesReturn")
+    );
+
+    if (isReturn) {
+      const billTotal = Math.abs(Number(inv.grandTotal || 0));
+      netSales -= billTotal;
+      const pMethod = String(inv.paymentMethod || "CASH").toUpperCase();
+      const retType = String(inv.returnType || "").toLowerCase();
+
+      if (inv.paymentMethod === "Split" && Array.isArray(inv.payments)) {
+        for (const p of inv.payments) {
+          const pType = String(p.paymentType || p.mode || "").toUpperCase();
+          const amt = Math.abs(Number(p.amount || 0));
+          if (pType.includes("UPI") || pType.includes("QR")) {
+            qrNet -= amt;
+          } else if (pType.includes("CASH")) {
+            cashNet -= amt;
+          }
+        }
+      } else if (pMethod.includes("UPI") || pMethod.includes("QR")) {
+        qrNet -= billTotal;
+      } else if (pMethod.includes("CASH") || retType === "cash_refund") {
+        cashNet -= billTotal;
+      }
+      continue;
+    }
+
     invoiceCount++;
     netSales += inv.grandTotal;
 
