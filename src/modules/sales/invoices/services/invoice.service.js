@@ -16,6 +16,7 @@ import cashTransactionService from "../../../finance/treasury/cash-management/ca
 import bankTransactionService from "../../../finance/treasury/bank-management/bank-transactions/services/bankTransaction.service.js";
 import BankAccount from "../../../finance/treasury/bank-management/bank-accounts/models/bankAccount.model.js";
 import PaymentQr from "../../../finance/treasury/payment-qr/models/paymentQr.model.js";
+import { getUpiClearingAccount } from "../../../finance/treasury/shared/findOrCreateSystemAccount.js";
 
 import voucherNumberService from "../../../finance/journal-vouchers/services/voucherNumber.service.js";
 import cashTransactionRepository from "../../../finance/treasury/cash-management/cash-transactions/repositories/cashTransaction.repository.js";
@@ -765,7 +766,57 @@ const postSaleAccounting = async ({
           const shouldHoldForShift = Boolean(invoice.shiftId);
           let txSuccess = false;
 
-          if (bankAccount) {
+          if (shouldHoldForShift) {
+            // HOLD IN SHIFT:
+            // Do NOT create individual BankTransaction in Treasury!
+            // Post to SYS-UPI-CLEARING so Sales Revenue is immediately recognized in GL,
+            // while the Bank Account balance and Bank Transactions register remain untouched until Shift Close.
+            try {
+              const upiClearingAccount = await getUpiClearingAccount(
+                invoice.workspaceId,
+                invoice.companyId,
+                user?._id,
+                session
+              );
+
+              if (upiClearingAccount) {
+                const upiJvPayload = {
+                  voucherNumber: nextReceiptJv(),
+                  voucherDate: invoice.date || new Date(),
+                  voucherType: "RECEIPT",
+                  referenceNumber: payment.txnRefNo || payment.referenceNo || invoice.invoiceNo,
+                  narration: `UPI ${receiptNarrationSuffix} for Invoice ${invoice.invoiceNo} (Shift Held)`,
+                  status: "POSTED",
+                  lines: [
+                    {
+                      accountId: upiClearingAccount._id,
+                      debit: amount,
+                      credit: 0,
+                      narration: `UPI Received for Invoice ${invoice.invoiceNo}`,
+                    },
+                    {
+                      accountId: receiptCounterpartyId,
+                      debit: 0,
+                      credit: amount,
+                      narration: `Offset for Invoice ${invoice.invoiceNo}`,
+                    },
+                  ],
+                };
+
+                await journalVoucherService.createJournalVoucher(
+                  invoice.workspaceId,
+                  invoice.companyId,
+                  user?._id,
+                  upiJvPayload,
+                  { session }
+                );
+                txSuccess = true;
+              }
+            } catch (clrErr) {
+              console.error("Failed to post UPI Clearing JV for invoice:", clrErr);
+            }
+          } else if (bankAccount) {
+            // Direct sale without open shift (e.g. administrative/back-office invoice)
             try {
               const bankTxPayload = {
                 transactionDate: invoice.date || new Date(),
@@ -776,8 +827,8 @@ const postSaleAccounting = async ({
                 referenceNumber: payment.txnRefNo || payment.referenceNo || invoice.invoiceNo,
                 narration: `UPI ${receiptNarrationSuffix} for Invoice ${invoice.invoiceNo}`,
                 counterpartyAccountId: receiptCounterpartyId,
-                shiftId: invoice.shiftId || null,
-                status: shouldHoldForShift ? "PENDING_SHIFT_CLOSE" : "POSTED",
+                shiftId: null,
+                status: "POSTED",
               };
               
               await bankTransactionService.createBankTransaction(
@@ -789,7 +840,7 @@ const postSaleAccounting = async ({
               );
               txSuccess = true;
             } catch (btErr) {
-              console.error("Failed to create bank transaction, falling back to JV:", btErr);
+              console.error("Failed to create direct bank transaction, falling back to JV:", btErr);
             }
           }
           
@@ -805,7 +856,7 @@ const postSaleAccounting = async ({
                 voucherType: "RECEIPT",
                 referenceNumber: payment.txnRefNo || payment.referenceNo || invoice.invoiceNo,
                 narration: `UPI ${receiptNarrationSuffix} for Invoice ${invoice.invoiceNo}`,
-                status: shouldHoldForShift ? "DRAFT" : "POSTED",
+                status: "POSTED",
                 lines: [
                   {
                     accountId: bankLedgerAccountId,

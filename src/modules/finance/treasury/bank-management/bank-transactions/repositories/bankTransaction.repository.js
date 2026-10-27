@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import BankTransaction from "../models/bankTransaction.model.js";
+import { getBusinessDateRange } from "../../../../../../utils/businessDate.js";
 
 const POPULATE_FIELDS = [
   {
@@ -65,13 +66,31 @@ const getBankTransactions = async (
 
   if (filters.bankAccountId && filters.bankAccountId !== "all") query.bankAccountId = filters.bankAccountId;
   if (filters.transactionType && filters.transactionType !== "all") query.transactionType = filters.transactionType;
+  if (filters.category && filters.category !== "all") query.category = filters.category;
   if (filters.direction && filters.direction !== "all") query.direction = filters.direction;
   if (filters.status && filters.status !== "all") query.status = filters.status;
 
-  if (filters.startDate || filters.endDate) {
+  let startDt = null;
+  let endDt = null;
+  if (filters.startDate) {
+    if (typeof filters.startDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(filters.startDate.trim())) {
+      startDt = getBusinessDateRange(filters.startDate.trim()).startOfDay;
+    } else {
+      startDt = new Date(filters.startDate);
+    }
+  }
+  if (filters.endDate) {
+    if (typeof filters.endDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(filters.endDate.trim())) {
+      endDt = getBusinessDateRange(filters.endDate.trim()).endOfDay;
+    } else {
+      endDt = new Date(filters.endDate);
+    }
+  }
+
+  if (startDt || endDt) {
     query.transactionDate = {};
-    if (filters.startDate) query.transactionDate.$gte = new Date(filters.startDate);
-    if (filters.endDate) query.transactionDate.$lte = new Date(filters.endDate);
+    if (startDt) query.transactionDate.$gte = startDt;
+    if (endDt) query.transactionDate.$lte = endDt;
   }
 
   if (filters.search) {
@@ -106,14 +125,16 @@ const getBankTransactions = async (
     aggQuery.bankAccountId = new mongoose.Types.ObjectId(filters.bankAccountId);
   }
   if (filters.transactionType && filters.transactionType !== "all") aggQuery.transactionType = filters.transactionType;
+  if (filters.category && filters.category !== "all") aggQuery.category = filters.category;
   if (filters.direction && filters.direction !== "all") aggQuery.direction = filters.direction;
   if (filters.status && filters.status !== "all") aggQuery.status = filters.status;
 
-  if (filters.startDate || filters.endDate) {
+  if (startDt || endDt) {
     aggQuery.transactionDate = {};
-    if (filters.startDate) aggQuery.transactionDate.$gte = new Date(filters.startDate);
-    if (filters.endDate) aggQuery.transactionDate.$lte = new Date(filters.endDate);
+    if (startDt) aggQuery.transactionDate.$gte = startDt;
+    if (endDt) aggQuery.transactionDate.$lte = endDt;
   }
+
 
   if (filters.search) {
     const searchRegex = new RegExp(filters.search.trim(), "i");

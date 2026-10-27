@@ -176,4 +176,27 @@ const findOrCreateSystemAccount = async (
   return account;
 };
 
+/**
+ * Finds or creates the default Shift UPI Clearing Account (Asset / Transit).
+ */
+export const getUpiClearingAccount = async (
+  workspaceId,
+  companyId,
+  userId,
+  session = null,
+) => {
+  return findOrCreateSystemAccount(
+    workspaceId,
+    companyId,
+    userId,
+    "SYS-UPI-CLEARING",
+    "UPI Clearing Account",
+    "ASSET",
+    "BANK",
+    "SYS-TRANSIT-ASSETS",
+    "Transit Assets",
+    session,
+  );
+};
+
 export default findOrCreateSystemAccount;

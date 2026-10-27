@@ -15,6 +15,7 @@ import transferOrderModule from "../modules/transfer-order/transferOrder.module.
 import operationsModule from "../modules/operations/operations.module.js";
 import dashboardModule from "../modules/dashboard/dashboard.module.js";
 import doctorModule from "../modules/doctor/doctor.module.js";
+import pharmacyReportsModule from "../modules/reports/pharmacyReports.module.js";
 
 const router = Router();
 
@@ -43,6 +44,8 @@ router.use(API_PREFIX + transferOrderModule.path, transferOrderModule.router);
 router.use(API_PREFIX + operationsModule.path, operationsModule.router);
 
 router.use(API_PREFIX + dashboardModule.path, dashboardModule.router);
+
+router.use(API_PREFIX + pharmacyReportsModule.path, pharmacyReportsModule.router);
 
 export default router;
 

@@ -8,12 +8,16 @@ import {
   getBankTransactions,
   getBankTransactionById,
   cancelBankTransaction,
+  depositBankTransaction,
+  withdrawBankTransaction,
 } from "../controllers/bankTransaction.controller.js";
 
 import {
   cancelBankTransactionSchema,
   bankTransactionIdParamSchema,
   getBankTransactionsQuerySchema,
+  directDepositSchema,
+  directWithdrawSchema,
 } from "../validations/bankTransaction.validation.js";
 
 const router = Router();
@@ -25,6 +29,20 @@ router.use(companyContextMiddleware);
 
 // Routes
 router.get("/", validate(getBankTransactionsQuerySchema, "query"), getBankTransactions);
+
+// Direct Deposit into Bank Account (Always Directly POSTED)
+router.post(
+  "/deposit",
+  validate(directDepositSchema),
+  depositBankTransaction,
+);
+
+// Direct Withdrawal from Bank Account (Always Directly POSTED)
+router.post(
+  "/withdraw",
+  validate(directWithdrawSchema),
+  withdrawBankTransaction,
+);
 
 router.get(
   "/:bankTransactionId",

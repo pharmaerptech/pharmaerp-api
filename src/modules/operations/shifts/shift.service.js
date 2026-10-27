@@ -13,6 +13,16 @@ import branchCashRepository from "../../finance/treasury/cash-management/branch-
 import journalPostingService from "../../finance/journal-vouchers/services/journalPosting.service.js";
 import PaymentQr from "../../finance/treasury/payment-qr/models/paymentQr.model.js";
 import CustomerAdvanceTransaction from "../../parties/customers/models/customerAdvanceTransaction.model.js";
+import bankTransactionService from "../../finance/treasury/bank-management/bank-transactions/services/bankTransaction.service.js";
+import BankAccount from "../../finance/treasury/bank-management/bank-accounts/models/bankAccount.model.js";
+import { getUpiClearingAccount } from "../../finance/treasury/shared/findOrCreateSystemAccount.js";
+import {
+  BANK_TRANSACTION_TYPE,
+  BANK_TRANSACTION_DIRECTION,
+  BANK_TRANSACTION_STATUS,
+  BANK_TRANSACTION_PAYMENT_MODE,
+  BANK_TRANSACTION_CATEGORY,
+} from "../../finance/treasury/bank-management/bank-transactions/constants/bankTransaction.constant.js";
 
 export const openShift = async (data) => {
   const { workspaceId, companyId, branchId, date } = data;
@@ -774,8 +784,8 @@ export const closeShift = async (
   shift.shiftName = sameNameCount > 0 ? `${baseName} ${sameNameCount + 1}` : baseName;
   shift.closePeriod = closePeriod.id;
 
-  // Flush PENDING UPI BankTransactions & Post their Journal Vouchers
-  // (commits held amounts directly to the respective bank accounts for non-cancelled invoices and advance/credit receipts)
+  // ── Consolidated Per-Bank UPI Settlement ─────────────────────────────────
+  // Hold all UPI payments during shift; at shift close, release exactly ONE entry per bank per shift!
   const invoiceNos = invoices
     .filter((inv) => inv.status !== "Cancelled")
     .map((inv) => inv.invoiceNo)
@@ -784,7 +794,10 @@ export const closeShift = async (
     .map((tx) => tx.referenceNumber)
     .filter(Boolean);
 
+  let hasLegacyPendingFlushed = false;
+
   try {
+    // 1. Backward compatibility: flush any legacy individual PENDING_SHIFT_CLOSE transactions from older shifts
     const pendingBankTxs = await BankTransaction.find({
       companyId: shift.companyId,
       workspaceId: shift.workspaceId,
@@ -796,26 +809,161 @@ export const closeShift = async (
       ],
     });
 
-    for (const bt of pendingBankTxs) {
-      if (bt.journalVoucherId) {
-        try {
-          await journalPostingService.postJournalVoucher(
-            bt.journalVoucherId,
-            shift.companyId,
-            shift.workspaceId,
-            userId
-          );
-        } catch (postErr) {
-          console.error(`[Shift] Error posting JV ${bt.journalVoucherId} for BT ${bt._id}:`, postErr);
+    if (pendingBankTxs.length > 0) {
+      hasLegacyPendingFlushed = true;
+      for (const bt of pendingBankTxs) {
+        if (bt.journalVoucherId) {
+          try {
+            await journalPostingService.postJournalVoucher(
+              bt.journalVoucherId,
+              shift.companyId,
+              shift.workspaceId,
+              userId
+            );
+          } catch (postErr) {
+            console.error(`[Shift] Error posting legacy JV ${bt.journalVoucherId} for BT ${bt._id}:`, postErr);
+          }
         }
+        bt.status = "POSTED";
+        bt.postedAt = now;
+        bt.postedBy = userId;
+        await bt.save();
       }
-      bt.status = "POSTED";
-      bt.postedAt = now;
-      bt.postedBy = userId;
-      await bt.save();
     }
   } catch (btFlushErr) {
-    console.error("[Shift] Error flushing pending UPI bank transactions:", btFlushErr);
+    console.error("[Shift] Error flushing legacy pending UPI bank transactions:", btFlushErr);
+  }
+
+  // 2. Standard Shift-Consolidated UPI Settlement:
+  // If no legacy individual transactions were flushed, aggregate net UPI collections by bank account
+  // and create EXACTLY ONE BankTransaction and JournalVoucher per bank account.
+  if (!hasLegacyPendingFlushed) {
+    try {
+      // Find fallback primary active bank account if unlinked/unattributed QRs exist
+      const defaultBank =
+        (await BankAccount.findOne({
+          companyId: shift.companyId,
+          workspaceId: shift.workspaceId,
+          isDeleted: false,
+          isActive: true,
+          isPrimary: true,
+        })) ||
+        (await BankAccount.findOne({
+          companyId: shift.companyId,
+          workspaceId: shift.workspaceId,
+          isDeleted: false,
+          isActive: true,
+        }));
+
+      const bankTotalsMap = new Map();
+
+      // Aggregate from Sales UPI breakdown
+      for (const item of (shift.upiBreakdown || [])) {
+        const amt = Number(item.totalAmount || 0);
+        if (amt <= 0) continue;
+        const bankId = item.bankAccountId
+          ? String(item.bankAccountId)
+          : (defaultBank ? String(defaultBank._id) : null);
+        if (!bankId) continue;
+
+        if (!bankTotalsMap.has(bankId)) {
+          bankTotalsMap.set(bankId, {
+            bankAccountId: bankId,
+            bankName: item.bankName || "Bank Account",
+            totalAmount: 0,
+            transactionCount: 0,
+            billCount: 0,
+          });
+        }
+        const entry = bankTotalsMap.get(bankId);
+        entry.totalAmount += amt;
+        entry.transactionCount += Number(item.transactionCount || 0);
+        entry.billCount += Number(item.billCount || 0);
+      }
+
+      // Aggregate from Customer Advance & Credit Settlement UPI breakdown
+      for (const item of (shift.advanceCreditUpiBreakdown || [])) {
+        const amt = Number(item.totalAmount || 0);
+        if (amt <= 0) continue;
+        const bankId = item.bankAccountId
+          ? String(item.bankAccountId)
+          : (defaultBank ? String(defaultBank._id) : null);
+        if (!bankId) continue;
+
+        if (!bankTotalsMap.has(bankId)) {
+          bankTotalsMap.set(bankId, {
+            bankAccountId: bankId,
+            bankName: item.bankName || "Bank Account",
+            totalAmount: 0,
+            transactionCount: 0,
+            billCount: 0,
+          });
+        }
+        const entry = bankTotalsMap.get(bankId);
+        entry.totalAmount += amt;
+        entry.transactionCount += Number(item.transactionCount || 0);
+      }
+
+      // Safety Fallback: If bankTotalsMap is empty but shift has recorded positive UPI collections,
+      // attribute the total UPI collection to the default bank so funds are never trapped!
+      const totalRecordedUpi = Math.round(
+        Number(
+          shift.actualClosingUpiAmount ||
+          shift.expectedClosingUpiAmount ||
+          ((Number(shift.salesUpiTotal || 0)) + (Number(shift.advanceUpiTotal || 0)) + (Number(shift.creditUpiTotal || 0)))
+        ) * 100
+      ) / 100;
+
+      if (bankTotalsMap.size === 0 && totalRecordedUpi > 0 && defaultBank?._id) {
+        const defaultBankId = String(defaultBank._id);
+        bankTotalsMap.set(defaultBankId, {
+          bankAccountId: defaultBankId,
+          bankName: defaultBank.bankMasterId?.name || defaultBank.accountName || "Bank Account",
+          totalAmount: totalRecordedUpi,
+          transactionCount: 1,
+          billCount: 1,
+        });
+      }
+
+      const upiClearingAccount = await getUpiClearingAccount(
+        shift.workspaceId,
+        shift.companyId,
+        userId
+      );
+
+
+      for (const [bankId, bankData] of bankTotalsMap.entries()) {
+        const netAmount = Math.round(Number(bankData.totalAmount) * 100) / 100;
+        if (netAmount <= 0) continue;
+
+        const totalTxCount = bankData.transactionCount || bankData.billCount || 1;
+        const shiftDisplay = shift.shiftName || shift.shiftNo || "Shift";
+
+        const settlementPayload = {
+          transactionDate: now,
+          bankAccountId: bankId,
+          transactionType: BANK_TRANSACTION_TYPE.UPI,
+          paymentMode: BANK_TRANSACTION_PAYMENT_MODE.UPI,
+          category: BANK_TRANSACTION_CATEGORY.UPI_SETTLEMENT,
+          direction: BANK_TRANSACTION_DIRECTION.CREDIT,
+          amount: netAmount,
+          referenceNumber: `SHIFT-${shift.shiftNo}`,
+          narration: `${shiftDisplay} UPI Settlement (${totalTxCount} payments)`,
+          counterpartyAccountId: upiClearingAccount?._id || null,
+          shiftId: shift._id,
+          status: BANK_TRANSACTION_STATUS.POSTED,
+        };
+
+        await bankTransactionService.createBankTransaction(
+          shift.workspaceId,
+          shift.companyId,
+          userId,
+          settlementPayload
+        );
+      }
+    } catch (settleErr) {
+      console.error("[Shift] Error creating consolidated UPI bank transactions at shift close:", settleErr);
+    }
   }
 
   await shift.save();

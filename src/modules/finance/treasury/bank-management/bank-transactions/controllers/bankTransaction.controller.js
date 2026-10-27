@@ -37,3 +37,27 @@ export const cancelBankTransaction = asyncHandler(async (req, res) => {
     .status(200)
     .json(new ApiResponse(200, "Bank Transaction cancelled successfully", bankTransaction));
 });
+
+export const depositBankTransaction = asyncHandler(async (req, res) => {
+  const result = await bankTransactionService.directDeposit(
+    req.workspaceId,
+    req.companyId,
+    req.user._id,
+    req.body,
+  );
+  return res
+    .status(201)
+    .json(new ApiResponse(201, "Direct bank deposit posted successfully", result));
+});
+
+export const withdrawBankTransaction = asyncHandler(async (req, res) => {
+  const result = await bankTransactionService.directWithdraw(
+    req.workspaceId,
+    req.companyId,
+    req.user._id,
+    req.body,
+  );
+  return res
+    .status(201)
+    .json(new ApiResponse(201, "Direct bank withdrawal posted successfully", result));
+});

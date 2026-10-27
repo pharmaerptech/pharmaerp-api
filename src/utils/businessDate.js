@@ -61,3 +61,40 @@ export const formatBusinessDate = (date) => {
   const day = String(istDate.getUTCDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 };
+
+/**
+ * Resolves a transaction timestamp in Indian Standard Time (IST, UTC+05:30).
+ * - If dateInput is omitted/falsy, returns current instant (new Date()).
+ * - If dateInput is a Date instance, returns it directly.
+ * - If dateInput is a "YYYY-MM-DD" string:
+ *     If it matches today's IST calendar date, returns new Date() to record the exact current time.
+ *     If it is a different date (e.g. past entry), preserves the IST calendar date with the current IST time of day.
+ * - If dateInput is an ISO string with time, parses and returns it.
+ */
+export const parseISTTransactionDate = (dateInput) => {
+  if (!dateInput) return new Date();
+  if (dateInput instanceof Date && !isNaN(dateInput.getTime())) return dateInput;
+
+  if (typeof dateInput === "string") {
+    const trimmed = dateInput.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      const todayIST = formatBusinessDate(new Date());
+      if (trimmed === todayIST) {
+        return new Date();
+      }
+      const now = new Date();
+      const istMs = now.getTime() + 5.5 * 60 * 60 * 1000;
+      const istDate = new Date(istMs);
+      const hours = String(istDate.getUTCHours()).padStart(2, "0");
+      const minutes = String(istDate.getUTCMinutes()).padStart(2, "0");
+      const seconds = String(istDate.getUTCSeconds()).padStart(2, "0");
+      const ms = String(istDate.getUTCMilliseconds()).padStart(3, "0");
+      return new Date(`${trimmed}T${hours}:${minutes}:${seconds}.${ms}+05:30`);
+    }
+    const parsed = new Date(trimmed);
+    if (!isNaN(parsed.getTime())) return parsed;
+  }
+
+  return new Date();
+};
+

@@ -3,6 +3,8 @@ import {
   BANK_TRANSACTION_TYPE,
   BANK_TRANSACTION_DIRECTION,
   BANK_TRANSACTION_STATUS,
+  BANK_TRANSACTION_PAYMENT_MODE,
+  BANK_TRANSACTION_CATEGORY,
 } from "../constants/bankTransaction.constant.js";
 
 const bankTransactionSchema = new mongoose.Schema(
@@ -44,6 +46,22 @@ const bankTransactionSchema = new mongoose.Schema(
       type: String,
       enum: Object.values(BANK_TRANSACTION_TYPE),
       required: [true, "Transaction type is required"],
+      index: true,
+    },
+
+    // Descriptive payment mode tag (CASH, CHEQUE, UPI, NEFT, RTGS, IMPS, OTHER)
+    paymentMode: {
+      type: String,
+      enum: Object.values(BANK_TRANSACTION_PAYMENT_MODE),
+      default: BANK_TRANSACTION_PAYMENT_MODE.OTHER,
+      index: true,
+    },
+
+    // Transaction reason category (PERSONAL_USE, CAPITAL_INFUSION, DIRECT_EXPENSE, DIRECT_INCOME, OTHER)
+    category: {
+      type: String,
+      enum: Object.values(BANK_TRANSACTION_CATEGORY),
+      default: BANK_TRANSACTION_CATEGORY.OTHER,
       index: true,
     },
 
