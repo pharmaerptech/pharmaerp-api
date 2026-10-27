@@ -34,6 +34,8 @@ export const deduceGstrGroup = (entry) => {
   const totalAmount = Number(entry?.totalAmount !== undefined ? entry.totalAmount : (taxableAmount + cgst + sgst + igst + cess));
   const totalTax = cgst + sgst + igst + cess;
 
+  const vNum = String(entry?.voucherNumber || "").toUpperCase();
+
   if (entry?.isExport || rawDocType.includes("EXPORT") || narration.includes("EXPORT")) {
     return "Export Invoices";
   }
@@ -46,10 +48,10 @@ export const deduceGstrGroup = (entry) => {
   if (rawDocType.includes("REFUND_VOUCHER") || narration.includes("REFUND FROM ADVANCE") || narration.includes("REFUND VOUCHER")) {
     return "Refund from Advance";
   }
-  if (rawDocType.includes("CREDIT_NOTE") || narration.includes("CREDIT NOTE") || rawDocType.includes("SALE_RETURN")) {
+  if (rawDocType.includes("CREDIT_NOTE") || narration.includes("CREDIT NOTE") || rawDocType.includes("SALE_RETURN") || vNum.startsWith("RET-") || vNum.startsWith("CN-")) {
     return (hasValidPartyGstin || narration.includes("(B2B)")) ? "Credit Note - Registered" : "Credit Note - Unregistered";
   }
-  if (rawDocType.includes("DEBIT_NOTE") || narration.includes("DEBIT NOTE")) {
+  if (rawDocType.includes("DEBIT_NOTE") || narration.includes("DEBIT NOTE") || vNum.startsWith("DN-")) {
     return (hasValidPartyGstin || narration.includes("(B2B)")) ? "Debit Note - Registered" : "Debit Note - Unregistered";
   }
   if (entry?.isNilRated || entry?.taxRate === 0 || narration.includes("NIL RATED") || (taxableAmount > 0 && totalTax === 0)) {
@@ -65,6 +67,24 @@ export const deduceGstrGroup = (entry) => {
     return "B2C (Large) Invoice";
   }
   return "B2C (Small) Invoice";
+};
+
+export const isCreditNoteEntry = (entry) => {
+  if (!entry) return false;
+  const group = String(entry.groupDescription || "").toUpperCase();
+  const narration = String(entry.narration || "").toUpperCase();
+  const vNum = String(entry.voucherNumber || "").toUpperCase();
+  const docType = String(entry.documentType || entry.voucherType || entry.type || "").toUpperCase();
+  return (
+    group.includes("CREDIT NOTE") ||
+    group.includes("CDN") ||
+    docType.includes("CREDIT_NOTE") ||
+    docType.includes("SALE_RETURN") ||
+    narration.includes("CREDIT NOTE") ||
+    narration.includes("SALES RETURN") ||
+    vNum.startsWith("RET-") ||
+    vNum.startsWith("CN-")
+  );
 };
 
 const createEmptyGroup = (description, isSubItem = false) => ({
