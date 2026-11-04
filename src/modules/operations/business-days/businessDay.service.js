@@ -1,6 +1,16 @@
 import { BusinessDay } from "./businessDay.model.js";
 import { Shift } from "../shifts/shift.model.js";
 import ApiError from "../../../utils/ApiError.js";
+import BankAccount from "../../finance/treasury/bank-management/bank-accounts/models/bankAccount.model.js";
+import bankTransactionService from "../../finance/treasury/bank-management/bank-transactions/services/bankTransaction.service.js";
+import { getUpiClearingAccount } from "../../finance/treasury/shared/findOrCreateSystemAccount.js";
+import {
+  BANK_TRANSACTION_TYPE,
+  BANK_TRANSACTION_DIRECTION,
+  BANK_TRANSACTION_STATUS,
+  BANK_TRANSACTION_PAYMENT_MODE,
+  BANK_TRANSACTION_CATEGORY,
+} from "../../finance/treasury/bank-management/bank-transactions/constants/bankTransaction.constant.js";
 
 // ── Date helpers ─────────────────────────────────────────────────────────────
 
@@ -202,6 +212,119 @@ export const openBusinessDay = async (data) => {
 };
 
 /**
+ * Aggregates all net UPI collections across shifts of a Business Day grouped by bank account.
+ * Supports sales invoices, customer advances, and customer credit settlements.
+ *
+ * @param {object} businessDay
+ * @param {Array} shifts
+ * @returns {Promise<{ bankTotalsMap: Map<string, object>, defaultBank: object }>}
+ */
+export const aggregateBusinessDayUpiCollections = async (businessDay, shifts = []) => {
+  const defaultBank =
+    (await BankAccount.findOne({
+      companyId: businessDay.companyId,
+      workspaceId: businessDay.workspaceId,
+      isDeleted: false,
+      isActive: true,
+      isPrimary: true,
+    })) ||
+    (await BankAccount.findOne({
+      companyId: businessDay.companyId,
+      workspaceId: businessDay.workspaceId,
+      isDeleted: false,
+      isActive: true,
+    }));
+
+  const bankTotalsMap = new Map();
+
+  for (const shift of shifts) {
+    // If shift was already settled historically, skip it
+    if (shift.upiSettlementStatus === "SETTLED") continue;
+
+    // 1. Sales UPI breakdown
+    for (const item of (shift.upiBreakdown || [])) {
+      const amt = Number(item.totalAmount || 0);
+      if (amt <= 0) continue;
+      const bankId = item.bankAccountId
+        ? String(item.bankAccountId)
+        : (defaultBank ? String(defaultBank._id) : null);
+      if (!bankId) continue;
+
+      if (!bankTotalsMap.has(bankId)) {
+        bankTotalsMap.set(bankId, {
+          bankAccountId: bankId,
+          bankName: item.bankName || defaultBank?.bankMasterId?.name || defaultBank?.accountName || "Bank Account",
+          accountNumber: item.accountNumber || defaultBank?.accountNumber || "",
+          totalAmount: 0,
+          transactionCount: 0,
+          billCount: 0,
+        });
+      }
+      const entry = bankTotalsMap.get(bankId);
+      entry.totalAmount += amt;
+      entry.transactionCount += Number(item.transactionCount || 0);
+      entry.billCount += Number(item.billCount || 0);
+    }
+
+    // 2. Customer Advance & Credit Settlement UPI breakdown
+    for (const item of (shift.advanceCreditUpiBreakdown || [])) {
+      const amt = Number(item.totalAmount || 0);
+      if (amt <= 0) continue;
+      const bankId = item.bankAccountId
+        ? String(item.bankAccountId)
+        : (defaultBank ? String(defaultBank._id) : null);
+      if (!bankId) continue;
+
+      if (!bankTotalsMap.has(bankId)) {
+        bankTotalsMap.set(bankId, {
+          bankAccountId: bankId,
+          bankName: item.bankName || defaultBank?.bankMasterId?.name || defaultBank?.accountName || "Bank Account",
+          accountNumber: item.accountNumber || defaultBank?.accountNumber || "",
+          totalAmount: 0,
+          transactionCount: 0,
+          billCount: 0,
+        });
+      }
+      const entry = bankTotalsMap.get(bankId);
+      entry.totalAmount += amt;
+      entry.transactionCount += Number(item.transactionCount || 0);
+    }
+
+    // 3. Fallback: If bankTotalsMap is empty for this shift but shift recorded positive UPI collections
+    const shiftTotalRecordedUpi = Math.round(
+      Number(
+        shift.actualClosingUpiAmount ||
+        shift.expectedClosingUpiAmount ||
+        ((Number(shift.salesUpiTotal || 0)) + (Number(shift.advanceUpiTotal || 0)) + (Number(shift.creditUpiTotal || 0)))
+      ) * 100
+    ) / 100;
+
+    const currentShiftMappedAmt = (shift.upiBreakdown || []).reduce((sum, u) => sum + Number(u.totalAmount || 0), 0) +
+      (shift.advanceCreditUpiBreakdown || []).reduce((sum, u) => sum + Number(u.totalAmount || 0), 0);
+
+    if (currentShiftMappedAmt === 0 && shiftTotalRecordedUpi > 0 && defaultBank?._id) {
+      const defaultBankId = String(defaultBank._id);
+      if (!bankTotalsMap.has(defaultBankId)) {
+        bankTotalsMap.set(defaultBankId, {
+          bankAccountId: defaultBankId,
+          bankName: defaultBank?.bankMasterId?.name || defaultBank?.accountName || "Bank Account",
+          accountNumber: defaultBank?.accountNumber || "",
+          totalAmount: 0,
+          transactionCount: 0,
+          billCount: 0,
+        });
+      }
+      const entry = bankTotalsMap.get(defaultBankId);
+      entry.totalAmount += shiftTotalRecordedUpi;
+      entry.transactionCount += 1;
+      entry.billCount += 1;
+    }
+  }
+
+  return { bankTotalsMap, defaultBank };
+};
+
+/**
  * Closes a Business Day.
  *
  * On close:
@@ -315,6 +438,89 @@ export const closeBusinessDay = async (businessDayId, userId, payload = {}) => {
   businessDay.totalManualDeposits = totalManualDeposits;
   businessDay.totalManualWithdrawals = totalManualWithdrawals;
   businessDay.cashByShift = cashByShift;
+
+  // ── Consolidated UPI Settlement across all shifts ─────────────────────────
+  if (businessDay.upiSettlementStatus !== "SETTLED") {
+    try {
+      const { bankTotalsMap } = await aggregateBusinessDayUpiCollections(businessDay, shifts);
+
+      const upiClearingAccount = await getUpiClearingAccount(
+        businessDay.workspaceId,
+        businessDay.companyId,
+        userId
+      );
+
+      const now = new Date();
+      const settlementTxDate = now;
+      const upiSettlementTransactions = [];
+      const upiBankBreakdown = [];
+      let grandTotalUpiAmount = 0;
+      let grandTotalUpiTransactions = 0;
+
+      for (const [bankId, bankData] of bankTotalsMap.entries()) {
+        const netAmount = Math.round(Number(bankData.totalAmount) * 100) / 100;
+        if (netAmount <= 0) continue;
+
+        const totalTxCount = bankData.transactionCount || bankData.billCount || 1;
+        grandTotalUpiAmount += netAmount;
+        grandTotalUpiTransactions += totalTxCount;
+
+        const settlementPayload = {
+          transactionDate: settlementTxDate,
+          bankAccountId: bankId,
+          transactionType: BANK_TRANSACTION_TYPE.UPI,
+          paymentMode: BANK_TRANSACTION_PAYMENT_MODE.UPI,
+          category: BANK_TRANSACTION_CATEGORY.UPI_SETTLEMENT,
+          direction: BANK_TRANSACTION_DIRECTION.CREDIT,
+          amount: netAmount,
+          referenceNumber: `BD-${businessDay.businessDayNo}`,
+          narration: `Business Day ${businessDay.businessDayNo} UPI Settlement (${totalTxCount} payments across ${shifts.length} shifts)`,
+          counterpartyAccountId: upiClearingAccount?._id || null,
+          businessDayId: businessDay._id,
+          status: BANK_TRANSACTION_STATUS.POSTED,
+        };
+
+        const createdBt = await bankTransactionService.createBankTransaction(
+          businessDay.workspaceId,
+          businessDay.companyId,
+          userId,
+          settlementPayload
+        );
+
+        if (createdBt?._id) {
+          upiSettlementTransactions.push(createdBt._id);
+        }
+
+        upiBankBreakdown.push({
+          bankAccountId: bankId,
+          bankName: bankData.bankName,
+          accountNumber: bankData.accountNumber,
+          totalAmount: netAmount,
+          transactionCount: totalTxCount,
+          billCount: bankData.billCount || totalTxCount,
+          bankTransactionId: createdBt?._id || null,
+        });
+      }
+
+      businessDay.upiSettlementStatus = "SETTLED";
+      businessDay.upiSettledAt = now;
+      businessDay.upiSettledBy = userId;
+      businessDay.totalUpiAmount = Math.round(grandTotalUpiAmount * 100) / 100;
+      businessDay.totalUpiTransactions = grandTotalUpiTransactions;
+      businessDay.upiBankBreakdown = upiBankBreakdown;
+      businessDay.upiSettlementTransactions = upiSettlementTransactions;
+
+      // Mark all linked shifts as SETTLED
+      if (shifts.length > 0) {
+        await Shift.updateMany(
+          { _id: { $in: shifts.map((s) => s._id) } },
+          { $set: { upiSettlementStatus: "SETTLED", upiSettledAt: now } }
+        );
+      }
+    } catch (upiSettleErr) {
+      console.error("[BusinessDay] Error settling consolidated UPI bank transactions at business day close:", upiSettleErr);
+    }
+  }
 
   if (note) businessDay.note = note;
 

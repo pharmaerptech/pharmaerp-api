@@ -1,3 +1,4 @@
+import creditNoteService from "../../../sales/credit-notes/services/creditNote.service.js";
 import asyncHandler from "../../../../utils/asyncHandler.js";
 import ApiResponse from "../../../../utils/ApiResponse.js";
 import xlsx from "xlsx";
@@ -5,6 +6,29 @@ import customerService from "../services/customer.service.js";
 import b2cCustomerImportService from "../services/b2cCustomerImport.service.js";
 import customerAdvanceService from "../services/customerAdvance.service.js";
 import invoiceService from "../../../sales/invoices/services/invoice.service.js";
+
+export const getWalkInCustomer = asyncHandler(async (req, res) => {
+  const customer = await customerService.getWalkInCustomer(
+    req.workspaceId,
+    req.companyId
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, "Walk-in customer fetched successfully", customer));
+});
+
+export const ensureWalkInCustomer = asyncHandler(async (req, res) => {
+  const customer = await customerService.findOrCreateWalkInCustomer(
+    req.workspaceId,
+    req.companyId,
+    req.user?._id
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, "Walk-in customer ensured successfully", customer));
+});
 
 export const createCustomer = asyncHandler(async (req, res) => {
   const customer = await customerService.createCustomer(
@@ -501,5 +525,15 @@ export const deleteCustomerRelationship = asyncHandler(async (req, res) => {
     .json(new ApiResponse(200, "Customer relationship removed successfully", result));
 });
 
+export const getCustomerCreditNotes = asyncHandler(async (req, res) => {
+  const { customerId } = req.params;
+  const result = await creditNoteService.getCustomerCreditNotes(
+    customerId,
+    req.companyId,
+    req.workspaceId
+  );
 
-
+  return res
+    .status(200)
+    .json(new ApiResponse(200, "Customer credit notes fetched successfully", result));
+});

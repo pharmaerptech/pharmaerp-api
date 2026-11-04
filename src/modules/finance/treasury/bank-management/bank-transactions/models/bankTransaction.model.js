@@ -116,6 +116,14 @@ const bankTransactionSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Linked Business Day (e.g. for consolidated Day-End UPI settlements)
+    businessDayId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BusinessDay",
+      default: null,
+      index: true,
+    },
+
     status: {
       type: String,
       enum: Object.values(BANK_TRANSACTION_STATUS),
@@ -210,6 +218,11 @@ bankTransactionSchema.index({
 
 bankTransactionSchema.index({
   shiftId: 1,
+  status: 1,
+});
+
+bankTransactionSchema.index({
+  businessDayId: 1,
   status: 1,
 });
 

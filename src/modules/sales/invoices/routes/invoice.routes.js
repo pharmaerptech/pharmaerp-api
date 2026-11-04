@@ -26,6 +26,7 @@ router.get("/", getAllCustomerSales);
 router.get("/customer/:customerId", getCustomerSales);
 router.get("/:invoiceId", getInvoiceById);
 router.post("/customer/:customerId?", recordCustomerSale);
+router.post("/", recordCustomerSale);
 router.put("/customer/:invoiceId", updateCustomerSale);
 router.put("/customer/:customerId/:invoiceId", updateCustomerSale);
 router.put("/:invoiceId", updateCustomerSale);

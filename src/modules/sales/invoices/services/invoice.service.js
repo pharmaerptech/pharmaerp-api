@@ -3,6 +3,7 @@ import ApiError from "../../../../utils/ApiError.js";
 import invoiceRepository from "../repositories/invoice.repository.js";
 import { getBranchInitials } from "../../../../utils/branchInitials.js";
 import customerRepository from "../../../parties/customers/repositories/customer.repository.js";
+import customerService from "../../../parties/customers/services/customer.service.js";
 import branchRepository from "../../../organization/branches/repositories/branch.repository.js";
 import financialPeriodRepository from "../../../finance/financial-periods/repositories/financialPeriod.repository.js";
 import Batch from "../../../catalog/products/models/batch.model.js";
@@ -28,6 +29,7 @@ import branchCashRepository from "../../../finance/treasury/cash-management/bran
 import CashTransaction from "../../../finance/treasury/cash-management/cash-transactions/models/cashTransaction.model.js";
 import BankTransaction from "../../../finance/treasury/bank-management/bank-transactions/models/bankTransaction.model.js";
 import { Shift } from "../../../operations/shifts/shift.model.js";
+import { BusinessDay } from "../../../operations/business-days/businessDay.model.js";
 import CustomerAdvanceTransaction from "../../../parties/customers/models/customerAdvanceTransaction.model.js";
 import CustomerCreditTransaction from "../../../parties/customers/models/customerCreditTransaction.model.js";
 import customerAdvanceService from "../../../parties/customers/services/customerAdvance.service.js";
@@ -35,6 +37,12 @@ import { CUSTOMER_TRANSACTION_TYPE, CREDIT_STATUS } from "../../../parties/custo
 import Customer from "../../../parties/customers/models/customer.model.js";
 import SharedContactGroup from "../../../parties/customers/models/sharedContactGroup.model.js";
 import CustomerRelationship from "../../../parties/customers/models/customerRelationship.model.js";
+import creditNoteService from "../../credit-notes/services/creditNote.service.js";
+
+const isCreditNotePayment = (pType) => {
+  const s = String(pType || "").toLowerCase().replace(/[\s_-]/g, "");
+  return s === "creditnote";
+};
 
 /**
  * Validates that all cash payments have explicit denomination breakdowns
@@ -121,19 +129,20 @@ const revertCashTransactionsForInvoice = async (
 
 const validateCashDenominations = (saleData) => {
   const paymentsList = Array.isArray(saleData.payments) ? saleData.payments : [];
-  const methodLower = String(saleData.paymentMethod || "").toLowerCase();
+  const methodLower = String(saleData.paymentMethod || "").toLowerCase().replace(/[\s_-]/g, "");
   const isCreditMethod = methodLower === "credit";
   const isAdvanceMethod = methodLower === "advance";
+  const isCreditNoteMethod = methodLower === "creditnote";
 
-  // Skip cash denomination check if entirely non-cash (Credit or Advance)
+  // Skip cash denomination check if entirely non-cash (Credit, Advance, or CreditNote)
   const allNonCash =
     paymentsList.length > 0 &&
     paymentsList.every((p) => {
-      const pType = String(p.paymentType || p.mode || "").toLowerCase();
-      return pType === "credit" || pType === "advance";
+      const pType = String(p.paymentType || p.mode || "").toLowerCase().replace(/[\s_-]/g, "");
+      return pType === "credit" || pType === "advance" || pType === "creditnote";
     });
 
-  if (allNonCash || ((isCreditMethod || isAdvanceMethod) && paymentsList.length === 0)) {
+  if (allNonCash || ((isCreditMethod || isAdvanceMethod || isCreditNoteMethod) && paymentsList.length === 0)) {
     return;
   }
 
@@ -175,6 +184,17 @@ const validateCashDenominations = (saleData) => {
     const returnedDenoms = (Array.isArray(cp.returnedDenominations) ? cp.returnedDenominations : []).filter(
       d => Number(d.quantity) > 0 && Number(d.denomination) > 0
     );
+
+    if (denoms.length === 0 && cp.amount > 0) {
+      const autoDecomposed = branchCashRepository.decomposeCashAmount(cp.amount);
+      if (autoDecomposed.length > 0) {
+        cp.denominations = autoDecomposed;
+        denoms.push(...autoDecomposed);
+        if (paymentsList[cp.index]) {
+          paymentsList[cp.index].denominations = autoDecomposed;
+        }
+      }
+    }
 
     if (denoms.length === 0) {
       throw new ApiError(
@@ -220,6 +240,56 @@ const validateCashDenominations = (saleData) => {
       if ((!cashRow.returnedDenominations || cashRow.returnedDenominations.length === 0) && Array.isArray(saleData.returnedDenominations) && saleData.returnedDenominations.length > 0) {
         cashRow.returnedDenominations = saleData.returnedDenominations;
       }
+    }
+  }
+};
+
+/**
+ * Enforce strict payment total exact match with bill grand total.
+ * When payments array is provided:
+ * 1. Every payment row must have amount > 0 and be finite.
+ * 2. The sum of all payment mode amounts MUST exactly equal saleData.grandTotal (tolerance 0.01).
+ *    Customer cannot pay even a single penny more (overpayment) or less (underpayment) than the bill amount.
+ *    Any shortfall must be explicitly allocated to a payment mode such as Credit (Udhar / Pay Later).
+ */
+export const validatePaymentSplitIntegrity = (saleData) => {
+  if (!saleData) return;
+
+  const grandTotal = Math.round(Number(saleData.grandTotal || 0) * 100) / 100;
+
+  if (Array.isArray(saleData.payments) && saleData.payments.length > 0) {
+    let totalPaymentAmount = 0;
+
+    for (let i = 0; i < saleData.payments.length; i++) {
+      const p = saleData.payments[i];
+      const amt = Number(p.amount);
+      const mode = p.paymentType || p.mode || `Payment #${i + 1}`;
+
+      if (isNaN(amt) || !isFinite(amt)) {
+        throw new ApiError(400, `Invalid payment amount for "${mode}". Must be a valid number.`);
+      }
+
+      if (amt < 0) {
+        throw new ApiError(400, `Payment amount for "${mode}" cannot be negative (₹${amt.toFixed(2)}).`);
+      }
+
+      totalPaymentAmount += amt;
+    }
+
+    totalPaymentAmount = Math.round(totalPaymentAmount * 100) / 100;
+
+    if (totalPaymentAmount > grandTotal + 0.01) {
+      throw new ApiError(
+        400,
+        `Total payment amount (₹${totalPaymentAmount.toFixed(2)}) exceeds bill grand total (₹${grandTotal.toFixed(2)}). Customer cannot pay more than the bill amount.`
+      );
+    }
+
+    if (totalPaymentAmount < grandTotal - 0.01) {
+      throw new ApiError(
+        400,
+        `Total payment amount (₹${totalPaymentAmount.toFixed(2)}) is less than bill grand total (₹${grandTotal.toFixed(2)}). Any unpaid balance must be allocated to Credit (Pay Later / Udhar).`
+      );
     }
   }
 };
@@ -512,6 +582,11 @@ const postSaleAccounting = async ({
           paymentType: "credit",
           amount: invoice.grandTotal
         });
+      } else if (isCreditNotePayment(invoice.paymentMethod) && paymentsList.length === 0) {
+        paymentsList.push({
+          paymentType: "creditnote",
+          amount: invoice.grandTotal
+        });
       }
 
       // Compute credit and advance portions
@@ -546,26 +621,27 @@ const postSaleAccounting = async ({
           needsReceiptJv += 1; // fallback JV
         } else if (String(p.paymentType || p.mode).toLowerCase() === "advance") {
           needsReceiptJv += 1; // Customer Advance adjustment JV
+        } else if (isCreditNotePayment(p.paymentType || p.mode)) {
+          needsReceiptJv += 1; // Credit Note redemption JV
         }
       }
 
-      const salePromises = [];
-      const receiptPromises = [];
-      
-      if (needsSaleJv) salePromises.push(voucherNumberService.generateVoucherNumber(invoice.companyId, invoice.workspaceId, "SALE", { session }));
+      const saleRes = [];
+      if (needsSaleJv) {
+        const sNum = await voucherNumberService.generateVoucherNumber(invoice.companyId, invoice.workspaceId, "SALE", { session });
+        saleRes.push(sNum);
+      }
+
+      const receiptRes = [];
       for (let i = 0; i < needsReceiptJv; i++) {
-        receiptPromises.push(voucherNumberService.generateVoucherNumber(invoice.companyId, invoice.workspaceId, "JOURNAL", { session }));
+        const rNum = await voucherNumberService.generateVoucherNumber(invoice.companyId, invoice.workspaceId, "JOURNAL", { session });
+        receiptRes.push(rNum);
       }
 
       let baseCashTx = null;
       if (needsCashTx > 0) {
         baseCashTx = await cashTransactionRepository.getNextTransactionNumber(invoice.companyId, invoice.workspaceId, { session });
       }
-
-      const [saleRes, receiptRes] = await Promise.all([
-        Promise.all(salePromises),
-        Promise.all(receiptPromises)
-      ]);
 
       const cashTxRes = [];
       
@@ -585,40 +661,54 @@ const postSaleAccounting = async ({
       const nextCashTx = () => cashTxRes[cashTxIdx++];
 
       // 1. If customer bought on credit, create the SALE JV (Customer -> Sales) for creditPortion ONLY
-      if (customer.ledgerAccountId && preSaleJv && creditPortion > 0) {
-        const saleJvPayload = {
-          voucherNumber: preSaleJv,
-          voucherDate: invoice.date || new Date(),
-          voucherType: "SALE",
-          referenceNumber: invoice.invoiceNo,
-          narration: `Credit Sale against Invoice ${invoice.invoiceNo} for ${customer.name || "Customer"}`,
-          status: "POSTED",
-          lines: [
-            {
-              accountId: customer.ledgerAccountId,
-              debit: creditPortion,
-              credit: 0,
-              narration: `Credit due for Invoice ${invoice.invoiceNo}`
-            },
-            {
-              accountId: salesAccount._id,
-              debit: 0,
-              credit: creditPortion,
-              narration: `Sales from Invoice ${invoice.invoiceNo}`
-            }
-          ]
-        };
-        
-        try {
-          await journalVoucherService.createJournalVoucher(
+      if (preSaleJv && creditPortion > 0) {
+        let customerLedgerAccountId = customer?.ledgerAccountId;
+        if (!customerLedgerAccountId) {
+          const customerAccount = await customerAdvanceService.ensureCustomerLedgerAccount(
+            customer,
             invoice.workspaceId,
             invoice.companyId,
             user?._id,
-            saleJvPayload,
-            { session }
+            session
           );
-        } catch (jvErr) {
-          console.error("--- FAILED TO CREATE CREDIT SALES JV ---", jvErr);
+          customerLedgerAccountId = customerAccount?._id;
+        }
+
+        if (customerLedgerAccountId) {
+          const saleJvPayload = {
+            voucherNumber: preSaleJv,
+            voucherDate: invoice.date || new Date(),
+            voucherType: "SALE",
+            referenceNumber: invoice.invoiceNo,
+            narration: `Credit Sale against Invoice ${invoice.invoiceNo} for ${customer.name || "Customer"}`,
+            status: "POSTED",
+            lines: [
+              {
+                accountId: customerLedgerAccountId,
+                debit: creditPortion,
+                credit: 0,
+                narration: `Credit due for Invoice ${invoice.invoiceNo}`
+              },
+              {
+                accountId: salesAccount._id,
+                debit: 0,
+                credit: creditPortion,
+                narration: `Sales from Invoice ${invoice.invoiceNo}`
+              }
+            ]
+          };
+          
+          try {
+            await journalVoucherService.createJournalVoucher(
+              invoice.workspaceId,
+              invoice.companyId,
+              user?._id,
+              saleJvPayload,
+              { session }
+            );
+          } catch (jvErr) {
+            console.error("--- FAILED TO CREATE CREDIT SALES JV ---", jvErr);
+          }
         }
       }
 
@@ -628,7 +718,8 @@ const postSaleAccounting = async ({
       const receiptNarrationSuffix = "Sale";
 
       for (const payment of paymentsList) {
-        const paymentType = String(payment.paymentType || payment.mode || "").toLowerCase();
+        try {
+          const paymentType = String(payment.paymentType || payment.mode || "").toLowerCase();
         const amount = Number(payment.amount || 0);
         
         if (amount <= 0) continue;
@@ -657,6 +748,10 @@ const postSaleAccounting = async ({
 
               if (receivedAmount === 0 && receivedDenoms.length === 0) {
                 receivedAmount = Number(payment.amount || amount || 0);
+              }
+
+              if (receivedAmount > 0 && (receivedDenoms.length === 0 || receivedDenoms.every(d => Number(d.quantity) === 0))) {
+                receivedDenoms = branchCashRepository.decomposeCashAmount(receivedAmount);
               }
 
               let changeAmount = returnedDenoms.reduce((sum, d) => sum + (Number(d.denomination) * Number(d.quantity)), 0);
@@ -967,15 +1062,69 @@ const postSaleAccounting = async ({
             { $inc: { advanceBalance: -amount } },
             { session }
           );
+        } else if (isCreditNotePayment(paymentType)) {
+          let customerLedgerAccountId = customer?.ledgerAccountId;
+          if (!customerLedgerAccountId) {
+            const customerAccount = await customerAdvanceService.ensureCustomerLedgerAccount(
+              customer,
+              invoice.workspaceId,
+              invoice.companyId,
+              user?._id,
+              session
+            );
+            customerLedgerAccountId = customerAccount?._id;
+          }
+
+          if (customerLedgerAccountId) {
+            const creditNoteJvPayload = {
+              voucherNumber: nextReceiptJv(),
+              voucherDate: invoice.date || new Date(),
+              voucherType: "JOURNAL",
+              referenceNumber: invoice.invoiceNo,
+              narration: `Payment from Credit Note for Invoice ${invoice.invoiceNo}`,
+              status: "POSTED",
+              lines: [
+                {
+                  accountId: customerLedgerAccountId,
+                  debit: amount,
+                  credit: 0,
+                  narration: `Credit Note redemption applied to Invoice ${invoice.invoiceNo}`,
+                },
+                {
+                  accountId: receiptCounterpartyId,
+                  debit: 0,
+                  credit: amount,
+                  narration: `Sales from Invoice ${invoice.invoiceNo} (Credit Note)`,
+                },
+              ],
+            };
+
+            await journalVoucherService.createJournalVoucher(
+              invoice.workspaceId,
+              invoice.companyId,
+              user?._id,
+              creditNoteJvPayload,
+              { session }
+            );
+          }
         }
+      } catch (paymentErr) {
+        console.error(
+          `Error processing split payment leg (${payment?.paymentType || payment?.mode}) for invoice ${invoice.invoiceNo}:`,
+          paymentErr
+        );
       }
     }
+  }
   } catch (jvErr) {
     console.error("Error generating journal vouchers for sale bill:", jvErr);
   }
 };
 
 const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, user = null, existingSession = null) => {
+  // Enforce strict payment total exact match with bill grand total
+  validatePaymentSplitIntegrity(saleData);
+
   // Enforce mandatory cash denomination breakdown
   validateCashDenominations(saleData);
 
@@ -988,11 +1137,10 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     _lastTime = now;
   };
 
-  const session = existingSession || await mongoose.startSession();
-  if (!existingSession) session.startTransaction();
+  let session = existingSession || null;
 
   try {
-    _logTime('Session started');
+    _logTime('Validation started');
     
     // Calculate Financial Year string early for prefix
     const saleDateObj = saleData.date ? new Date(saleData.date) : new Date();
@@ -1006,7 +1154,7 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     }
 
     // Fetch all required reference data concurrently to eliminate sequential network latency
-    const [
+    let [
       customer,
       activeBranches,
       periods,
@@ -1017,7 +1165,9 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
       primaryBankAccount,
       defaultBankAccount
     ] = await Promise.all([
-      customerRepository.findCustomerById(customerId, companyId, workspaceId),
+      (customerId
+        ? customerRepository.findCustomerById(customerId, companyId, workspaceId)
+        : customerRepository.findWalkInCustomer(companyId, workspaceId)),
       branchRepository.getCompanyBranches(companyId),
       financialPeriodRepository.getPeriods(workspaceId, companyId, { isCurrent: true, all: true }),
       Company.findOne({ _id: companyId, workspaceId }),
@@ -1027,6 +1177,10 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
       BankAccount.findOne({ companyId, workspaceId, isDeleted: false, isActive: true, isPrimary: true }),
       BankAccount.findOne({ companyId, workspaceId, isDeleted: false, isActive: true }),
     ]);
+
+  if (!customer && !customerId) {
+    customer = await customerService.findOrCreateWalkInCustomer(workspaceId, companyId, user?._id);
+  }
 
   if (!customer) {
     throw new ApiError(404, "Customer not found");
@@ -1108,36 +1262,110 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     resolvedPaymentQrId = null;
   }
 
-  // Auto-resolve active open shift for branch if not explicitly provided
-  let resolvedShiftId = saleData.shiftId || null;
-  if (!resolvedShiftId && resolvedBranchId) {
-    const activeOpenShift = await Shift.findOne({
-      companyId: companyId || customer.companyId,
-      branchId: resolvedBranchId,
-      status: "open",
-    }).session(session);
-    if (activeOpenShift) {
-      resolvedShiftId = activeOpenShift._id;
+  // ── BUSINESS DAY & SHIFT GATEKEEPER ENFORCEMENT ───────────────────────────
+  // A sale bill CANNOT be created unless there is an OPEN Business Day
+  // and an OPEN Shift for this branch. This prevents stale/bypassed billing
+  // if another user or browser session closed the shift or business day.
+  let resolvedShiftId = null;
+  let resolvedBusinessDayId = null;
+
+  if (resolvedBranchId) {
+    // 1. Concurrently fetch open Business Day and candidate Shift
+    const [openBusinessDay, candidateShift] = await Promise.all([
+      BusinessDay.findOne({
+        branchId: resolvedBranchId,
+        status: "open",
+      }),
+      saleData.shiftId
+        ? Shift.findById(saleData.shiftId)
+        : Shift.findOne({
+            branchId: resolvedBranchId,
+            status: "open",
+          }),
+    ]);
+
+    const isDayClosed = !openBusinessDay;
+    const isShiftClosed = !candidateShift || candidateShift.status !== "open";
+
+    if (isDayClosed && isShiftClosed) {
+      throw new ApiError(
+        400,
+        "Cannot create sale bill. The shift is closed, the business day is closed. Please open a business day and shift before billing."
+      );
     }
+
+    if (isDayClosed) {
+      throw new ApiError(
+        400,
+        "Cannot create sale bill. The Business Day is closed for this branch. Please open a Business Day before billing."
+      );
+    }
+
+    if (isShiftClosed) {
+      throw new ApiError(
+        400,
+        "Cannot create sale bill. The shift is closed. Please open a new shift before billing."
+      );
+    }
+
+    if (candidateShift.branchId && candidateShift.branchId.toString() !== resolvedBranchId.toString()) {
+      throw new ApiError(400, "Cannot create sale bill. Specified shift does not belong to this branch.");
+    }
+
+    if (candidateShift.businessDayId && candidateShift.businessDayId.toString() !== openBusinessDay._id.toString()) {
+      throw new ApiError(
+        400,
+        "Cannot create sale bill. Active shift does not belong to the open Business Day."
+      );
+    }
+
+    resolvedBusinessDayId = openBusinessDay._id;
+    resolvedShiftId = candidateShift._id;
   }
 
-  // Compute credit and advance portions
+  // Compute credit, advance, and credit note portions
   const grandTotal = Number(saleData.grandTotal || 0);
   const paymentsList = Array.isArray(saleData.payments) ? saleData.payments : [];
-  const primaryMethodLower = String(saleData.paymentMethod || "").toLowerCase();
+  const primaryMethodLower = String(saleData.paymentMethod || "").toLowerCase().replace(/[\s_-]/g, "");
 
   let creditPortion = 0;
   let advancePortion = 0;
+  let creditNotePortion = 0;
+  let creditNoteAllocations = [];
 
   if (paymentsList.length > 0) {
     for (const p of paymentsList) {
-      const pType = String(p.paymentType || p.mode || "").toLowerCase();
+      const pType = String(p.paymentType || p.mode || "").toLowerCase().replace(/[\s_-]/g, "");
       if (pType === "credit") creditPortion += Number(p.amount || 0);
       if (pType === "advance") advancePortion += Number(p.amount || 0);
+      if (pType === "creditnote") {
+        creditNotePortion += Number(p.amount || 0);
+        if (Array.isArray(p.creditNoteAllocations) && p.creditNoteAllocations.length > 0) {
+          creditNoteAllocations.push(...p.creditNoteAllocations);
+        }
+      }
     }
   } else {
     if (primaryMethodLower === "credit") creditPortion = grandTotal;
     if (primaryMethodLower === "advance") advancePortion = grandTotal;
+    if (primaryMethodLower === "creditnote") creditNotePortion = grandTotal;
+  }
+
+  if (Array.isArray(saleData.creditNoteAllocations) && saleData.creditNoteAllocations.length > 0) {
+    creditNoteAllocations.push(...saleData.creditNoteAllocations);
+  }
+
+  // ── WALK-IN CUSTOMER ENFORCEMENT ───────────────────────────
+  if (customer.isWalkIn) {
+    if (creditPortion > 0) {
+      throw new ApiError(400, "Credit sale is not allowed for Walk-in Customer.");
+    }
+    if (advancePortion > 0) {
+      throw new ApiError(400, "Advance payment is not allowed for Walk-in Customer.");
+    }
+    if (creditNotePortion > 0) {
+      throw new ApiError(400, "Credit Note redemption is not allowed for Walk-in Customer.");
+    }
   }
 
   // 1. Advance validation
@@ -1152,6 +1380,17 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
       throw new ApiError(
         400,
         `Insufficient advance balance for "${customer.name}". Available: ₹${availableAdvance.toFixed(2)}, Required: ₹${advancePortion.toFixed(2)}.`
+      );
+    }
+  }
+
+  // 2. Credit Note balance validation
+  if (creditNotePortion > 0) {
+    const availableCreditNoteBal = Number(customer.creditNoteBalance || 0);
+    if (availableCreditNoteBal < creditNotePortion - 0.01) {
+      throw new ApiError(
+        400,
+        `Insufficient Credit Note balance for "${customer.name}". Available: ₹${availableCreditNoteBal.toFixed(2)}, Required: ₹${creditNotePortion.toFixed(2)}.`
       );
     }
   }
@@ -1231,6 +1470,7 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     date: saleData.date || new Date(),
     financialPeriodId,
     shiftId: resolvedShiftId || null,
+    businessDayId: resolvedBusinessDayId || null,
     billingMode: saleData.billingMode || "B2C",
     subtotal: saleData.subtotal || 0,
     discount: saleData.discount || 0,
@@ -1248,6 +1488,8 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     creditStatus: creditPortion > 0 ? "PENDING" : "NA",
     creditPaidAmount: 0,
     creditTransactionId: null,
+    creditNoteTotal: creditNotePortion,
+    creditNoteAllocations: [],
     items: Array.isArray(saleData.items) ? saleData.items : [],
     doctor: saleData.doctor || saleData.doctorName || null,
     doctorId: saleData.doctorId || null,
@@ -1256,10 +1498,33 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     createdByName: user?.name || null,
     createdByEmail: user?.email || null,
   };
-  _logTime('Data setup completed');
+  // Start database transaction now that all gatekeeper validations and reads have succeeded
+  if (!session) {
+    session = await mongoose.startSession();
+    session.startTransaction();
+  }
 
   const savedInvoice = await invoiceRepository.createInvoice(newSale, { session });
   _logTime('Invoice created in DB');
+
+  // Redeem Credit Notes if invoice has credit note portion
+  if (creditNotePortion > 0) {
+    const redemptionResult = await creditNoteService.redeemCreditNotesForInvoice(
+      customer._id,
+      creditNotePortion,
+      savedInvoice,
+      {
+        session,
+        user,
+        shiftId: resolvedShiftId || null,
+        creditNoteAllocations,
+      }
+    );
+    savedInvoice.creditNoteTotal = redemptionResult.totalRedeemed;
+    savedInvoice.creditNoteAllocations = redemptionResult.redeemedNotes;
+    await savedInvoice.save({ session });
+    _logTime('Credit notes redeemed and invoice updated');
+  }
 
   // Create CustomerCreditTransaction if invoice has credit portion
   if (creditPortion > 0) {
@@ -1287,6 +1552,13 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
 
     savedInvoice.creditTransactionId = creditTx._id;
     await savedInvoice.save({ session });
+
+    // Update customer creditOutstanding in DB
+    await Customer.findByIdAndUpdate(
+      customer._id,
+      { $inc: { creditOutstanding: creditPortion } },
+      { session }
+    );
   }
 
   // Deduct inventory from Batch and ProductFacility
@@ -1323,7 +1595,7 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
 
     return savedInvoice;
   } catch (error) {
-    if (!existingSession) {
+    if (!existingSession && session) {
       try {
         await session.abortTransaction();
       } catch (abortErr) {
@@ -1355,13 +1627,30 @@ const updateCustomerSale = async (invoiceId, customerId, saleData, companyId, wo
       throw new ApiError(400, "Cannot edit a cancelled invoice");
     }
 
-    // Shift-gate check: Only allow update if shift is open (or invoice has no shift assigned)
+    // Shift-gate and Business Day-gate check
+    if (existingInvoice.branchId) {
+      const openBusinessDay = await BusinessDay.findOne({
+        branchId: existingInvoice.branchId,
+        status: "open",
+      }).session(session);
+
+      if (!openBusinessDay) {
+        throw new ApiError(400, "Cannot edit sale bill. The Business Day is closed for this branch.");
+      }
+    }
+
     if (existingInvoice.shiftId) {
       const shift = await Shift.findById(existingInvoice.shiftId).session(session);
       if (shift && shift.status !== "open") {
         throw new ApiError(403, "Cannot edit an invoice after its shift is closed");
       }
     }
+
+    // Enforce strict payment total exact match with bill grand total
+    validatePaymentSplitIntegrity({
+      ...saleData,
+      grandTotal: saleData.grandTotal !== undefined ? saleData.grandTotal : existingInvoice.grandTotal,
+    });
 
     // Enforce cash denominations validation if payment involves cash
     validateCashDenominations(saleData);
@@ -1370,6 +1659,25 @@ const updateCustomerSale = async (invoiceId, customerId, saleData, companyId, wo
     const customer = await customerRepository.findCustomerById(targetCustomerId, companyId, workspaceId);
     if (!customer) {
       throw new ApiError(404, "Customer not found");
+    }
+
+    if (customer.isWalkIn) {
+      const paymentsList = Array.isArray(saleData.payments) ? saleData.payments : [];
+      const hasCredit = String(saleData.paymentMethod || "").toLowerCase() === "credit" ||
+        paymentsList.some((p) => String(p.paymentType || p.mode || "").toLowerCase().includes("credit"));
+      if (hasCredit) {
+        throw new ApiError(400, "Credit sale is not allowed for Walk-in Customer.");
+      }
+      const hasAdvance = String(saleData.paymentMethod || "").toLowerCase() === "advance" ||
+        paymentsList.some((p) => String(p.paymentType || p.mode || "").toLowerCase().includes("advance"));
+      if (hasAdvance) {
+        throw new ApiError(400, "Advance payment is not allowed for Walk-in Customer.");
+      }
+      const hasCreditNote = String(saleData.paymentMethod || "").toLowerCase().includes("creditnote") ||
+        paymentsList.some((p) => String(p.paymentType || p.mode || "").toLowerCase().includes("creditnote"));
+      if (hasCreditNote) {
+        throw new ApiError(400, "Credit Note redemption is not allowed for Walk-in Customer.");
+      }
     }
 
     // 1. Revert Old Inventory (Add quantities back)
@@ -1386,6 +1694,14 @@ const updateCustomerSale = async (invoiceId, customerId, saleData, companyId, wo
       companyId,
       user?._id || user?.id,
       session
+    );
+
+    // Revert old credit notes if any
+    await creditNoteService.revertInvoiceCreditNotes(
+      existingInvoice._id,
+      companyId || existingInvoice.companyId,
+      workspaceId || existingInvoice.workspaceId,
+      { session }
     );
 
     // 4. Resolve paymentQrId for UPI attribution
@@ -1469,6 +1785,42 @@ const updateCustomerSale = async (invoiceId, customerId, saleData, companyId, wo
       existingInvoice.updatedBy = user._id;
       existingInvoice.updatedByName = user.name || null;
       existingInvoice.updatedByEmail = user.email || null;
+    }
+
+    // Re-redeem credit notes if update contains credit note portion
+    const updatedPayments = Array.isArray(saleData.payments) ? saleData.payments : existingInvoice.payments;
+    let updateCreditNotePortion = 0;
+    let updateCreditNoteAllocations = [];
+    if (Array.isArray(updatedPayments) && updatedPayments.length > 0) {
+      for (const p of updatedPayments) {
+        if (isCreditNotePayment(p.paymentType || p.mode)) {
+          updateCreditNotePortion += Number(p.amount || 0);
+          if (Array.isArray(p.creditNoteAllocations) && p.creditNoteAllocations.length > 0) {
+            updateCreditNoteAllocations.push(...p.creditNoteAllocations);
+          }
+        }
+      }
+    } else if (isCreditNotePayment(saleData.paymentMethod || existingInvoice.paymentMethod)) {
+      updateCreditNotePortion = Number(saleData.grandTotal !== undefined ? saleData.grandTotal : existingInvoice.grandTotal);
+    }
+
+    if (updateCreditNotePortion > 0) {
+      const redemptionResult = await creditNoteService.redeemCreditNotesForInvoice(
+        customer._id,
+        updateCreditNotePortion,
+        existingInvoice,
+        {
+          session,
+          user,
+          shiftId: existingInvoice.shiftId || null,
+          creditNoteAllocations: updateCreditNoteAllocations,
+        }
+      );
+      existingInvoice.creditNoteTotal = redemptionResult.totalRedeemed;
+      existingInvoice.creditNoteAllocations = redemptionResult.redeemedNotes;
+    } else {
+      existingInvoice.creditNoteTotal = 0;
+      existingInvoice.creditNoteAllocations = [];
     }
 
     await existingInvoice.save({ session });
@@ -1787,13 +2139,25 @@ const cancelCustomerSale = async (
       );
     }
 
-    // Cancel linked CustomerCreditTransaction if pending
+    // Cancel linked CustomerCreditTransaction if pending and restore creditOutstanding
     if (invoice.creditTransactionId || invoice.creditStatus === "PENDING") {
+      const pendingCredits = await CustomerCreditTransaction.find({
+        invoiceId: invoice._id,
+        status: "PENDING",
+      }).session(session);
+      const totalCreditToCancel = pendingCredits.reduce((s, c) => s + (Number(c.balanceDue) || 0), 0);
       await CustomerCreditTransaction.updateMany(
         { invoiceId: invoice._id, status: "PENDING" },
         { status: "CANCELLED" },
         { session }
       );
+      if (invoice.customerId && totalCreditToCancel > 0) {
+        await Customer.findByIdAndUpdate(
+          invoice.customerId,
+          { $inc: { creditOutstanding: -totalCreditToCancel } },
+          { session }
+        );
+      }
     }
 
     // Revert any advance deduction for this invoice to restore customer's advance balance
@@ -1814,6 +2178,14 @@ const cancelCustomerSale = async (
         );
       }
     }
+
+    // Revert any credit note redemption for this invoice to restore customer's credit note balance
+    await creditNoteService.revertInvoiceCreditNotes(
+      invoice._id,
+      companyId || invoice.companyId,
+      workspaceId || invoice.workspaceId,
+      { session }
+    );
 
     // Shift-gate check: Only allow cancellation if shift is open (or invoice has no shift assigned)
     const { Shift } = await import("../../../operations/shifts/shift.model.js");
@@ -1968,3 +2340,4 @@ export default {
   getNextInvoiceNumber,
   getInvoiceById,
 };
+

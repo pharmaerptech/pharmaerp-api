@@ -225,13 +225,28 @@ const shiftSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
-    // Split Cash and UPI portion breakdown
+    // Split portion breakdown across all payment modes
     splitCashAmount: {
       type: Number,
       default: 0,
       min: 0,
     },
     splitUpiAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    splitCreditAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    splitAdvanceAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    splitCreditNoteAmount: {
       type: Number,
       default: 0,
       min: 0,
@@ -246,6 +261,30 @@ const shiftSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    pureCreditAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    pureAdvanceAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    pureCreditNoteAmount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    // Multi-mode split combinations breakdown (e.g. Cash + Credit Note, UPI + Advance)
+    splitCombinations: [
+      {
+        combination: { type: String, default: "" },
+        modes: [{ type: String }],
+        count: { type: Number, default: 0 },
+        totalAmount: { type: Number, default: 0 },
+      },
+    ],
     cashInvoiceCount: {
       type: Number,
       default: 0,
@@ -272,6 +311,16 @@ const shiftSchema = new mongoose.Schema(
       min: 0,
     },
     advanceInvoiceCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    creditNoteSalesTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    creditNoteInvoiceCount: {
       type: Number,
       default: 0,
       min: 0,
@@ -478,6 +527,11 @@ const shiftSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    returnCreditNoteTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     returnSplitTotal: {
       type: Number,
       default: 0,
@@ -518,6 +572,10 @@ const shiftSchema = new mongoose.Schema(
         count: { type: Number, default: 0 },
         amount: { type: Number, default: 0 },
       },
+      creditNote: {
+        count: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+      },
       upi: {
         count: { type: Number, default: 0 },
         amount: { type: Number, default: 0 },
@@ -530,6 +588,18 @@ const shiftSchema = new mongoose.Schema(
         count: { type: Number, default: 0 },
         amount: { type: Number, default: 0 },
       },
+    },
+
+    // ── UPI Settlement Status (Held until Business Day Close) ─────────────
+    upiSettlementStatus: {
+      type: String,
+      enum: ["PENDING_BUSINESS_DAY_CLOSE", "SETTLED", "NOT_APPLICABLE"],
+      default: "PENDING_BUSINESS_DAY_CLOSE",
+      index: true,
+    },
+    upiSettledAt: {
+      type: Date,
+      default: null,
     },
   },
   { timestamps: true }

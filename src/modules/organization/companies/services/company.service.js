@@ -5,6 +5,7 @@ import companyRepository from "../repositories/company.repository.js";
 import workspaceRepository from "../../workspaces/repositories/workspace.repository.js";
 import memberAccessRepository from "../../../core/access-control/repositories/memberAccess.repository.js";
 import coaSeederService from "../../../finance/chart-of-accounts/services/coaSeeder.service.js";
+import customerService from "../../../parties/customers/services/customer.service.js";
 import financialPeriodService from "../../../finance/financial-periods/services/financialPeriod.service.js";
 import { PERIOD_TYPE, PERIOD_STATUS } from "../../../finance/financial-periods/constants/financialPeriod.constant.js";
 import { COMPANY_STATUS } from "../constants/company.constant.js";
@@ -110,6 +111,9 @@ const createCompany = async (workspaceId, userId, payload) => {
 
     // Seed default Chart of Accounts groups and accounts for the new company
     await coaSeederService.seedCompanyChartOfAccounts(workspaceId, company._id, userId, { session });
+
+    // Automatically create default Walk-in Customer for the new company
+    await customerService.findOrCreateWalkInCustomer(workspaceId, company._id, userId, { session });
 
     await session.commitTransaction();
     session.endSession();

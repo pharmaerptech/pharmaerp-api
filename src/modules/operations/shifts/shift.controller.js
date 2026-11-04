@@ -137,8 +137,14 @@ export const getShiftSummary = asyncHandler(async (req, res, next) => {
   let splitNet = 0;
   let splitCashAmount = 0;
   let splitUpiAmount = 0;
+  let splitCreditAmount = 0;
+  let splitAdvanceAmount = 0;
+  let splitCreditNoteAmount = 0;
   let pureCashAmount = 0;
   let pureUpiAmount = 0;
+  let pureCreditAmount = 0;
+  let pureAdvanceAmount = 0;
+  let pureCreditNoteAmount = 0;
   let netSales = 0;
   let paymentQrCount = 0;
   let qrNet = 0;
@@ -147,22 +153,27 @@ export const getShiftSummary = asyncHandler(async (req, res, next) => {
   let creditInvoiceCount = 0;
   let advanceSalesTotal = 0;
   let advanceInvoiceCount = 0;
+  let creditNoteSalesTotal = 0;
+  let creditNoteInvoiceCount = 0;
   let returnCount = 0;
   let returnAmount = 0;
   let returnCashTotal = 0;
   let returnUpiTotal = 0;
   let returnAdvanceTotal = 0;
   let returnCreditTotal = 0;
+  let returnCreditNoteTotal = 0;
   let returnSplitTotal = 0;
   const returnInvoices = [];
   const returnBreakdown = {
     cash: { count: 0, amount: 0 },
     advance: { count: 0, amount: 0 },
     credit: { count: 0, amount: 0 },
+    creditNote: { count: 0, amount: 0 },
     upi: { count: 0, amount: 0 },
     split: { count: 0, amount: 0 },
     other: { count: 0, amount: 0 },
   };
+  const splitCombinationsMap = new Map();
 
   // Cancelled metrics tracking
   let cancelledInvoiceCount = 0;
@@ -308,7 +319,11 @@ export const getShiftSummary = asyncHandler(async (req, res, next) => {
         returnAdvanceTotal += billTotal;
         returnBreakdown.advance.count += 1;
         returnBreakdown.advance.amount += billTotal;
-      } else if (retType === "credit_note" || pMethod.includes("CREDIT")) {
+      } else if (retType === "credit_note" || pMethod.includes("CREDIT_NOTE") || pMethod.includes("CREDITNOTE")) {
+        returnCreditNoteTotal += billTotal;
+        returnBreakdown.creditNote.count += 1;
+        returnBreakdown.creditNote.amount += billTotal;
+      } else if (pMethod.includes("CREDIT")) {
         returnCreditTotal += billTotal;
         returnBreakdown.credit.count += 1;
         returnBreakdown.credit.amount += billTotal;
@@ -361,71 +376,124 @@ export const getShiftSummary = asyncHandler(async (req, res, next) => {
 
     // Regular active sale logic
     invoiceCount++;
-    netSales += inv.grandTotal;
+    const billGrandTotal = Number(inv.grandTotal || 0);
+    netSales += billGrandTotal;
 
-    if (inv.paymentMethod === "Split") {
+    const isSplit = inv.paymentMethod === "Split" || (Array.isArray(inv.payments) && inv.payments.length > 1);
+
+    if (isSplit) {
       splitInvoiceCount++;
-      splitNet += inv.grandTotal || 0;
+      splitNet += billGrandTotal;
+
       let billSplitCash = 0;
       let billSplitUpi = 0;
-      let hasCreditInBill = false;
-      let hasAdvanceInBill = false;
+      let billSplitCredit = 0;
+      let billSplitAdvance = 0;
+      let billSplitCreditNote = 0;
+      const modesInBill = new Set();
+
       if (Array.isArray(inv.payments) && inv.payments.length > 0) {
         for (const p of inv.payments) {
-          const pType = p.paymentType ? p.paymentType.toUpperCase() : "CASH";
+          const pType = String(p.paymentType || p.paymentMode || p.type || p.mode || "").toUpperCase();
           const amt = Number(p.amount || 0);
+          if (amt <= 0) continue;
+
           if (pType.includes("UPI") || pType.includes("QR")) {
             billSplitUpi += amt;
+            modesInBill.add("UPI");
             _trackUpi(p.paymentQrId || inv.paymentQrId, amt, inv._id, true);
+          } else if (pType.includes("CREDIT_NOTE") || pType.includes("CREDITNOTE")) {
+            billSplitCreditNote += amt;
+            modesInBill.add("Credit Note");
           } else if (pType.includes("CREDIT")) {
-            creditSalesTotal += amt;
-            hasCreditInBill = true;
+            billSplitCredit += amt;
+            modesInBill.add("Credit");
           } else if (pType.includes("ADVANCE") || pType.includes("WALLET")) {
-            advanceSalesTotal += amt;
-            hasAdvanceInBill = true;
+            billSplitAdvance += amt;
+            modesInBill.add("Advance");
           } else if (pType.includes("CASH")) {
             billSplitCash += amt;
-          } else if (!pType.includes("CARD")) {
+            modesInBill.add("Cash");
+          } else {
             billSplitCash += amt;
+            modesInBill.add("Cash");
           }
         }
       } else {
         const tendered = Number(inv.cashTendered || 0);
-        billSplitCash = Math.min(Number(inv.grandTotal || 0), tendered);
-        billSplitUpi = Math.max(0, Number(inv.grandTotal || 0) - billSplitCash);
+        billSplitCash = Math.min(billGrandTotal, tendered);
+        billSplitUpi = Math.max(0, billGrandTotal - billSplitCash);
+        if (billSplitCash > 0) modesInBill.add("Cash");
+        if (billSplitUpi > 0) modesInBill.add("UPI");
       }
-      if (hasCreditInBill) creditInvoiceCount++;
-      if (hasAdvanceInBill) advanceInvoiceCount++;
+
+      // Check change due on cash portion in split
+      if (billSplitCash > 0 && inv.changeDue > 0 && inv.cashTendered > 0) {
+        const netCashTendered = Math.max(0, Number(inv.cashTendered) - Number(inv.changeDue));
+        if (netCashTendered < billSplitCash) {
+          billSplitCash = netCashTendered;
+        }
+      }
+
+      if (billSplitCredit > 0) {
+        creditInvoiceCount++;
+        creditSalesTotal += billSplitCredit;
+      }
+      if (billSplitAdvance > 0) {
+        advanceInvoiceCount++;
+        advanceSalesTotal += billSplitAdvance;
+      }
+      if (billSplitCreditNote > 0) {
+        creditNoteInvoiceCount++;
+        creditNoteSalesTotal += billSplitCreditNote;
+      }
+
       splitCashAmount += billSplitCash;
       splitUpiAmount += billSplitUpi;
+      splitCreditAmount += billSplitCredit;
+      splitAdvanceAmount += billSplitAdvance;
+      splitCreditNoteAmount += billSplitCreditNote;
+
       cashNet += billSplitCash;
       qrNet += billSplitUpi;
-      // Note: splitInvoiceCount tracks split bills separately; pure cashInvoiceCount and paymentQrCount are NOT incremented
+
+      // Group into readable split combinations
+      const sortedModes = Array.from(modesInBill).sort();
+      const combKey = sortedModes.join(" + ") || "Split";
+      if (!splitCombinationsMap.has(combKey)) {
+        splitCombinationsMap.set(combKey, {
+          combination: combKey,
+          modes: sortedModes,
+          count: 0,
+          totalAmount: 0,
+        });
+      }
+      const comb = splitCombinationsMap.get(combKey);
+      comb.count += 1;
+      comb.totalAmount += billGrandTotal;
     } else {
-      const pMethod = inv.paymentMethod ? inv.paymentMethod.toUpperCase() : "CASH";
+      const pMethod = String(inv.paymentMethod || "").toUpperCase();
 
       if (pMethod.includes("UPI") || pMethod.includes("QR")) {
         paymentQrCount++;
-        const amt = Number(inv.grandTotal || 0);
-        pureUpiAmount += amt;
-        qrNet += amt;
-        _trackUpi(inv.paymentQrId, amt, inv._id, false);
-      } else if (pMethod.includes("CASH")) {
-        cashInvoiceCount++;
-        const amt = (inv.cashTendered - inv.changeDue > 0) ? (inv.cashTendered - inv.changeDue) : Number(inv.grandTotal || 0);
-        pureCashAmount += amt;
-        cashNet += amt;
+        pureUpiAmount += billGrandTotal;
+        qrNet += billGrandTotal;
+        _trackUpi(inv.paymentQrId, billGrandTotal, inv._id, false);
+      } else if (pMethod.includes("CREDIT_NOTE") || pMethod.includes("CREDITNOTE")) {
+        creditNoteInvoiceCount++;
+        pureCreditNoteAmount += billGrandTotal;
+        creditNoteSalesTotal += billGrandTotal;
       } else if (pMethod.includes("CREDIT")) {
         creditInvoiceCount++;
-        const amt = Number(inv.grandTotal || 0);
-        creditSalesTotal += amt;
+        pureCreditAmount += billGrandTotal;
+        creditSalesTotal += billGrandTotal;
       } else if (pMethod.includes("ADVANCE")) {
         advanceInvoiceCount++;
-        const amt = Number(inv.grandTotal || 0);
-        advanceSalesTotal += amt;
+        pureAdvanceAmount += billGrandTotal;
+        advanceSalesTotal += billGrandTotal;
       } else {
         cashInvoiceCount++;
-        const amt = Number(inv.grandTotal || 0);
+        const amt = (inv.cashTendered - inv.changeDue > 0) ? (inv.cashTendered - inv.changeDue) : billGrandTotal;
         pureCashAmount += amt;
         cashNet += amt;
       }
@@ -845,8 +913,29 @@ export const getShiftSummary = asyncHandler(async (req, res, next) => {
     splitSalesTotal: splitNet,
     creditSalesTotal: (shift.status === "closed" && shift.creditSalesTotal != null) ? shift.creditSalesTotal : creditSalesTotal,
     creditInvoiceCount: (shift.status === "closed" && shift.creditInvoiceCount != null) ? shift.creditInvoiceCount : creditInvoiceCount,
+    pureCreditAmount: (shift.status === "closed" && shift.pureCreditAmount != null) ? shift.pureCreditAmount : pureCreditAmount,
+    splitCreditAmount: (shift.status === "closed" && shift.splitCreditAmount != null) ? shift.splitCreditAmount : splitCreditAmount,
+
     advanceSalesTotal: (shift.status === "closed" && shift.advanceSalesTotal != null) ? shift.advanceSalesTotal : advanceSalesTotal,
     advanceInvoiceCount: (shift.status === "closed" && shift.advanceInvoiceCount != null) ? shift.advanceInvoiceCount : advanceInvoiceCount,
+    pureAdvanceAmount: (shift.status === "closed" && shift.pureAdvanceAmount != null) ? shift.pureAdvanceAmount : pureAdvanceAmount,
+    splitAdvanceAmount: (shift.status === "closed" && shift.splitAdvanceAmount != null) ? shift.splitAdvanceAmount : splitAdvanceAmount,
+
+    creditNoteSalesTotal: (shift.status === "closed" && shift.creditNoteSalesTotal != null) ? shift.creditNoteSalesTotal : creditNoteSalesTotal,
+    creditNoteInvoiceCount: (shift.status === "closed" && shift.creditNoteInvoiceCount != null) ? shift.creditNoteInvoiceCount : creditNoteInvoiceCount,
+    pureCreditNoteAmount: (shift.status === "closed" && shift.pureCreditNoteAmount != null) ? shift.pureCreditNoteAmount : pureCreditNoteAmount,
+    splitCreditNoteAmount: (shift.status === "closed" && shift.splitCreditNoteAmount != null) ? shift.splitCreditNoteAmount : splitCreditNoteAmount,
+
+    splitCombinations: (shift.status === "closed" && shift.splitCombinations?.length > 0)
+      ? shift.splitCombinations
+      : Array.from(splitCombinationsMap.values()),
+    splitBreakdown: {
+      cash: { amount: splitCashAmount },
+      upi: { amount: splitUpiAmount },
+      credit: { amount: splitCreditAmount },
+      advance: { amount: splitAdvanceAmount },
+      creditNote: { amount: splitCreditNoteAmount },
+    },
     upiBreakdown,
     expectedClosingCashAmount,
     withdrawals,

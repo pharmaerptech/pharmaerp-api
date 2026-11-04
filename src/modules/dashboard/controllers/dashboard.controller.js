@@ -49,11 +49,15 @@ export const getCompanyDashboard = asyncHandler(async (req, res) => {
     null;
 
   const timeframe = req.query.timeframe || "THIS_MONTH";
+  const startDate = req.query.startDate || null;
+  const endDate = req.query.endDate || null;
 
   const data = await dashboardService.getCompanyDashboardData({
     workspaceId: req.workspaceId,
     companyId,
     timeframe,
+    startDate,
+    endDate,
   });
 
   return res
@@ -63,10 +67,14 @@ export const getCompanyDashboard = asyncHandler(async (req, res) => {
 
 export const getWorkspaceDashboard = asyncHandler(async (req, res) => {
   const timeframe = req.query.timeframe || "THIS_MONTH";
+  const startDate = req.query.startDate || null;
+  const endDate = req.query.endDate || null;
 
   const data = await dashboardService.getWorkspaceDashboardData({
     workspaceId: req.workspaceId,
     timeframe,
+    startDate,
+    endDate,
   });
 
   return res

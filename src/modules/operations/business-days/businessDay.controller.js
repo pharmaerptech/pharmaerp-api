@@ -15,6 +15,7 @@ import {
   cancelBusinessDay as cancelBusinessDayService,
   getOpenBusinessDay as getOpenBusinessDayService,
   getSuggestedBusinessDate as getSuggestedBusinessDateService,
+  aggregateBusinessDayUpiCollections,
 } from "./businessDay.service.js";
 
 // ── Shared helpers (reused from shift summary logic) ─────────────────────────
@@ -532,6 +533,25 @@ export const getBusinessDaySummary = asyncHandler(async (req, res, next) => {
   });
 
   const upiBreakdown = Object.values(upiBreakdownRaw);
+
+  let upiBankSummary = [];
+  try {
+    const { bankTotalsMap } = await aggregateBusinessDayUpiCollections(businessDay, allShifts);
+    upiBankSummary = Array.from(bankTotalsMap.values()).map((b) => ({
+      ...b,
+      totalAmount: Math.round(Number(b.totalAmount) * 100) / 100,
+    }));
+  } catch (aggErr) {
+    console.warn("[getBusinessDaySummary] Error aggregating UPI per bank:", aggErr.message);
+  }
+  const totalSettlementUpiAmount = Math.round(
+    upiBankSummary.reduce((sum, b) => sum + (Number(b.totalAmount) || 0), 0) * 100
+  ) / 100;
+  const totalSettlementUpiCount = upiBankSummary.reduce(
+    (sum, b) => sum + (Number(b.transactionCount) || 0),
+    0
+  );
+
   const shiftIds = allShifts.map((s) => s._id);
   const ftData = await fetchFundTransfers({
     shifts: allShifts,
@@ -631,6 +651,9 @@ export const getBusinessDaySummary = asyncHandler(async (req, res, next) => {
     totalCashNet,
     totalQrNet,
     upiBreakdown,
+    upiBankSummary,
+    totalSettlementUpiAmount,
+    totalSettlementUpiCount,
     withdrawals: ftData.withdrawals,
     deposits: ftData.deposits,
     totalWithdrawals: totalFundWithdrawals,

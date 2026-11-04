@@ -16,4 +16,13 @@ export const reportQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(200).default(25).optional(),
   search: Joi.string().trim().allow("").optional(),
+  paymentMethod: Joi.string().trim().allow("").optional(),
+  status: Joi.string().trim().allow("").optional(),
+  sortBy: Joi.string().trim().allow("").optional(),
+  sortOrder: Joi.string().valid("asc", "desc", "1", "-1").optional(),
+  customerId: objectId.optional(),
+  supplierId: objectId.optional(),
+  productId: objectId.optional(),
+  billNo: Joi.string().trim().allow("").optional(),
+  timeframe: Joi.string().valid("daily", "weekly", "monthly").optional(),
 });

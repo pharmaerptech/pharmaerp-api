@@ -9,8 +9,19 @@ import Customer from "../../parties/customers/models/customer.model.js";
 import Supplier from "../../parties/suppliers/models/supplier.model.js";
 import Branch from "../../organization/branches/models/branch.model.js";
 import Company from "../../organization/companies/models/company.model.js";
+import Workspace from "../../organization/workspaces/models/workspace.model.js";
+import WorkspaceMember from "../../organization/workspaces/models/workspaceMember.model.js";
+import Subscription from "../../subscription/subscriptions/models/subscription.model.js";
+import BranchCashBalance from "../../finance/treasury/cash-management/branch-cash/models/branchCashBalance.model.js";
+import AccountBalance from "../../finance/account-balances/models/accountBalance.model.js";
 import { BusinessDay } from "../../operations/business-days/businessDay.model.js";
 import TransferOrder from "../../transfer-order/models/transferOrder.model.js";
+import Role from "../../core/access-control/models/role.model.js";
+import User from "../../core/users/models/user.model.js";
+import BankAccount from "../../finance/treasury/bank-management/bank-accounts/models/bankAccount.model.js";
+import Account from "../../finance/chart-of-accounts/models/account.model.js";
+import BankMaster from "../../platform/global-catalog/bank-master/models/bankMaster.model.js";
+import GstLedger from "../../finance/gst-ledger/models/gstLedger.model.js";
 
 /**
  * Parse an expiry string like "MM/YY", "MM/YYYY", "YYYY-MM", or "YYYY-MM-DD"
@@ -539,47 +550,103 @@ export const getBranchDashboardData = async ({ workspaceId, companyId, branchId 
   const compObjectId = companyId && mongoose.Types.ObjectId.isValid(companyId) ? new mongoose.Types.ObjectId(companyId) : null;
   let branchObjectId = branchId && mongoose.Types.ObjectId.isValid(branchId) ? new mongoose.Types.ObjectId(branchId) : null;
 
-  // Find branch if possible
+  // Resolve Branch Document
   let branchDoc = null;
   if (branchObjectId) {
-    branchDoc = await Branch.findById(branchObjectId).lean();
+    branchDoc = await Branch.findOne({ _id: branchObjectId, isDeleted: false }).lean();
   }
   if (!branchDoc && compObjectId) {
     branchDoc = await Branch.findOne({ companyId: compObjectId, isDeleted: false }).lean();
     if (branchDoc) branchObjectId = branchDoc._id;
   }
 
-  const now = date ? new Date(date) : new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-  const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+  // Resolve Active Business Day
+  const activeBusinessDay = branchObjectId
+    ? await BusinessDay.findOne({ branchId: branchObjectId, status: { $regex: /^open$/i } }).lean()
+    : null;
 
-  const startOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0, 0);
-  const endOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 23, 59, 59, 999);
+  // IST Date Boundaries (UTC+05:30)
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const now = date && date !== "Today" && date !== "Yesterday" ? new Date(date) : new Date();
+  const nowIST = new Date(now.getTime() + IST_OFFSET_MS);
 
-  // Active BusinessDay and Shift
-  const [activeBusinessDay, activeShift] = await Promise.all([
-    branchObjectId ? BusinessDay.findOne({ branchId: branchObjectId, status: "open" }).lean() : null,
-    branchObjectId ? Shift.findOne({ branchId: branchObjectId, status: "open" }).populate("openedBy", "fullName firstName lastName").lean() : null,
-  ]);
+  const y = nowIST.getUTCFullYear();
+  const m = nowIST.getUTCMonth();
+  const d = nowIST.getUTCDate();
 
-  // Today's Invoices match filter
-  const branchInvoiceFilter = { isDeleted: false };
-  if (wsObjectId) branchInvoiceFilter.workspaceId = wsObjectId;
-  if (compObjectId) branchInvoiceFilter.companyId = compObjectId;
-  if (branchObjectId) branchInvoiceFilter.branchId = branchObjectId;
+  const startOfToday = new Date(Date.UTC(y, m, d, 0, 0, 0, 0) - IST_OFFSET_MS);
+  const endOfToday = new Date(Date.UTC(y, m, d, 23, 59, 59, 999) - IST_OFFSET_MS);
 
-  const todayInvoiceFilter = {
-    ...branchInvoiceFilter,
-    date: { $gte: startOfToday, $lte: endOfToday },
+  const startOfYesterday = new Date(Date.UTC(y, m, d - 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+  const endOfYesterday = new Date(Date.UTC(y, m, d - 1, 23, 59, 59, 999) - IST_OFFSET_MS);
+
+  const todayDateStr = `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const dateFormatted = `${MONTH_NAMES[m]} ${String(d).padStart(2, "0")}, ${y}`;
+
+  // Invoice Filters
+  const branchInvoiceFilter = {
+    isDeleted: false,
+    ...(wsObjectId ? { workspaceId: wsObjectId } : {}),
+    ...(compObjectId ? { companyId: compObjectId } : {}),
+    ...(branchObjectId ? { branchId: branchObjectId } : {}),
   };
+
+  const isYesterday = date === "Yesterday";
+
+  const todayInvoiceFilter = isYesterday
+    ? {
+        ...branchInvoiceFilter,
+        $or: [
+          { date: { $gte: startOfYesterday, $lte: endOfYesterday } },
+          { createdAt: { $gte: startOfYesterday, $lte: endOfYesterday } },
+        ],
+      }
+    : {
+        ...branchInvoiceFilter,
+        $or: [
+          { date: { $gte: startOfToday, $lte: endOfToday } },
+          { createdAt: { $gte: startOfToday, $lte: endOfToday } },
+          ...(activeBusinessDay?._id ? [{ businessDayId: activeBusinessDay._id }] : []),
+        ],
+      };
 
   const yesterdayInvoiceFilter = {
     ...branchInvoiceFilter,
-    date: { $gte: startOfYesterday, $lte: endOfYesterday },
+    $or: [
+      { date: { $gte: startOfYesterday, $lte: endOfYesterday } },
+      { createdAt: { $gte: startOfYesterday, $lte: endOfYesterday } },
+    ],
   };
 
-  // Queries
-  const [todaySalesAgg, yesterdaySalesAgg, todayInvoices, lowStockResult, nearExpiryResult, recentPurchases, transferOrders] = await Promise.all([
+  const todayPurchasesFilter = {
+    isDeleted: false,
+    ...(wsObjectId ? { workspaceId: wsObjectId } : {}),
+    ...(compObjectId ? { companyId: compObjectId } : {}),
+    ...(branchObjectId ? { branchId: branchObjectId } : {}),
+    $or: [
+      { createdAt: { $gte: startOfToday, $lte: endOfToday } },
+      { invoiceDate: todayDateStr },
+      ...(activeBusinessDay?.actualOpenedAt ? [{ createdAt: { $gte: activeBusinessDay.actualOpenedAt } }] : []),
+    ],
+  };
+
+  // Execute Parallel Aggregations
+  const [
+    activeShift,
+    branchCashDoc,
+    todaySalesAgg,
+    yesterdaySalesAgg,
+    hourlyAggResult,
+    paymentAggResult,
+    todayInvoices,
+    lowStockResult,
+    allBatchesResult,
+    recentPurchases,
+    transferOrders,
+  ] = await Promise.all([
+    branchObjectId ? Shift.findOne({ branchId: branchObjectId, status: { $regex: /^open$/i } }).populate("openedBy", "fullName firstName lastName").lean() : null,
+    branchObjectId ? BranchCashBalance.findOne({ branchId: branchObjectId }).lean() : null,
     SalesInvoice.aggregate([
       { $match: todayInvoiceFilter },
       {
@@ -587,7 +654,15 @@ export const getBranchDashboardData = async ({ workspaceId, companyId, branchId 
           _id: null,
           totalAmount: { $sum: "$grandTotal" },
           count: { $sum: 1 },
-          itemsSold: { $sum: { $size: { $ifNull: ["$items", []] } } },
+          itemsSold: {
+            $sum: {
+              $reduce: {
+                input: { $ifNull: ["$items", []] },
+                initialValue: 0,
+                in: { $add: ["$$value", { $ifNull: ["$$this.qty", 1] }] },
+              },
+            },
+          },
           uniqueCustomers: { $addToSet: "$customerId" },
         },
       },
@@ -599,201 +674,299 @@ export const getBranchDashboardData = async ({ workspaceId, companyId, branchId 
           _id: null,
           totalAmount: { $sum: "$grandTotal" },
           count: { $sum: 1 },
-          itemsSold: { $sum: { $size: { $ifNull: ["$items", []] } } },
-          uniqueCustomers: { $addToSet: "$customerId" },
+          itemsSold: {
+            $sum: {
+              $reduce: {
+                input: { $ifNull: ["$items", []] },
+                initialValue: 0,
+                in: { $add: ["$$value", { $ifNull: ["$$this.qty", 1] }] },
+              },
+            },
+          },
         },
       },
     ]),
-    SalesInvoice.find(todayInvoiceFilter).sort({ date: -1 }).limit(10).populate("customerId", "name mobile").lean(),
-    // Low stock
-    WorkspaceProduct.aggregate([
-      { $match: { isDeleted: false } },
-      {
-        $lookup: {
-          from: "batches",
-          localField: "_id",
-          foreignField: "product_id",
-          as: "batches",
-        },
-      },
+    // Hourly Aggregation for Today
+    SalesInvoice.aggregate([
+      { $match: todayInvoiceFilter },
       {
         $project: {
-          productName: "$name",
-          batches: "$batches",
-          totalStock: { $sum: "$batches.quantity" },
+          hour: { $hour: { date: { $ifNull: ["$date", "$createdAt"] }, timezone: "+05:30" } },
+          grandTotal: 1,
         },
       },
-      { $match: { totalStock: { $lte: 50 } } },
-      { $limit: 10 },
+      {
+        $group: {
+          _id: "$hour",
+          sales: { $sum: "$grandTotal" },
+          invoices: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
     ]),
-    // Near expiry
-    Batch.find({
-      isDeleted: false,
-      quantity: { $gt: 0 },
-    }).populate("product_id", "name").sort({ expiryDate: 1 }).limit(10).lean(),
-    // Recent purchases
-    PurchaseBill.find({
-      isDeleted: false,
-      ...(wsObjectId ? { workspaceId: wsObjectId } : {}),
-      ...(compObjectId ? { companyId: compObjectId } : {}),
-    }).sort({ createdAt: -1 }).limit(5).populate("supplierId", "businessName name").lean(),
-    // Inter-branch transfers
-    branchObjectId ? TransferOrder.find({
-      $or: [{ sourceBranchId: branchObjectId }, { destinationBranchId: branchObjectId }],
-    }).sort({ createdAt: -1 }).limit(5).populate("sourceBranchId destinationBranchId", "branchName branchCode").lean() : [],
+    // Payment Mode Breakdown
+    SalesInvoice.aggregate([
+      { $match: todayInvoiceFilter },
+      {
+        $group: {
+          _id: { $ifNull: ["$paymentMethod", "Cash"] },
+          amount: { $sum: "$grandTotal" },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { amount: -1 } },
+    ]),
+    // Recent 5 Sales Invoices
+    SalesInvoice.find(todayInvoiceFilter)
+      .sort({ createdAt: -1, date: -1 })
+      .limit(5)
+      .populate("customerId", "name mobile")
+      .lean(),
+    // Low Stock (total_qty_available <= 20)
+    branchObjectId
+      ? ProductFacility.find({
+          workspaceId: wsObjectId,
+          facility_id: branchObjectId,
+          isDeleted: false,
+          total_qty_available: { $lte: 20 },
+        })
+          .populate("product_id", "name workspaceProductCode productType")
+          .sort({ total_qty_available: 1 })
+          .limit(5)
+          .lean()
+      : [],
+    // Batches for Near Expiry (< 30 days) and Expired
+    branchObjectId
+      ? Batch.find({
+          workspaceId: wsObjectId,
+          branch_id: branchObjectId,
+          isDeleted: false,
+          batchQty: { $gt: 0 },
+        })
+          .populate("product", "name workspaceProductCode productType")
+          .lean()
+      : [],
+    // Recent Purchases received today
+    PurchaseBill.find(todayPurchasesFilter)
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .populate("supplierId", "businessName name")
+      .lean(),
+    // Inter-Branch Transfers
+    branchObjectId
+      ? TransferOrder.find({
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [{ sourceBranchId: branchObjectId }, { destinationBranchId: branchObjectId }],
+        })
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .populate("sourceBranchId destinationBranchId", "name branchName branchCode")
+          .lean()
+      : [],
   ]);
 
   const todayStat = todaySalesAgg[0] || { totalAmount: 0, count: 0, itemsSold: 0, uniqueCustomers: [] };
-  const yesterdayStat = yesterdaySalesAgg[0] || { totalAmount: 0, count: 0, itemsSold: 0, uniqueCustomers: [] };
+  const yesterdayStat = yesterdaySalesAgg[0] || { totalAmount: 0, count: 0, itemsSold: 0 };
 
-  // Calculate stats or fall back to high-fidelity reference defaults if no transactions today yet
-  const hasRealSales = todayStat.count > 0;
-  const todaysSales = hasRealSales ? todayStat.totalAmount : 124580;
-  const totalInvoices = hasRealSales ? todayStat.count : 218;
-  const newCustomers = hasRealSales ? todayStat.uniqueCustomers.length : 32;
-  const itemsSold = hasRealSales && todayStat.itemsSold > 0 ? todayStat.itemsSold : 1842;
-  const avgBillValue = totalInvoices > 0 ? Math.round(todaysSales / totalInvoices) : 572;
+  const todaysSales = todayStat.totalAmount || 0;
+  const yesterdaySales = yesterdayStat.totalAmount || 0;
+  const salesGrowth =
+    yesterdaySales > 0
+      ? Math.round(((todaysSales - yesterdaySales) / yesterdaySales) * 1000) / 10
+      : (todaysSales > 0 ? 100 : 0);
 
-  const yesterdaySales = yesterdayStat.totalAmount > 0 ? yesterdayStat.totalAmount : 110600;
-  const salesGrowth = Math.round(((todaysSales - yesterdaySales) / yesterdaySales) * 1000) / 10 || 12.6;
+  const totalInvoices = todayStat.count || 0;
+  const yesterdayInvoices = yesterdayStat.count || 0;
+  const totalInvoicesGrowth =
+    yesterdayInvoices > 0
+      ? Math.round(((totalInvoices - yesterdayInvoices) / yesterdayInvoices) * 1000) / 10
+      : (totalInvoices > 0 ? 100 : 0);
 
-  // Format Payment Mode Breakdown (matching 42.3%, 28.6%, 18.4%, 7.2%, 3.5%)
-  const paymentBreakdownList = [
-    { mode: "Cash", percentage: 42.3, amount: Math.round(todaysSales * 0.423), color: "#16a34a" },
-    { mode: "UPI", percentage: 28.6, amount: Math.round(todaysSales * 0.286), color: "#2563eb" },
-    { mode: "Card", percentage: 18.4, amount: Math.round(todaysSales * 0.184), color: "#f59e0b" },
-    { mode: "Credit (Khata)", percentage: 7.2, amount: Math.round(todaysSales * 0.072), color: "#dc2626" },
-    { mode: "Others", percentage: 3.5, amount: Math.round(todaysSales * 0.035), color: "#64748b" },
-  ];
+  const newCustomers = Array.isArray(todayStat.uniqueCustomers)
+    ? todayStat.uniqueCustomers.filter(Boolean).length
+    : 0;
+  const itemsSold = todayStat.itemsSold || 0;
+  const avgBillValue = totalInvoices > 0 ? Math.round(todaysSales / totalInvoices) : 0;
 
-  // Hourly Sales Trend (8 AM to 10 PM)
-  const hourlyData = [
-    { time: "8 AM", sales: Math.round(todaysSales * 0.12), invoices: Math.max(10, Math.round(totalInvoices * 0.11)) },
-    { time: "10 AM", sales: Math.round(todaysSales * 0.23), invoices: Math.max(18, Math.round(totalInvoices * 0.19)) },
-    { time: "12 PM", sales: Math.round(todaysSales * 0.37), invoices: Math.max(30, Math.round(totalInvoices * 0.31)) },
-    { time: "2 PM", sales: Math.round(todaysSales), invoices: totalInvoices },
-    { time: "4 PM", sales: Math.round(todaysSales * 0.58), invoices: Math.max(45, Math.round(totalInvoices * 0.50)) },
-    { time: "6 PM", sales: Math.round(todaysSales * 0.76), invoices: Math.max(60, Math.round(totalInvoices * 0.70)) },
-    { time: "8 PM", sales: Math.round(todaysSales * 0.95), invoices: Math.max(80, Math.round(totalInvoices * 0.91)) },
-    { time: "10 PM", sales: Math.round(todaysSales), invoices: totalInvoices },
-  ];
+  // Format Payment Mode Breakdown (Real data)
+  const totalPaymentAmount = paymentAggResult.reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
+  const colorMap = {
+    CASH: "#16a34a",
+    UPI: "#2563eb",
+    CARD: "#f59e0b",
+    CREDIT: "#dc2626",
+    KHATA: "#dc2626",
+    SPLIT: "#8b5cf6",
+  };
+
+  const paymentBreakdownList = paymentAggResult.map((item) => {
+    const rawMode = String(item._id || "Cash").trim();
+    const upperMode = rawMode.toUpperCase();
+    let color = "#64748b";
+    for (const [key, c] of Object.entries(colorMap)) {
+      if (upperMode.includes(key)) {
+        color = c;
+        break;
+      }
+    }
+    const amt = Number(item.amount) || 0;
+    const pct = totalPaymentAmount > 0 ? Math.round((amt / totalPaymentAmount) * 1000) / 10 : 0;
+    return {
+      mode: rawMode,
+      percentage: pct,
+      amount: Math.round(amt),
+      count: item.count || 0,
+      color,
+    };
+  });
+
+  // Hourly Sales Trend (8 AM to 10 PM slots)
+  const slotHours = [8, 10, 12, 14, 16, 18, 20, 22];
+  const slotLabels = ["8 AM", "10 AM", "12 PM", "2 PM", "4 PM", "6 PM", "8 PM", "10 PM"];
+
+  const hourlyData = slotHours.map((slotH, idx) => {
+    const matching = hourlyAggResult.filter((item) => {
+      const h = Number(item._id);
+      return idx === 0 ? h <= 8 : h === slotH || h === slotH - 1;
+    });
+    const s = matching.reduce((sum, curr) => sum + (Number(curr.sales) || 0), 0);
+    const inv = matching.reduce((sum, curr) => sum + (Number(curr.invoices) || 0), 0);
+    return {
+      time: slotLabels[idx],
+      hour: slotH,
+      sales: Math.round(s),
+      invoices: inv,
+    };
+  });
 
   // Low stock items formatting
-  const formattedLowStock = (lowStockResult.length >= 3 ? lowStockResult.slice(0, 5).map((item, idx) => ({
-    id: String(idx + 1),
-    product: item.productName || "Augmentin 625",
-    batch: item.batches?.[0]?.batch_number || `AUG25A`,
-    stock: item.totalStock || 12,
-    reorderAt: 50,
-  })) : [
-    { id: "1", product: "Augmentin 625", batch: "AUG25A", stock: 12, reorderAt: 50 },
-    { id: "2", product: "Paracetamol 500mg", batch: "PAR25B", stock: 28, reorderAt: 100 },
-    { id: "3", product: "Azithromycin 500mg", batch: "AZT25C", stock: 32, reorderAt: 100 },
-    { id: "4", product: "Pantoprazole 40mg", batch: "PAN25D", stock: 18, reorderAt: 50 },
-    { id: "5", product: "Cetirizine 10mg", batch: "CET25E", stock: 24, reorderAt: 50 },
-  ]);
+  const formattedLowStock = lowStockResult.map((pf, idx) => ({
+    id: String(pf._id || idx + 1),
+    product: pf.product_id?.name || "Product",
+    sku: pf.product_id?.workspaceProductCode || "SKU",
+    batch: pf.itemCode || `LOT-${idx + 1}`,
+    stock: Number(pf.total_qty_available || 0),
+    reorderAt: 10,
+  }));
 
-  // Near expiry items formatting (<= 60 days)
-  const formattedNearExpiry = (nearExpiryResult.length >= 3 ? nearExpiryResult.slice(0, 5).map((item, idx) => ({
-    id: String(idx + 1),
-    product: item.product_id?.name || item.name || "Dolo 650",
-    batch: item.batch_number || "DOL25A",
-    expiry: item.expiry_date || "Nov 2026",
-    stock: item.quantity || 120,
-  })) : [
-    { id: "1", product: "Dolo 650", batch: "DOL25A", expiry: "Nov 2026", stock: 120 },
-    { id: "2", product: "Amoxicillin 500mg", batch: "AMX24F", expiry: "Nov 2026", stock: 85 },
-    { id: "3", product: "Cetirizine 10mg", batch: "CET24G", expiry: "Dec 2026", stock: 60 },
-    { id: "4", product: "Omeprazole 20mg", batch: "OME24H", expiry: "Dec 2026", stock: 45 },
-    { id: "5", product: "Vitamin D3 60K", batch: "VIT24I", expiry: "Jan 2027", stock: 32 },
-  ]);
+  // Near expiry items formatting (<= 30 days) & expired
+  const nearExpiryList = [];
+  for (const b of allBatchesResult) {
+    const exp = parseExpiryDate(b.expiryDate);
+    if (exp) {
+      const diffMs = exp.getTime() - now.getTime();
+      const daysLeft = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+      if (daysLeft <= 30) {
+        nearExpiryList.push({
+          id: String(b._id),
+          product: b.product?.name || "Medicine",
+          batch: b.batchNo || "BATCH",
+          expiry: b.expiryDate || "N/A",
+          daysLeft: Math.max(0, daysLeft),
+          isExpired: daysLeft <= 0,
+          stock: Number(b.batchQty || 0),
+        });
+      }
+    }
+  }
+  nearExpiryList.sort((a, b) => a.daysLeft - b.daysLeft);
+  const formattedNearExpiry = nearExpiryList.slice(0, 5);
 
   // Today's purchase receipts formatting
-  const formattedPurchases = (recentPurchases.length >= 3 ? recentPurchases.slice(0, 5).map((pb, idx) => ({
-    id: String(idx + 1),
-    supplier: pb.supplierId?.businessName || pb.supplierId?.name || "Sun Pharma",
-    invoiceNo: pb.purchaseBillNo || `SP-${10280 + idx}`,
-    items: pb.items?.length || 24,
-    amount: pb.grandTotal || 124580,
-    status: pb.status === "CONFIRMED" ? "Received" : "Pending",
-  })) : [
-    { id: "1", supplier: "Sun Pharma", invoiceNo: "SP-10283", items: 24, amount: 124580, status: "Received" },
-    { id: "2", supplier: "Mankind Pharma", invoiceNo: "MP-55821", items: 15, amount: 84320, status: "Received" },
-    { id: "3", supplier: "Cipla Distributors", invoiceNo: "CP-77810", items: 32, amount: 214500, status: "Pending" },
-    { id: "4", supplier: "Abbott Healthcare", invoiceNo: "AB-44128", items: 18, amount: 96420, status: "Received" },
-    { id: "5", supplier: "LifeCare Distributors", invoiceNo: "LC-99341", items: 28, amount: 152300, status: "Received" },
-  ]);
+  const formattedPurchases = recentPurchases.map((pb, idx) => ({
+    id: String(pb._id || idx + 1),
+    supplier: pb.supplierId?.businessName || pb.supplierId?.name || "Distributor",
+    invoiceNo: pb.purchaseBillNo || pb.supplierInvoiceNo || `PB-${idx + 1}`,
+    items: Array.isArray(pb.items) ? pb.items.length : 0,
+    amount: Number(pb.grandTotal || 0),
+    status: pb.status === "CONFIRMED" ? "Received" : pb.status === "DRAFT" ? "Draft" : pb.status || "Received",
+    date: dateFormatted,
+  }));
 
   // Today's recent sales formatting
-  const formattedRecentSales = (todayInvoices.length >= 3 ? todayInvoices.slice(0, 5).map((inv, idx) => {
+  const formattedRecentSales = todayInvoices.map((inv, idx) => {
     const invDate = new Date(inv.date || inv.createdAt);
-    const timeStr = !isNaN(invDate.getTime()) ? invDate.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }) : "02:15 PM";
+    const timeStr = !isNaN(invDate.getTime())
+      ? new Date(invDate.getTime() + IST_OFFSET_MS).toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+          timeZone: "UTC",
+        })
+      : "N/A";
     return {
-      id: String(idx + 1),
+      id: String(inv._id || idx + 1),
       time: timeStr,
-      invoiceNo: inv.invoiceNo || `INV-${10284 - idx}`,
-      customer: inv.customerId?.name || "Walk-in",
-      items: inv.items?.length || 3,
-      amount: inv.grandTotal || 1245,
-      payment: inv.paymentMethod || "UPI",
+      invoiceNo: inv.invoiceNo || `INV-${idx + 1}`,
+      customer: inv.customerId?.name || "Walk-in Customer",
+      items: Array.isArray(inv.items) ? inv.items.length : 1,
+      amount: Number(inv.grandTotal || 0),
+      payment: inv.paymentMethod || "Cash",
     };
-  }) : [
-    { id: "1", time: "02:15 PM", invoiceNo: "INV-10284", customer: "Walk-in", items: 3, amount: 1245, payment: "UPI" },
-    { id: "2", time: "01:48 PM", invoiceNo: "INV-10283", customer: "Rajesh Verma", items: 5, amount: 2380, payment: "Card" },
-    { id: "3", time: "01:20 PM", invoiceNo: "INV-10282", customer: "Walk-in", items: 2, amount: 560, payment: "Cash" },
-    { id: "4", time: "12:55 PM", invoiceNo: "INV-10281", customer: "Priya Sharma", items: 4, amount: 1920, payment: "UPI" },
-    { id: "5", time: "12:30 PM", invoiceNo: "INV-10280", customer: "Walk-in", items: 1, amount: 420, payment: "Cash" },
-  ]);
-
-  // Online Orders (Pahuch Quick-Commerce)
-  const onlineOrders = [
-    { id: "1", orderNo: "PO-77821", customer: "Aman Gupta", amount: 1250, status: "Preparing" },
-    { id: "2", orderNo: "PO-77820", customer: "Sneha Patel", amount: 890, status: "Packed" },
-    { id: "3", orderNo: "PO-77819", customer: "Rohan Mehta", amount: 1480, status: "Out for Delivery" },
-    { id: "4", orderNo: "PO-77818", customer: "Kunal Jain", amount: 620, status: "Delivered" },
-    { id: "5", orderNo: "PO-77817", customer: "Neha Singh", amount: 980, status: "Cancelled" },
-  ];
+  });
 
   // Inter-branch transfers formatting
-  const formattedTransfers = (transferOrders.length >= 3 ? transferOrders.slice(0, 5).map((to, idx) => ({
-    id: String(idx + 1),
-    fromTo: `${to.sourceBranchId?.branchName || "Central"} → ${to.destinationBranchId?.branchName || "Indore"}`,
-    items: to.items?.length || 50,
-    status: to.status === "IN_TRANSIT" ? "In Transit" : to.status === "COMPLETED" ? "Completed" : "Pending",
-  })) : [
-    { id: "1", fromTo: "Central → Indore", items: 50, status: "In Transit" },
-    { id: "2", fromTo: "Indore → Bhopal", items: 20, status: "Completed" },
-    { id: "3", fromTo: "Indore → Ujjain", items: 15, status: "Pending" },
-    { id: "4", fromTo: "Dewas → Indore", items: 30, status: "Pending" },
-    { id: "5", fromTo: "Bhopal → Indore", items: 12, status: "Cancelled" },
-  ]);
+  const formattedTransfers = transferOrders.map((to, idx) => ({
+    id: String(to._id || idx + 1),
+    fromTo: `${to.sourceBranchId?.name || to.sourceBranchId?.branchName || "Branch"} → ${to.destinationBranchId?.name || to.destinationBranchId?.branchName || "Branch"}`,
+    items: Array.isArray(to.items) ? to.items.length : 0,
+    status:
+      to.status === "IN_TRANSIT"
+        ? "In Transit"
+        : to.status === "COMPLETED"
+        ? "Completed"
+        : to.status === "PENDING"
+        ? "Pending"
+        : to.status === "CANCELLED"
+        ? "Cancelled"
+        : to.status,
+  }));
 
-  const cashierName = activeShift?.openedBy?.fullName || 
-    (activeShift?.openedBy?.firstName ? `${activeShift.openedBy.firstName} ${activeShift.openedBy.lastName || ""}`.trim() : "Rohit Sharma");
+  // Shift & Cash Drawer Details
+  const isDayOpen = String(activeBusinessDay?.status || "").toLowerCase() === "open";
+  const isShiftLive = String(activeShift?.status || "").toLowerCase() === "open";
+  const cashierName =
+    activeShift?.openedBy?.fullName ||
+    (activeShift?.openedBy?.firstName
+      ? `${activeShift.openedBy.firstName} ${activeShift.openedBy.lastName || ""}`.trim()
+      : null);
+
+  const shiftOpenedAt = activeShift?.openedAt || activeShift?.createdAt;
+  const shiftTimeFormatted = shiftOpenedAt
+    ? `${new Date(new Date(shiftOpenedAt).getTime() + IST_OFFSET_MS).toLocaleTimeString("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "UTC",
+      })} - Active`
+    : "Not Started";
+
+  const liveDrawerCash = branchCashDoc?.currentBalance ?? (activeShift?.cashSalesTotal ?? 0);
 
   return {
     branchInfo: {
       branchId: branchDoc?._id || branchObjectId,
-      branchName: branchDoc?.branchName || "Indore - Main Branch",
-      branchCode: branchDoc?.branchCode || "MB-001",
-      businessDayStatus: activeBusinessDay?.status === "open" ? "OPEN" : "OPEN",
+      branchName: branchDoc?.name || branchDoc?.branchName || "Main Branch",
+      branchCode: branchDoc?.branchCode || "BR-001",
+      businessDayStatus: isDayOpen ? "OPEN" : "CLOSED",
       businessDate: activeBusinessDay?.businessDate || now,
-      shiftName: activeShift?.shiftName || "Morning Shift",
-      shiftTime: "08:00 AM - 02:00 PM",
-      cashierName,
+      shiftName: activeShift?.shiftName || (isShiftLive ? `Shift #${activeShift.shiftNo || 1}` : "No Active Shift"),
+      shiftTime: shiftTimeFormatted,
+      cashierName: cashierName || "Unassigned",
       counterName: "Counter 1",
+      isShiftActive: isShiftLive,
+      isDayOpen,
     },
     kpis: {
       todaysSales,
       todaysSalesGrowth: salesGrowth,
       totalInvoices,
-      totalInvoicesGrowth: 8.2,
+      totalInvoicesGrowth,
       newCustomers,
-      newCustomersGrowth: 28.0,
+      newCustomersGrowth: 0,
       avgBillValue,
-      avgBillValueGrowth: 4.5,
+      avgBillValueGrowth: 0,
       itemsSold,
-      itemsSoldGrowth: 10.1,
+      itemsSoldGrowth: 0,
     },
     salesTrend: {
       timeframe: "Today",
@@ -803,205 +976,923 @@ export const getBranchDashboardData = async ({ workspaceId, companyId, branchId 
     },
     paymentModeBreakdown: {
       totalSales: todaysSales,
-      totalSalesFormatted: `₹ ${(todaysSales / 100000).toFixed(2)} L`,
+      totalSalesFormatted: `₹ ${todaysSales.toLocaleString("en-IN")}`,
       breakdown: paymentBreakdownList,
     },
     currentShift: {
-      isLive: true,
-      shiftName: activeShift?.shiftName || "Morning Shift",
-      shiftTime: "08:00 AM - 02:00 PM",
-      cashier: cashierName,
+      isLive: isShiftLive,
+      shiftId: activeShift?._id?.toString() || null,
+      shiftNo: activeShift?.shiftNo || null,
+      shiftName: activeShift?.shiftName || (isShiftLive ? `Shift #${activeShift.shiftNo || 1}` : "No Active Shift"),
+      shiftTime: shiftTimeFormatted,
+      cashier: cashierName || "None",
       counter: "Counter 1",
-      salesAmount: todaysSales,
-      invoices: totalInvoices,
-      cashInDrawer: activeShift?.cashSalesTotal || 18250,
+      salesAmount: activeShift?.salesTotal || todaysSales,
+      invoices: activeShift?.totalInvoices || totalInvoices,
+      cashInDrawer: liveDrawerCash,
+      openedAt: activeShift?.openedAt || null,
     },
     lowStockItems: formattedLowStock,
     nearExpiryItems: formattedNearExpiry,
     todaysPurchases: formattedPurchases,
     recentSales: formattedRecentSales,
-    onlineOrders,
     interBranchTransfers: formattedTransfers,
   };
 };
 
 /**
- * Get Company Level Dashboard Data (Image 2)
+ * Calculate IST-aligned timeframe boundaries and prior comparison period
  */
-const getCompanyDashboardData = async ({ workspaceId, companyId, timeframe = "THIS_MONTH" }) => {
+const calculateTimeframeBoundaries = (timeframe = "THIS_MONTH", customStart = null, customEnd = null) => {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const now = new Date();
+  const nowIST = new Date(now.getTime() + IST_OFFSET_MS);
+
+  const y = nowIST.getUTCFullYear();
+  const m = nowIST.getUTCMonth(); // 0-11
+  const d = nowIST.getUTCDate();
+
+  const tf = String(timeframe || "THIS_MONTH").trim().toUpperCase().replace(/\s+/g, "_");
+
+  const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  const fmtDate = (dt) => {
+    const ist = new Date(dt.getTime() + IST_OFFSET_MS);
+    const day = String(ist.getUTCDate()).padStart(2, "0");
+    const mon = MONTH_NAMES[ist.getUTCMonth()];
+    const yr = ist.getUTCFullYear();
+    return `${day} ${mon} ${yr}`;
+  };
+
+  let start;
+  let end;
+  let prevStart;
+  let prevEnd;
+  let dateRangeFormatted;
+
+  if (customStart && customEnd) {
+    start = new Date(customStart);
+    if (String(customStart).length <= 10) start.setHours(0, 0, 0, 0);
+    end = new Date(customEnd);
+    if (String(customEnd).length <= 10) end.setHours(23, 59, 59, 999);
+    const span = Math.max(1000, end.getTime() - start.getTime());
+    prevEnd = new Date(start.getTime() - 1);
+    prevStart = new Date(prevEnd.getTime() - span);
+    dateRangeFormatted = `${fmtDate(start)} - ${fmtDate(end)}`;
+  } else if (tf === "TODAY") {
+    start = new Date(Date.UTC(y, m, d, 0, 0, 0, 0) - IST_OFFSET_MS);
+    end = new Date(Date.UTC(y, m, d, 23, 59, 59, 999) - IST_OFFSET_MS);
+    prevStart = new Date(Date.UTC(y, m, d - 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+    prevEnd = new Date(Date.UTC(y, m, d - 1, 23, 59, 59, 999) - IST_OFFSET_MS);
+    dateRangeFormatted = fmtDate(start);
+  } else if (tf === "THIS_QUARTER") {
+    const qStartMonth = Math.floor(m / 3) * 3;
+    start = new Date(Date.UTC(y, qStartMonth, 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+    end = new Date(Date.UTC(y, qStartMonth + 3, 0, 23, 59, 59, 999) - IST_OFFSET_MS);
+    prevStart = new Date(Date.UTC(y, qStartMonth - 3, 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+    prevEnd = new Date(Date.UTC(y, qStartMonth, 0, 23, 59, 59, 999) - IST_OFFSET_MS);
+    dateRangeFormatted = `${fmtDate(start)} - ${fmtDate(end)}`;
+  } else if (tf === "THIS_YEAR") {
+    start = new Date(Date.UTC(y, 0, 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+    end = new Date(Date.UTC(y, 11, 31, 23, 59, 59, 999) - IST_OFFSET_MS);
+    prevStart = new Date(Date.UTC(y - 1, 0, 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+    prevEnd = new Date(Date.UTC(y - 1, 11, 31, 23, 59, 59, 999) - IST_OFFSET_MS);
+    dateRangeFormatted = `${fmtDate(start)} - ${fmtDate(end)}`;
+  } else {
+    // Default THIS_MONTH
+    start = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+    end = new Date(Date.UTC(y, m + 1, 0, 23, 59, 59, 999) - IST_OFFSET_MS);
+    prevStart = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0, 0) - IST_OFFSET_MS);
+    prevEnd = new Date(Date.UTC(y, m, 0, 23, 59, 59, 999) - IST_OFFSET_MS);
+    dateRangeFormatted = `${fmtDate(start)} - ${fmtDate(end)}`;
+  }
+
+  return { start, end, prevStart, prevEnd, dateRangeFormatted };
+};
+
+const calculateWorkspaceTimeframe = calculateTimeframeBoundaries;
+
+/**
+ * Get Company Level Dashboard Data with Real MongoDB Aggregations
+ * Strictly Company Scope:
+ * - Corporate Bank Accounts & Treasury
+ * - Branches registered under this company
+ * - Customer Receivables & Supplier Payables
+ * - Sales & Purchase aggregations and 6-Month Trends
+ * - Branch Performance Leaderboard
+ * - Sales by Category Donut & Top Selling Products
+ * - GST Summary (GSTR-1, GSTR-2 ITC, GSTR-3B Net Payable)
+ * - Inventory Stock Deficits & Expiry Alerts across company branches
+ * - Recent Chronological Streams (Purchases, Sales, Transfers)
+ */
+const getCompanyDashboardData = async ({
+  workspaceId,
+  companyId,
+  timeframe = "THIS_MONTH",
+  startDate = null,
+  endDate = null,
+}) => {
   const wsObjectId = new mongoose.Types.ObjectId(workspaceId);
   const compObjectId = new mongoose.Types.ObjectId(companyId);
 
-  // 1. Fetch Company info & Branches
-  const companyDoc = await Company.findOne({ _id: compObjectId, workspaceId: wsObjectId }).lean();
-  const branches = await Branch.find({ companyId: compObjectId, workspaceId: wsObjectId, isDeleted: false }).lean();
+  const isActiveStatus = (status) => String(status || "").trim().toLowerCase() === "active";
 
-  // 2. Aggregate Sales Invoices for this company
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  const fmtDate = (dt) => {
+    if (!dt) return "";
+    const ist = new Date(new Date(dt).getTime() + IST_OFFSET_MS);
+    const day = String(ist.getUTCDate()).padStart(2, "0");
+    const mon = MONTH_NAMES[ist.getUTCMonth()];
+    const yr = ist.getUTCFullYear();
+    return `${day} ${mon} ${yr}`;
+  };
+
+  const calcGrowth = (curr, prev) => {
+    if (!prev || prev === 0) return curr > 0 ? 100 : 0;
+    const pct = ((curr - prev) / prev) * 100;
+    return Math.round(pct * 10) / 10;
+  };
+
+  // 1. Calculate IST Timeframe Boundaries
+  const { start, end, prevStart, prevEnd, dateRangeFormatted } = calculateTimeframeBoundaries(
+    timeframe,
+    startDate,
+    endDate
+  );
+
+  const toDateStr = (dt) => {
+    const ist = new Date(new Date(dt).getTime() + IST_OFFSET_MS);
+    return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, "0")}-${String(ist.getUTCDate()).padStart(2, "0")}`;
+  };
+  const startDateStr = toDateStr(start);
+  const endDateStr = toDateStr(end);
+  const prevStartDateStr = toDateStr(prevStart);
+  const prevEndDateStr = toDateStr(prevEnd);
+
   const now = new Date();
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-  const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+  const nowIST = new Date(now.getTime() + IST_OFFSET_MS);
+  const sixMonthsAgoStart = new Date(
+    Date.UTC(nowIST.getUTCFullYear(), nowIST.getUTCMonth() - 5, 1, 0, 0, 0, 0) - IST_OFFSET_MS
+  );
 
-  let rawSales = 0;
-  let rawPurchases = 0;
+  // 2. Parallel Core Entity Aggregations
+  const [
+    companyDoc,
+    branches,
+    salesCurrentAgg,
+    salesPriorAgg,
+    purchasesCurrentAgg,
+    purchasesPriorAgg,
+    sales6MonthsAgg,
+    purchases6MonthsAgg,
+    branchSalesCurrentAgg,
+    branchSalesPriorAgg,
+    bankAccounts,
+    customerReceivablesAgg,
+    supplierPayablesAgg,
+    gstSummaryAgg,
+    topProductsAgg,
+    categorySalesAgg,
+    recentPurchasesRaw,
+    recentSalesRaw,
+  ] = await Promise.all([
+    // Company doc
+    Company.findOne({ _id: compObjectId, workspaceId: wsObjectId, isDeleted: false }).lean(),
 
-  try {
-    const [salesCurrentMonth, purchasesCurrentMonth] = await Promise.all([
-      SalesInvoice.aggregate([
-        { $match: { companyId: compObjectId, isDeleted: false, invoiceDate: { $gte: startOfMonth } } },
-        { $group: { _id: null, total: { $sum: "$grandTotal" }, count: { $sum: 1 } } },
-      ]),
-      PurchaseBill.aggregate([
-        { $match: { companyId: compObjectId, isDeleted: false, billDate: { $gte: startOfMonth } } },
-        { $group: { _id: null, total: { $sum: "$grandTotal" }, count: { $sum: 1 } } },
-      ]),
-    ]);
+    // Branches for this company
+    Branch.find({ companyId: compObjectId, workspaceId: wsObjectId, isDeleted: false })
+      .select("name branchCode address phone email manager branchHead status createdAt")
+      .sort({ createdAt: -1 })
+      .lean(),
 
-    rawSales = salesCurrentMonth[0]?.total || 0;
-    rawPurchases = purchasesCurrentMonth[0]?.total || 0;
-  } catch (err) {
-    console.warn("Aggregation warning in getCompanyDashboardData:", err);
+    // Sales in current timeframe (date field is indexed)
+    SalesInvoice.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { date: { $gte: start, $lte: end } },
+            { createdAt: { $gte: start, $lte: end } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalSales: { $sum: "$grandTotal" },
+          totalInvoices: { $sum: 1 },
+          totalTax: { $sum: "$tax" },
+        },
+      },
+    ]),
+
+    // Sales in prior comparison period
+    SalesInvoice.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { date: { $gte: prevStart, $lte: prevEnd } },
+            { createdAt: { $gte: prevStart, $lte: prevEnd } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalSales: { $sum: "$grandTotal" },
+        },
+      },
+    ]),
+
+    // Purchases in current timeframe (createdAt field is indexed)
+    PurchaseBill.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { createdAt: { $gte: start, $lte: end } },
+            { invoiceDate: { $gte: startDateStr, $lte: endDateStr } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPurchases: { $sum: "$grandTotal" },
+          totalGst: { $sum: "$totalGst" },
+          amountDue: { $sum: "$amountDue" },
+        },
+      },
+    ]),
+
+    // Purchases in prior comparison period
+    PurchaseBill.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { createdAt: { $gte: prevStart, $lte: prevEnd } },
+            { invoiceDate: { $gte: prevStartDateStr, $lte: prevEndDateStr } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPurchases: { $sum: "$grandTotal" },
+        },
+      },
+    ]),
+
+    // 6 Months Sales by month (IST)
+    SalesInvoice.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { date: { $gte: sixMonthsAgoStart } },
+            { createdAt: { $gte: sixMonthsAgoStart } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: { date: { $ifNull: ["$date", "$createdAt"] }, timezone: "+05:30" } },
+            month: { $month: { date: { $ifNull: ["$date", "$createdAt"] }, timezone: "+05:30" } },
+          },
+          sales: { $sum: "$grandTotal" },
+        },
+      },
+    ]),
+
+    // 6 Months Purchases by month (IST)
+    PurchaseBill.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { createdAt: { $gte: sixMonthsAgoStart } },
+            { invoiceDate: { $gte: `${nowIST.getUTCFullYear() - 1}-01-01` } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: { date: "$createdAt", timezone: "+05:30" } },
+            month: { $month: { date: "$createdAt", timezone: "+05:30" } },
+          },
+          purchases: { $sum: "$grandTotal" },
+        },
+      },
+    ]),
+
+    // Branch Performance in current period
+    SalesInvoice.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { date: { $gte: start, $lte: end } },
+            { createdAt: { $gte: start, $lte: end } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: "$branchId",
+          sales: { $sum: "$grandTotal" },
+          invoicesCount: { $sum: 1 },
+        },
+      },
+    ]),
+
+    // Branch Performance in prior period
+    SalesInvoice.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { date: { $gte: prevStart, $lte: prevEnd } },
+            { createdAt: { $gte: prevStart, $lte: prevEnd } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: "$branchId",
+          sales: { $sum: "$grandTotal" },
+        },
+      },
+    ]),
+
+    // Corporate Bank Accounts
+    BankAccount.find({
+      companyId: compObjectId,
+      workspaceId: wsObjectId,
+      isDeleted: false,
+    })
+      .populate("ledgerAccountId", "name code openingBalance openingBalanceType")
+      .populate("bankMasterId", "bankName logo")
+      .lean(),
+
+    // Customer Receivables (Total credit outstanding)
+    Customer.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalReceivables: { $sum: "$creditOutstanding" },
+        },
+      },
+    ]),
+
+    // Supplier Payables (Total pending due bills)
+    PurchaseBill.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          status: { $ne: "CANCELLED" },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPayables: { $sum: "$amountDue" },
+        },
+      },
+    ]),
+
+    // GST Ledger Summary for Company
+    GstLedger.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          voucherDate: { $gte: start, $lte: end },
+        },
+      },
+      {
+        $group: {
+          _id: "$gstType",
+          cgst: { $sum: "$cgst" },
+          sgst: { $sum: "$sgst" },
+          igst: { $sum: "$igst" },
+          totalGst: { $sum: { $add: ["$cgst", "$sgst", "$igst"] } },
+        },
+      },
+    ]),
+
+    // Top Selling Products (grouped from invoice items)
+    SalesInvoice.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { date: { $gte: start, $lte: end } },
+            { createdAt: { $gte: start, $lte: end } },
+          ],
+        },
+      },
+      { $unwind: "$items" },
+      {
+        $group: {
+          _id: { $ifNull: ["$items.productId", "$items.name"] },
+          name: { $first: "$items.name" },
+          category: {
+            $first: {
+              $ifNull: [
+                "$items.category",
+                { $ifNull: ["$items.productForm", "Allopathic"] },
+              ],
+            },
+          },
+          unitsSold: { $sum: { $ifNull: ["$items.qty", 1] } },
+          amount: {
+            $sum: {
+              $multiply: [
+                { $ifNull: ["$items.qty", 1] },
+                { $ifNull: ["$items.rate", { $ifNull: ["$items.price", 0] }] },
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { amount: -1 } },
+      { $limit: 5 },
+    ]),
+
+    // Sales by Product Category
+    SalesInvoice.aggregate([
+      {
+        $match: {
+          companyId: compObjectId,
+          workspaceId: wsObjectId,
+          isDeleted: false,
+          $or: [
+            { date: { $gte: start, $lte: end } },
+            { createdAt: { $gte: start, $lte: end } },
+          ],
+        },
+      },
+      { $unwind: "$items" },
+      {
+        $group: {
+          _id: {
+            $ifNull: [
+              "$items.category",
+              { $ifNull: ["$items.productForm", "Allopathic"] },
+            ],
+          },
+          amount: {
+            $sum: {
+              $multiply: [
+                { $ifNull: ["$items.qty", 1] },
+                { $ifNull: ["$items.rate", { $ifNull: ["$items.price", 0] }] },
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { amount: -1 } },
+      { $limit: 6 },
+    ]),
+
+    // Recent Purchases
+    PurchaseBill.find({
+      companyId: compObjectId,
+      workspaceId: wsObjectId,
+      isDeleted: false,
+    })
+      .populate("supplierId", "businessName name")
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean(),
+
+    // Recent Sales
+    SalesInvoice.find({
+      companyId: compObjectId,
+      workspaceId: wsObjectId,
+      isDeleted: false,
+    })
+      .populate("branchId", "name branchCode")
+      .sort({ createdAt: -1, date: -1 })
+      .limit(5)
+      .lean(),
+  ]);
+
+  const branchIds = branches.map((b) => b._id);
+  const activeBranches = branches.filter((b) => isActiveStatus(b.status));
+
+  // 3. Dependent Parallel Batch: Bank Balances, Branch Stock Alerts, Transfers
+  const ledgerAccountIds = bankAccounts
+    .map((b) => b.ledgerAccountId?._id || b.ledgerAccountId)
+    .filter(Boolean);
+
+  const [
+    accountBalances,
+    stockDeficitAgg,
+    activeBatches,
+    transfersRaw,
+  ] = await Promise.all([
+    // Live AccountBalances for corporate bank ledger accounts
+    ledgerAccountIds.length > 0
+      ? AccountBalance.find({
+          companyId: compObjectId,
+          accountId: { $in: ledgerAccountIds },
+        }).lean()
+      : [],
+
+    // Inventory Alerts from ProductFacility across company branches
+    branchIds.length > 0
+      ? ProductFacility.aggregate([
+          {
+            $match: {
+              workspaceId: wsObjectId,
+              facility_id: { $in: branchIds },
+              isDeleted: false,
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              outOfStock: {
+                $sum: {
+                  $cond: [{ $lte: ["$total_qty_available", 0] }, 1, 0],
+                },
+              },
+              lowStock: {
+                $sum: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $gt: ["$total_qty_available", 0] },
+                        { $lte: ["$total_qty_available", 10] },
+                      ],
+                    },
+                    1,
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ])
+      : [],
+
+    // Batches across company branches for near-expiry and expired
+    branchIds.length > 0
+      ? Batch.find({
+          workspaceId: wsObjectId,
+          branch_id: { $in: branchIds },
+          isDeleted: false,
+          batchQty: { $gt: 0 },
+        })
+          .select("expiryDate batchQty")
+          .lean()
+      : [],
+
+    // Inter-Branch Transfers between this company's branches
+    branchIds.length > 0
+      ? TransferOrder.find({
+          workspaceId: wsObjectId,
+          $or: [
+            { sourceBranchId: { $in: branchIds } },
+            { destinationBranchId: { $in: branchIds } },
+          ],
+        })
+          .populate("sourceBranchId", "name branchCode")
+          .populate("destinationBranchId", "name branchCode")
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .lean()
+      : [],
+  ]);
+
+  // 4. Calculate Corporate Bank Balances
+  const balanceMap = new Map();
+  accountBalances.forEach((ab) => {
+    const accId = String(ab.accountId?._id || ab.accountId || "");
+    const bal = Number(ab.balance || 0);
+    const type = String(ab.balanceType || "dr").toLowerCase();
+    balanceMap.set(accId, type === "dr" ? bal : -bal);
+  });
+
+  let totalBankBalance = 0;
+  const corporateBankAccounts = bankAccounts.map((b) => {
+    const accId = String(b.ledgerAccountId?._id || b.ledgerAccountId || "");
+    let bal = 0;
+    if (balanceMap.has(accId)) {
+      bal = balanceMap.get(accId);
+    } else if (b.ledgerAccountId && typeof b.ledgerAccountId === "object") {
+      const opBal = Number(b.ledgerAccountId.openingBalance || 0);
+      const opType = String(b.ledgerAccountId.openingBalanceType || "dr").toLowerCase();
+      bal = opType === "dr" ? opBal : -opBal;
+    }
+    totalBankBalance += bal;
+
+    return {
+      id: String(b._id),
+      bankName: b.bankMasterId?.bankName || b.accountName || "Bank",
+      accountHolderName: b.accountHolderName,
+      accountNumber: b.accountNumber,
+      accountType: b.accountType || "CURRENT",
+      ifscCode: b.ifscCode,
+      branchName: b.branchName,
+      isPrimary: Boolean(b.isPrimary),
+      balance: bal,
+    };
+  });
+
+  // 5. Primary KPI Metrics & Real Growth %
+  const totalSales = Number(salesCurrentAgg[0]?.totalSales || 0);
+  const totalSalesInvoices = Number(salesCurrentAgg[0]?.totalInvoices || 0);
+  const priorSales = Number(salesPriorAgg[0]?.totalSales || 0);
+  const totalSalesGrowth = calcGrowth(totalSales, priorSales);
+
+  const totalPurchases = Number(purchasesCurrentAgg[0]?.totalPurchases || 0);
+  const priorPurchases = Number(purchasesPriorAgg[0]?.totalPurchases || 0);
+  const totalPurchasesGrowth = calcGrowth(totalPurchases, priorPurchases);
+
+  // Verifiable Gross Realization: Sales - Purchases for the period
+  const grossProfit = totalSales - totalPurchases;
+  const priorGrossProfit = priorSales - priorPurchases;
+  const grossProfitGrowth = calcGrowth(grossProfit, priorGrossProfit);
+
+  const outstandingReceivables = Number(customerReceivablesAgg[0]?.totalReceivables || 0);
+  const outstandingPayables = Number(supplierPayablesAgg[0]?.totalPayables || 0);
+
+  // 6. 6-Month Historical Sales vs Purchases Trend
+  const sales6MonthMap = new Map();
+  sales6MonthsAgg.forEach((s) => {
+    sales6MonthMap.set(`${s._id.year}-${s._id.month}`, Number(s.sales || 0));
+  });
+
+  const purchases6MonthMap = new Map();
+  purchases6MonthsAgg.forEach((p) => {
+    purchases6MonthMap.set(`${p._id.year}-${p._id.month}`, Number(p.purchases || 0));
+  });
+
+  const months = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const y = d.getUTCFullYear();
+    const m = d.getUTCMonth() + 1; // 1-12
+    const key = `${y}-${m}`;
+    months.push({
+      month: MONTH_NAMES[d.getUTCMonth()],
+      year: y,
+      sales: sales6MonthMap.get(key) || 0,
+      purchases: purchases6MonthMap.get(key) || 0,
+    });
   }
 
-  const totalSales = rawSales > 0 ? rawSales : 6812430;
-  const totalSalesGrowth = 14.6;
+  // 7. Branch Performance Leaderboard
+  const branchSalesMap = new Map();
+  const branchCountMap = new Map();
+  branchSalesCurrentAgg.forEach((b) => {
+    const bId = String(b._id || "");
+    branchSalesMap.set(bId, Number(b.sales || 0));
+    branchCountMap.set(bId, Number(b.invoicesCount || 0));
+  });
 
-  const totalPurchases = rawPurchases > 0 ? rawPurchases : 4218900;
-  const totalPurchasesGrowth = 8.2;
+  const branchPriorSalesMap = new Map();
+  branchSalesPriorAgg.forEach((b) => {
+    const bId = String(b._id || "");
+    branchPriorSalesMap.set(bId, Number(b.sales || 0));
+  });
 
-  const grossProfit = totalSales - totalPurchases > 0 ? totalSales - totalPurchases : 2648530;
-  const grossProfitGrowth = 16.3;
+  const branchPerformance = branches
+    .map((b) => {
+      const bId = String(b._id);
+      const bSales = branchSalesMap.get(bId) || 0;
+      const bPrior = branchPriorSalesMap.get(bId) || 0;
+      const bInvoices = branchCountMap.get(bId) || 0;
+      const bGrowth = calcGrowth(bSales, bPrior);
+      // Realization estimate (approx 25% gross markup margin)
+      const bProfit = Math.round(bSales * 0.25);
 
-  const outstandingReceivables = 1228300;
-  const outstandingReceivablesGrowth = 6.8;
-  const outstandingPayables = 1842750;
-  const outstandingPayablesGrowth = 11.2;
-  const bankBalance = 4832120;
-  const bankBalanceGrowth = 4.1;
+      return {
+        id: bId,
+        name: b.name,
+        code: b.branchCode || "BR",
+        sales: bSales,
+        profit: bProfit,
+        growth: bGrowth,
+        invoicesCount: bInvoices,
+        status: isActiveStatus(b.status) ? "Active" : String(b.status || "Inactive"),
+        manager: b.manager?.name || b.branchHead?.name || "Branch In-Charge",
+      };
+    })
+    .sort((a, b) => b.sales - a.sales);
 
-  // 3. Sales vs Purchases Trend (6 Months: May to Oct)
-  const salesVsPurchasesTrend = {
-    timeframe: "Last 6 Months",
-    months: [
-      { month: "May", sales: 7200000, purchases: 4800000 },
-      { month: "Jun", sales: 8800000, purchases: 6400000 },
-      { month: "Jul", sales: 11400000, purchases: 7900000 },
-      { month: "Aug", sales: 14500000, purchases: 9600000 },
-      { month: "Sep", sales: 13200000, purchases: 8200000 },
-      { month: "Oct", sales: 15800000, purchases: 10200000 },
-    ],
-  };
+  // 8. Sales by Product Category
+  const categoryPalette = ["#10b981", "#0ea5e9", "#f59e0b", "#ec4899", "#8b5cf6", "#94a3b8"];
+  const totalCatAmount = categorySalesAgg.reduce((sum, c) => sum + Number(c.amount || 0), 0);
+  const categories = categorySalesAgg.map((cat, idx) => {
+    const amt = Number(cat.amount || 0);
+    const pct = totalCatAmount > 0 ? Number(((amt / totalCatAmount) * 100).toFixed(1)) : 0;
+    return {
+      name: String(cat._id || "Other Medicines"),
+      percentage: pct,
+      amount: amt,
+      color: categoryPalette[idx % categoryPalette.length],
+    };
+  });
 
-  // 4. Branch Performance Leaderboard
-  const branchPerformance = branches.length > 0 && branches.length >= 3
-    ? branches.slice(0, 5).map((b, idx) => ({
-        id: String(idx + 1),
-        name: b.branchName || "Branch",
-        sales: 1824300 - idx * 200000,
-        profit: 712400 - idx * 80000,
-        growth: Math.max(4, 16 - idx * 3),
-      }))
-    : [
-        { id: "1", name: "Indore - Main", sales: 1824300, profit: 712400, growth: 16 },
-        { id: "2", name: "Bhopal - MP Nagar", sales: 1492100, profit: 548210, growth: 12 },
-        { id: "3", name: "Ujjain", sales: 1218450, profit: 423110, growth: 8 },
-        { id: "4", name: "Dewas", sales: 1082300, profit: 376540, growth: 6 },
-        { id: "5", name: "Indore - Vijay Nagar", sales: 1021800, profit: 388270, growth: 5 },
-      ];
-
-  // 5. Sales by Product Category
   const salesByCategory = {
     totalSales,
-    totalSalesFormatted: `₹ ${(totalSales / 100000).toFixed(2)} L`,
-    categories: [
-      { name: "Allopathic Medicines", percentage: 56.3, amount: 3835400, color: "#10b981" },
-      { name: "Generics", percentage: 18.4, amount: 1253480, color: "#0ea5e9" },
-      { name: "OTC Products", percentage: 11.2, amount: 762990, color: "#f59e0b" },
-      { name: "Health & Wellness", percentage: 7.8, amount: 531370, color: "#ec4899" },
-      { name: "Personal Care", percentage: 4.1, amount: 279310, color: "#8b5cf6" },
-      { name: "Others", percentage: 2.2, amount: 149880, color: "#94a3b8" },
-    ],
+    totalSalesFormatted: `₹ ${Number(totalSales).toLocaleString("en-IN")}`,
+    categories,
   };
 
-  // 6. Top Selling Products
-  const topSellingProducts = [
-    { id: "1", name: "Paracetamol 500mg", category: "Allopathic", unitsSold: 12450, amount: 124500 },
-    { id: "2", name: "Augmentin 625", category: "Allopathic", unitsSold: 8320, amount: 208000 },
-    { id: "3", name: "Azithromycin 500mg", category: "Allopathic", unitsSold: 6890, amount: 172250 },
-    { id: "4", name: "Pantoprazole 40mg", category: "Generics", unitsSold: 6120, amount: 122400 },
-    { id: "5", name: "Vitamin D3 60K", category: "Health & Wellness", unitsSold: 5480, amount: 98640 },
-  ];
+  // 9. Top Selling Products
+  const topSellingProducts = topProductsAgg.map((p, idx) => ({
+    id: String(p._id || idx + 1),
+    name: p.name || "Medicine SKU",
+    category: p.category || "General Rx",
+    unitsSold: Number(p.unitsSold || 0),
+    amount: Number(p.amount || 0),
+  }));
 
-  // 7. GST Summary
+  // 10. GST Summary (GSTR-1, GSTR-2, GSTR-3B)
+  let outputGst = 0;
+  let itc = 0;
+  let cgst = 0;
+  let sgst = 0;
+  let igst = 0;
+
+  if (gstSummaryAgg.length > 0) {
+    gstSummaryAgg.forEach((g) => {
+      if (g._id === "GSTR-1") {
+        outputGst += Number(g.totalGst || 0);
+        cgst += Number(g.cgst || 0);
+        sgst += Number(g.sgst || 0);
+        igst += Number(g.igst || 0);
+      } else if (g._id === "GSTR-2") {
+        itc += Number(g.totalGst || 0);
+      }
+    });
+  } else {
+    // Fallback to taxes recorded on SalesInvoices and PurchaseBills
+    outputGst = Number(salesCurrentAgg[0]?.totalTax || 0);
+    itc = Number(purchasesCurrentAgg[0]?.totalGst || 0);
+    cgst = Math.round(outputGst * 0.5);
+    sgst = Math.round(outputGst * 0.5);
+    igst = 0;
+  }
+
+  const netGstPayable = Math.max(0, outputGst - itc);
+  const maxGstBreakdown = Math.max(cgst, sgst, igst, 1);
+
   const gstSummary = {
-    outputGst: 1028450,
-    itc: 682310,
-    netGstPayable: 346140,
+    outputGst,
+    itc,
+    netGstPayable,
     breakdown: [
-      { label: "CGST", amount: 173070, color: "#10b981" },
-      { label: "SGST", amount: 173070, color: "#3b82f6" },
-      { label: "IGST", amount: 104000, color: "#8b5cf6" },
+      {
+        label: "CGST",
+        amount: cgst,
+        color: "bg-emerald-500",
+        barHeightPct: Math.round((cgst / maxGstBreakdown) * 100),
+      },
+      {
+        label: "SGST",
+        amount: sgst,
+        color: "bg-blue-500",
+        barHeightPct: Math.round((sgst / maxGstBreakdown) * 100),
+      },
+      {
+        label: "IGST",
+        amount: igst,
+        color: "bg-purple-500",
+        barHeightPct: Math.round((igst / maxGstBreakdown) * 100),
+      },
     ],
   };
 
-  // 8. Inventory Alerts (All Branches)
+  // 11. Inventory Shortages & Expiry Alerts across company branches
+  const outOfStockCount = Number(stockDeficitAgg[0]?.outOfStock || 0);
+  const lowStockCount = Number(stockDeficitAgg[0]?.lowStock || 0);
+
+  const thirtyDaysAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  let nearExpiryCount = 0;
+  let expiredCount = 0;
+
+  activeBatches.forEach((batch) => {
+    const expDate = parseExpiryDate(batch.expiryDate);
+    if (!expDate) return;
+    if (expDate < now) {
+      expiredCount++;
+    } else if (expDate <= thirtyDaysAhead) {
+      nearExpiryCount++;
+    }
+  });
+
   const inventoryAlerts = {
-    outOfStock: 58,
-    lowStock: 142,
-    nearExpiry: 46,
-    expired: 18,
+    outOfStock: outOfStockCount,
+    lowStock: lowStockCount,
+    nearExpiry: nearExpiryCount,
+    expired: expiredCount,
   };
 
-  // 9. Recent Purchases
-  const recentPurchases = [
-    { id: "1", date: "Oct 28, 2026", supplier: "Sun Pharma Distributors", invoiceNo: "SP-10283", items: 24, amount: 124580, status: "Received" },
-    { id: "2", date: "Oct 26, 2026", supplier: "Mankind Pharma", invoiceNo: "MP-55821", items: 15, amount: 84320, status: "Received" },
-    { id: "3", date: "Oct 22, 2026", supplier: "Cipla Distributors", invoiceNo: "CP-77810", items: 32, amount: 214500, status: "Received" },
-    { id: "4", date: "Oct 20, 2026", supplier: "Abbott Healthcare", invoiceNo: "AB-44128", items: 18, amount: 96420, status: "Partial" },
-    { id: "5", date: "Oct 18, 2026", supplier: "LifeCare Distributors", invoiceNo: "LC-99341", items: 28, amount: 152300, status: "Received" },
-  ];
+  // 12. Recent Activity Streams
+  const recentPurchases = recentPurchasesRaw.map((pb) => ({
+    id: String(pb._id),
+    date: fmtDate(pb.createdAt),
+    supplier: pb.supplierId?.businessName || pb.supplierId?.name || "Distributor",
+    invoiceNo: pb.purchaseBillNo || pb.supplierInvoiceNo || "PB",
+    items: Array.isArray(pb.items) ? pb.items.length : 0,
+    amount: Number(pb.grandTotal || 0),
+    status: pb.status === "CONFIRMED" ? "Received" : pb.status === "DRAFT" ? "Draft" : pb.status || "Received",
+  }));
 
-  // 10. Recent Sales (All Branches)
-  const recentSales = [
-    { id: "1", date: "Oct 28, 2026", branch: "Indore - Main", invoiceNo: "INV-10284", amount: 1245, payment: "UPI" },
-    { id: "2", date: "Oct 28, 2026", branch: "Bhopal - MP Nagar", invoiceNo: "INV-10283", amount: 3860, payment: "Card" },
-    { id: "3", date: "Oct 28, 2026", branch: "Ujjain", invoiceNo: "INV-10282", amount: 2145, payment: "Cash" },
-    { id: "4", date: "Oct 27, 2026", branch: "Dewas", invoiceNo: "INV-10281", amount: 5230, payment: "UPI" },
-    { id: "5", date: "Oct 27, 2026", branch: "Indore - Vijay Nagar", invoiceNo: "INV-10280", amount: 1980, payment: "Cash" },
-  ];
+  const recentSales = recentSalesRaw.map((inv) => ({
+    id: String(inv._id),
+    date: fmtDate(inv.date || inv.createdAt),
+    branch: inv.branchId?.name || "Main Counter",
+    invoiceNo: inv.invoiceNo || "INV",
+    amount: Number(inv.grandTotal || 0),
+    payment: inv.paymentMethod || "Cash",
+  }));
 
-  // 11. Inter-Branch Transfers
-  const interBranchTransfers = [
-    { id: "1", date: "Oct 27", fromTo: "Central → Indore", items: 12, status: "In Transit" },
-    { id: "2", date: "Oct 26", fromTo: "Indore → Bhopal", items: 8, status: "Completed" },
-    { id: "3", date: "Oct 24", fromTo: "Dewas → Ujjain", items: 15, status: "Pending" },
-    { id: "4", date: "Oct 22", fromTo: "Bhopal → Indore", items: 10, status: "Completed" },
-    { id: "5", date: "Oct 20", fromTo: "Indore → Dewas", items: 6, status: "Cancelled" },
-  ];
+  const interBranchTransfers = transfersRaw.map((t) => ({
+    id: String(t._id),
+    date: fmtDate(t.createdAt),
+    fromTo: `${t.sourceBranchId?.name || "Branch"} → ${t.destinationBranchId?.name || "Branch"}`,
+    items: Array.isArray(t.items) ? t.items.length : 0,
+    status:
+      t.status === "IN_TRANSIT"
+        ? "In Transit"
+        : t.status === "COMPLETED"
+        ? "Completed"
+        : t.status === "PENDING"
+        ? "Pending"
+        : t.status === "CANCELLED"
+        ? "Cancelled"
+        : t.status,
+  }));
 
   return {
     companyInfo: {
-      companyId: companyDoc?._id || compObjectId,
-      companyName: companyDoc?.name || "Traveller Medico Pvt. Ltd.",
-      gstin: companyDoc?.gstin || "23ABCDE1234F1Z5",
-      activeBranchesCount: branches.length || 5,
-      totalBranchesAllowed: 8,
+      companyId: String(companyDoc?._id || compObjectId),
+      companyName: companyDoc?.name || "Company",
+      legalName: companyDoc?.legalName || companyDoc?.name || "Company",
+      gstin: companyDoc?.gstin || "N/A",
+      pan: companyDoc?.pan || "N/A",
+      activeBranchesCount: activeBranches.length,
+      totalBranchesCount: branches.length,
+      dateRangeFormatted,
     },
     kpis: {
       totalSales,
       totalSalesGrowth,
+      totalSalesInvoices,
       totalPurchases,
       totalPurchasesGrowth,
       grossProfit,
       grossProfitGrowth,
       outstandingReceivables,
-      outstandingReceivablesGrowth,
+      outstandingReceivablesGrowth: 0,
       outstandingPayables,
-      outstandingPayablesGrowth,
-      bankBalance,
-      bankBalanceGrowth,
+      outstandingPayablesGrowth: 0,
+      bankBalance: totalBankBalance,
+      bankBalanceGrowth: 0,
     },
-    salesVsPurchasesTrend,
+    salesVsPurchasesTrend: {
+      timeframe: "Last 6 Months",
+      months,
+    },
     branchPerformance,
     salesByCategory,
     topSellingProducts,
@@ -1010,150 +1901,272 @@ const getCompanyDashboardData = async ({ workspaceId, companyId, timeframe = "TH
     recentPurchases,
     recentSales,
     interBranchTransfers,
+    corporateBankAccounts,
   };
 };
 
 /**
- * Get Workspace Level Dashboard Data (Image 3)
+ * Get Workspace Level Dashboard Data with Real MongoDB Aggregations
+ * Strictly Workspace Scope:
+ * - Legal Registered Companies Directory
+ * - Physical Branch Network
+ * - Team Members & Access Control
+ * - Roles & Permissions Master
+ * - Corporate Bank Accounts with real live accumulated balances
+ * - Subscription & Quota Limits
+ * - Workspace Setup & Compliance Health
  */
-const getWorkspaceDashboardData = async ({ workspaceId, timeframe = "THIS_MONTH" }) => {
+const getWorkspaceDashboardData = async ({
+  workspaceId,
+  timeframe = "THIS_MONTH",
+  startDate = null,
+  endDate = null,
+}) => {
   const wsObjectId = new mongoose.Types.ObjectId(workspaceId);
+  const now = new Date();
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-  // 1. Fetch Companies, Branches, Staff for this workspace
-  let totalCompanies = 3;
-  let activeBranches = 12;
-  let totalStaff = 38;
+  const isActiveStatus = (status) => String(status || "").trim().toLowerCase() === "active";
 
-  try {
-    const [compCount, branchCount] = await Promise.all([
-      Company.countDocuments({ workspaceId: wsObjectId, isDeleted: false }),
-      Branch.countDocuments({ workspaceId: wsObjectId, isDeleted: false }),
-    ]);
-    if (compCount > 0) totalCompanies = compCount;
-    if (branchCount > 0) activeBranches = branchCount;
-  } catch (err) {
-    console.warn("Workspace count warning:", err);
-  }
-
-  // 2. Financial KPIs
-  const totalRevenue = 14832450;
-  const totalRevenueGrowth = 12.5;
-  const totalPurchases = 9214300;
-  const totalPurchasesGrowth = 8.3;
-  const grossProfit = 5618150;
-  const grossProfitGrowth = 18.2;
-
-  // 3. Revenue & Profit Trend (6 Months: May to Oct)
-  const revenueProfitTrend = {
-    timeframe: "Last 6 Months",
-    months: [
-      { month: "May", revenue: 9500000, purchases: 5800000, profit: 3700000 },
-      { month: "Jun", revenue: 11800000, purchases: 7200000, profit: 4600000 },
-      { month: "Jul", revenue: 13900000, purchases: 8400000, profit: 5500000 },
-      { month: "Aug", revenue: 16800000, purchases: 10200000, profit: 6600000 },
-      { month: "Sep", revenue: 14200000, purchases: 8900000, profit: 5300000 },
-      { month: "Oct", revenue: 14832450, purchases: 9214300, profit: 5618150 },
-    ],
+  const fmtDate = (dt) => {
+    if (!dt) return "";
+    const ist = new Date(new Date(dt).getTime() + IST_OFFSET_MS);
+    const day = String(ist.getUTCDate()).padStart(2, "0");
+    const mon = MONTH_NAMES[ist.getUTCMonth()];
+    const yr = ist.getUTCFullYear();
+    return `${day} ${mon} ${yr}`;
   };
 
-  // 4. Top Companies by Revenue
-  const topCompanies = [
-    { id: "1", rank: 1, name: "Traveller Medico Pvt. Ltd.", code: "TRV-01", revenue: 6812430, growth: 14, progressPct: 75, badgeColor: "bg-emerald-500 text-white" },
-    { id: "2", rank: 2, name: "LifeCare Distributors", code: "LCD-01", revenue: 5218920, growth: 10, progressPct: 60, badgeColor: "bg-emerald-500 text-white" },
-    { id: "3", rank: 3, name: "HealthPlus Retail", code: "HPR-01", revenue: 2801100, growth: 8, progressPct: 40, badgeColor: "bg-amber-500 text-white" },
-  ];
+  // 1. Fetch Core Workspace Document
+  const workspaceDoc = await Workspace.findById(wsObjectId)
+    .select("name code createdAt status")
+    .lean();
 
-  // 5. Branch Performance Leaderboard
-  const branchPerformance = [
-    { id: "1", name: "Indore - Main", sales: 1824300, growth: 16 },
-    { id: "2", name: "Bhopal - MP Nagar", sales: 1492100, growth: 12 },
-    { id: "3", name: "Ujjain", sales: 1218450, growth: 8 },
-    { id: "4", name: "Dewas", sales: 1082300, growth: 6 },
-    { id: "5", name: "Indore - Vijay Nagar", sales: 1021800, growth: 5 },
-  ];
+  // 2. Fetch All Registered Companies
+  const companies = await Company.find({
+    workspaceId: wsObjectId,
+    isDeleted: false,
+  })
+    .select("name companyCode legalName gstin pan email phone address licenses status createdAt")
+    .sort({ createdAt: -1 })
+    .lean();
 
-  // 6. Sales by Category Donut
-  const salesByCategory = {
-    totalSales: totalRevenue,
-    totalSalesFormatted: "₹ 1.48 Cr",
-    categories: [
-      { name: "Allopathic Medicines", percentage: 54.2, color: "#10b981" },
-      { name: "Generics", percentage: 18.6, color: "#0ea5e9" },
-      { name: "OTC Products", percentage: 12.3, color: "#f59e0b" },
-      { name: "Health & Wellness", percentage: 7.8, color: "#ec4899" },
-      { name: "Personal Care", percentage: 4.1, color: "#8b5cf6" },
-      { name: "Others", percentage: 3.0, color: "#94a3b8" },
-    ],
-  };
+  // 3. Fetch All Physical Branches Mapped to Companies
+  const branches = await Branch.find({
+    workspaceId: wsObjectId,
+    isDeleted: false,
+  })
+    .populate("companyId", "name companyCode")
+    .select("name branchCode companyId address phone email status branchHead manager createdAt")
+    .sort({ createdAt: -1 })
+    .lean();
 
-  // 7. Stock Alerts
-  const stockAlerts = {
-    outOfStock: 12,
-    lowStock: 28,
-    nearExpiry: 16,
-    expired: 8,
-  };
+  const branchCountByCompany = new Map();
+  branches.forEach((br) => {
+    const cId = String(br.companyId?._id || br.companyId || "");
+    branchCountByCompany.set(cId, (branchCountByCompany.get(cId) || 0) + 1);
+  });
 
-  // 8. Financial Summary
-  const financialSummary = {
-    cashInBranches: 1248500,
-    bankAccountBalance: 4832120,
-    pendingCustomerReceivables: 1821300,
-    pendingSupplierPayables: 3218450,
-    netGstPayable: 682100,
-  };
+  const formattedCompanies = companies.map((c) => ({
+    id: String(c._id),
+    name: c.name,
+    code: c.companyCode || "CO",
+    legalName: c.legalName || c.name,
+    gstin: c.gstin || "N/A",
+    pan: c.pan || "N/A",
+    email: c.email || null,
+    phone: c.phone?.mobile || c.phone?.landline || null,
+    city: c.address?.city || null,
+    state: c.address?.state || null,
+    retailLicense: c.licenses?.retailLicenseNumber || null,
+    wholesaleLicense: c.licenses?.wholesaleLicenseNumber || null,
+    fssaiNumber: c.licenses?.fssaiNumber || null,
+    status: isActiveStatus(c.status) ? "ACTIVE" : String(c.status || "INACTIVE").toUpperCase(),
+    branchCount: branchCountByCompany.get(String(c._id)) || 0,
+    createdAt: c.createdAt,
+    createdAtFormatted: fmtDate(c.createdAt),
+  }));
 
-  // 9. Recent Business Activity Feed
-  const recentActivity = [
-    { id: "1", time: "10:24 AM", type: "Sale", description: "Invoice #INV-10284", entity: "Indore - Main", amount: 1245, user: "Rohan S.", iconType: "cart" },
-    { id: "2", time: "09:48 AM", type: "Purchase", description: "GRN #GRN-5582", entity: "Traveller Medico", amount: 18420, user: "Amit K.", iconType: "cart" },
-    { id: "3", time: "09:15 AM", type: "Transfer", description: "Branch Transfer #TRF-210", entity: "Bhopal → Indore", amount: 5360, user: "Neha P.", iconType: "transfer" },
-    { id: "4", time: "08:32 AM", type: "Payment", description: "Supplier Payment", entity: "LifeCare Distributors", amount: 25000, user: "Arjun M.", iconType: "payment" },
-    { id: "5", time: "08:12 AM", type: "User", description: "New user invited", entity: "Traveller Medico", amount: null, user: "System", iconType: "user" },
-  ];
+  const formattedBranches = branches.map((b) => ({
+    id: String(b._id),
+    name: b.name,
+    code: b.branchCode || "BR",
+    companyId: String(b.companyId?._id || b.companyId || ""),
+    companyName: b.companyId?.name || "Company",
+    companyCode: b.companyId?.companyCode || "CO",
+    city: b.address?.city || "Local",
+    state: b.address?.state || null,
+    phone: b.phone?.mobile || null,
+    manager: b.manager?.name || b.branchHead?.name || "Branch In-Charge",
+    status: isActiveStatus(b.status) ? "ACTIVE" : String(b.status || "INACTIVE").toUpperCase(),
+    createdAt: b.createdAt,
+    createdAtFormatted: fmtDate(b.createdAt),
+  }));
 
-  // 10. Subscription & Usage
+  // 4. Fetch Workspace Members & Role Distribution
+  const members = await WorkspaceMember.find({
+    workspaceId: wsObjectId,
+    status: { $ne: "Removed" },
+  })
+    .populate("userId", "name email phone isEmailVerified lastLoginAt")
+    .populate("roleId", "name code isSystem")
+    .sort({ isOwner: -1, createdAt: -1 })
+    .lean();
+
+  const roleMemberCounts = new Map();
+  const formattedMembers = members.map((m) => {
+    const roleName = m.roleId?.name || (m.isOwner ? "Workspace Owner" : "Member");
+    const roleCode = m.roleId?.code || (m.isOwner ? "owner" : "member");
+    const roleIdKey = String(m.roleId?._id || roleCode);
+    roleMemberCounts.set(roleIdKey, (roleMemberCounts.get(roleIdKey) || 0) + 1);
+
+    return {
+      id: String(m._id),
+      userId: String(m.userId?._id || ""),
+      name: m.userId?.name || "Staff Member",
+      email: m.userId?.email || "N/A",
+      phone: m.userId?.phone || null,
+      roleName,
+      roleCode,
+      isOwner: Boolean(m.isOwner),
+      status: isActiveStatus(m.status) ? "Active" : String(m.status || "Inactive"),
+      lastActiveAt: m.lastActiveAt || m.userId?.lastLoginAt || m.createdAt,
+      lastActiveFormatted: fmtDate(m.lastActiveAt || m.userId?.lastLoginAt || m.createdAt),
+      createdAt: m.createdAt,
+    };
+  });
+
+  // 5. Fetch Roles & Permissions
+  const roles = await Role.find({
+    workspaceId: wsObjectId,
+    isDeleted: false,
+  })
+    .select("name code description permissions isSystem status createdAt")
+    .sort({ isSystem: -1, name: 1 })
+    .lean();
+
+  const formattedRoles = roles.map((r) => {
+    const memberCount = roleMemberCounts.get(String(r._id)) || roleMemberCounts.get(r.code) || 0;
+    return {
+      id: String(r._id),
+      name: r.name,
+      code: r.code,
+      description: r.description || "System configured role",
+      isSystem: Boolean(r.isSystem),
+      permissionsCount: Array.isArray(r.permissions) ? r.permissions.length : 0,
+      memberCount,
+      status: isActiveStatus(r.status) ? "ACTIVE" : String(r.status || "INACTIVE").toUpperCase(),
+      createdAt: r.createdAt,
+    };
+  });
+
+  // 6. Active Counts with Case-Insensitive Matching
+  const activeCompCount = companies.filter((c) => isActiveStatus(c.status)).length;
+  const activeBranchCount = branches.filter((b) => isActiveStatus(b.status)).length;
+  const activeStaffCount = members.filter((m) => isActiveStatus(m.status)).length;
+
+  // 7. Subscription Quotas & Limits
+  const activeSub = await Subscription.findOne({
+    workspaceId: wsObjectId,
+    status: { $in: ["ACTIVE", "TRIAL", "GRACE_PERIOD"] },
+  })
+    .populate("planId")
+    .sort({ createdAt: -1 })
+    .lean();
+
+  const planLimits = activeSub?.planId?.limits || {};
+  const maxCompanies = planLimits.maxCompanies || Math.max(companies.length, 3);
+  const maxBranches = planLimits.maxBranches || Math.max(branches.length, 10);
+  const maxStaff = planLimits.maxUsers || Math.max(members.length, 20);
+
+  const daysLeft = activeSub?.expiresAt
+    ? Math.max(0, Math.ceil((new Date(activeSub.expiresAt).getTime() - now.getTime()) / (1000 * 60 * 60 * 24)))
+    : 365;
+
   const subscriptionUsage = {
-    planName: "Growth Plan",
-    status: "Active",
-    validTill: "15 Mar 2027",
-    daysLeft: 10,
-    branches: { used: 8, max: 15 },
-    staffSeats: { used: 24, max: 50 },
-    storageGb: { used: 62, max: 200 },
+    planName: activeSub?.currentPlanSnapshot?.name || activeSub?.planId?.name || "Enterprise Plan",
+    status: activeSub?.status || "Active",
+    tier: activeSub?.planId?.tier || "PRO",
+    validTill: activeSub?.expiresAt ? fmtDate(activeSub.expiresAt) : "Continuous",
+    daysLeft,
+    companies: {
+      used: companies.length,
+      active: activeCompCount,
+      max: maxCompanies,
+      pct: Math.min(100, Math.round((companies.length / maxCompanies) * 100)),
+    },
+    branches: {
+      used: branches.length,
+      active: activeBranchCount,
+      max: maxBranches,
+      pct: Math.min(100, Math.round((branches.length / maxBranches) * 100)),
+    },
+    staffSeats: {
+      used: members.length,
+      active: activeStaffCount,
+      max: maxStaff,
+      pct: Math.min(100, Math.round((members.length / maxStaff) * 100)),
+    },
+  };
+
+  // 8. Workspace Setup & Compliance Status
+  const compliance = {
+    isSetupComplete: Boolean(workspaceDoc?.name && activeCompCount > 0 && activeBranchCount > 0),
+    healthScore: Math.round(
+      ((activeCompCount > 0 ? 30 : 0) +
+       (activeBranchCount > 0 ? 30 : 0) +
+       (activeStaffCount > 0 ? 20 : 0) +
+       (roles.length > 0 ? 20 : 0))
+    ),
+    organizationProfile: Boolean(workspaceDoc?.name),
+    hasActiveCompany: activeCompCount > 0,
+    hasActiveBranch: activeBranchCount > 0,
+    hasStaffAssigned: activeStaffCount > 0,
+    hasRolesConfigured: roles.length > 0,
+  };
+
+  // 9. Primary Workspace KPIs (Strictly Workspace-Level, Bank Accounts Belong to Company Dashboard)
+  const kpis = {
+    totalCompanies: companies.length,
+    activeCompanies: activeCompCount,
+    maxCompanies,
+    totalBranches: branches.length,
+    activeBranches: activeBranchCount,
+    maxBranches,
+    totalStaff: members.length,
+    activeStaff: activeStaffCount,
+    maxStaff,
+    totalRoles: roles.length,
+    planName: subscriptionUsage.planName,
+    planTier: subscriptionUsage.tier,
+    validTill: subscriptionUsage.validTill,
+    daysLeft,
+    status: workspaceDoc?.status || "Active",
   };
 
   return {
     workspaceInfo: {
-      workspaceId: wsObjectId,
-      workspaceName: "Traveller Healthcare Group",
+      id: String(workspaceDoc?._id || wsObjectId),
+      name: workspaceDoc?.name || "Healthcare Pharmacy Workspace",
+      code: workspaceDoc?.code || "WS",
+      createdAt: workspaceDoc?.createdAt,
+      createdAtFormatted: fmtDate(workspaceDoc?.createdAt),
     },
-    kpis: {
-      totalRevenue,
-      totalRevenueGrowth,
-      totalPurchases,
-      totalPurchasesGrowth,
-      grossProfit,
-      grossProfitGrowth,
-      activeCompanies: totalCompanies,
-      activeCompaniesMax: 3,
-      activeCompaniesGrowth: 0,
-      activeBranches,
-      activeBranchesMax: 15,
-      activeBranchesGrowth: 20,
-      totalStaff,
-      totalStaffMax: 50,
-      totalStaffGrowth: 11,
-    },
-    revenueProfitTrend,
-    topCompanies,
-    branchPerformance,
-    salesByCategory,
-    stockAlerts,
-    financialSummary,
-    recentActivity,
+    kpis,
+    companies: formattedCompanies,
+    branches: formattedBranches,
+    members: formattedMembers,
+    roles: formattedRoles,
     subscriptionUsage,
+    compliance,
   };
+};
+
+export {
+  getDashboardOverview,
+  getCompanyDashboardData,
+  getWorkspaceDashboardData,
 };
 
 export default {

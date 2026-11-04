@@ -136,62 +136,12 @@ const getMyActiveContext = async (userId) => {
     throw new ApiError(404, "User not found");
   }
 
-  const activeContext = user.activeContext || {
-    workspaceId: null,
+  return {
+    workspaceId: user.activeContext?.workspaceId || null,
     companyId: null,
     branchId: null,
-    updatedAt: null,
+    updatedAt: user.activeContext?.updatedAt || null,
   };
-
-  // Self-healing check: verify that current company and branch access are still valid
-  if (activeContext.workspaceId) {
-    let contextModified = false;
-    let validCompanyId = activeContext.companyId;
-    let validBranchId = activeContext.branchId;
-
-    if (validCompanyId) {
-      const hasCompany = await memberAccessService.hasCompanyAccess(
-        activeContext.workspaceId,
-        userId,
-        validCompanyId,
-      );
-      if (!hasCompany) {
-        validCompanyId = null;
-        validBranchId = null;
-        contextModified = true;
-      }
-    }
-
-    if (validBranchId) {
-      const hasBranch = await memberAccessService.hasBranchAccess(
-        activeContext.workspaceId,
-        userId,
-        validBranchId,
-      );
-      if (!hasBranch) {
-        validBranchId = null;
-        contextModified = true;
-      }
-    }
-
-    if (contextModified) {
-      const updated = await userRepository.updateActiveContext(userId, {
-        workspaceId: activeContext.workspaceId,
-        companyId: validCompanyId,
-        branchId: validBranchId,
-      });
-      return (
-        updated?.activeContext || {
-          workspaceId: activeContext.workspaceId,
-          companyId: validCompanyId,
-          branchId: validBranchId,
-          updatedAt: new Date(),
-        }
-      );
-    }
-  }
-
-  return activeContext;
 };
 
 
@@ -289,7 +239,7 @@ const validateBranchContext = async (
 };
 
 const updateMyActiveContext = async (userId, payload) => {
-  const { workspaceId, companyId, branchId } = payload;
+  const { workspaceId } = payload;
 
   if (!workspaceId) {
     const user = await userRepository.clearActiveContext(userId);
@@ -303,36 +253,11 @@ const updateMyActiveContext = async (userId, payload) => {
 
   await validateWorkspaceContext(userId, workspaceId);
 
-  let activeContext = {
+  const activeContext = {
     workspaceId,
     companyId: null,
     branchId: null,
   };
-
-  if (companyId) {
-    await validateCompanyContext(userId, workspaceId, companyId);
-
-    activeContext = {
-      ...activeContext,
-      companyId,
-    };
-  }
-
-  if (branchId) {
-    if (!companyId) {
-      throw new ApiError(
-        400,
-        "Company id is required when branch id is provided",
-      );
-    }
-
-    await validateBranchContext(userId, workspaceId, companyId, branchId);
-
-    activeContext = {
-      ...activeContext,
-      branchId,
-    };
-  }
 
   const user = await userRepository.updateActiveContext(userId, activeContext);
 

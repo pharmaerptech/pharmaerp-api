@@ -110,6 +110,8 @@ export const getBankTransactionsQuerySchema = Joi.object({
   category: Joi.string().valid(...Object.values(BANK_TRANSACTION_CATEGORY), "all").optional(),
   direction: Joi.string().valid("CREDIT", "DEBIT", "all").optional(),
   status: Joi.string().valid("DRAFT", "POSTED", "CANCELLED", "PENDING_SHIFT_CLOSE", "all").optional(),
+  shiftId: objectId.allow(null, "").optional(),
+  businessDayId: objectId.allow(null, "").optional(),
   startDate: Joi.date().optional(),
   endDate: Joi.date().optional(),
   page: Joi.number().integer().min(1).default(1).optional(),

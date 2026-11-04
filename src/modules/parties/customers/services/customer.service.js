@@ -10,7 +10,7 @@ import customerRepository from "../repositories/customer.repository.js";
 import branchRepository from "../../../organization/branches/repositories/branch.repository.js";
 import gstLedgerRepository from "../../../finance/gst-ledger/repositories/gstLedger.repository.js";
 import financialPeriodRepository from "../../../finance/financial-periods/repositories/financialPeriod.repository.js";
-import { CUSTOMER_STATUS, CUSTOMER_TRANSACTION_TYPE } from "../constants/customer.constant.js";
+import { CUSTOMER_STATUS, CUSTOMER_TYPE, CUSTOMER_TRANSACTION_TYPE } from "../constants/customer.constant.js";
 import Customer from "../models/customer.model.js";
 import Batch from "../../../catalog/products/models/batch.model.js";
 import ProductFacility from "../../../catalog/products/models/productFacility.model.js";
@@ -24,6 +24,124 @@ import CustomerCreditTransaction from "../models/customerCreditTransaction.model
 import SharedContactGroup from "../models/sharedContactGroup.model.js";
 import CustomerRelationship, { CONFIRMATION_STATUS } from "../models/customerRelationship.model.js";
 import { getReciprocalRelation } from "../helpers/phoneNormalizer.js";
+
+const findOrCreateWalkInCustomer = async (workspaceId, companyId, userId = null, options = {}) => {
+  const session = options.session || null;
+
+  // 1. Check if already exists for this company
+  const existing = await customerRepository.findWalkInCustomer(companyId, workspaceId, { session });
+  if (existing) {
+    return existing.toSafeObject ? existing.toSafeObject() : existing;
+  }
+
+  try {
+    // 2. Ensure CURRENT_ASSETS and SUNDRY_DEBTORS groups exist
+    let currentAssetsGroup = await accountGroupRepository.findGroupByCode(companyId, "CURRENT_ASSETS", { session });
+    if (!currentAssetsGroup) {
+      currentAssetsGroup = await accountGroupRepository.createGroup(
+        {
+          workspaceId,
+          companyId,
+          groupCode: "CURRENT_ASSETS",
+          groupName: "Current Assets",
+          nature: "ASSET",
+          parentGroupId: null,
+          isSystemGroup: true,
+          createdBy: userId,
+        },
+        { session }
+      );
+    }
+
+    let sundryDebtorsGroup = await accountGroupRepository.findGroupByCode(companyId, "SUNDRY_DEBTORS", { session });
+    if (!sundryDebtorsGroup) {
+      sundryDebtorsGroup = await accountGroupRepository.createGroup(
+        {
+          workspaceId,
+          companyId,
+          groupCode: "SUNDRY_DEBTORS",
+          groupName: "Sundry Debtors",
+          nature: "ASSET",
+          parentGroupId: currentAssetsGroup._id,
+          isSystemGroup: true,
+          createdBy: userId,
+        },
+        { session }
+      );
+    }
+
+    // 3. Find or create CUST-WALKIN system ledger account
+    let ledgerAccount = await accountRepository.findAccountByCode(companyId, "CUST-WALKIN", { session });
+    if (!ledgerAccount) {
+      ledgerAccount = await accountRepository.createAccount(
+        {
+          workspaceId,
+          companyId,
+          accountCode: "CUST-WALKIN",
+          accountName: "Walk-in Customer",
+          accountGroupId: sundryDebtorsGroup._id,
+          accountNature: "ASSET",
+          accountCategory: "CUSTOMER",
+          openingBalance: 0,
+          openingBalanceType: "dr",
+          status: "active",
+          isSystemAccount: true,
+          createdBy: userId,
+        },
+        { session }
+      );
+    }
+
+    // 4. Create the Walk-in Customer document
+    const walkInCustomer = await customerRepository.createCustomer(
+      {
+        workspaceId,
+        companyId,
+        branchId: null,
+        customerCode: "WALK-IN",
+        customerType: CUSTOMER_TYPE.WALK_IN,
+        name: "Walk-in Customer",
+        mobile: null,
+        alternateMobile: null,
+        email: null,
+        gstNumber: null,
+        panNumber: null,
+        drugLicenseNumber: null,
+        creditLimit: 0,
+        creditDays: 0,
+        openingBalance: 0,
+        openingBalanceType: "dr",
+        advanceBalance: 0,
+        creditNoteBalance: 0,
+        creditOutstanding: 0,
+        isWalkIn: true,
+        isSystemCustomer: true,
+        status: "active",
+        ledgerAccountId: ledgerAccount?._id || null,
+        createdBy: userId,
+      },
+      { session }
+    );
+
+    return walkInCustomer.toSafeObject ? walkInCustomer.toSafeObject() : walkInCustomer;
+  } catch (err) {
+    if (err.code === 11000 || String(err.message).includes("E11000")) {
+      const fallback = await customerRepository.findWalkInCustomer(companyId, workspaceId, { session });
+      if (fallback) {
+        return fallback.toSafeObject ? fallback.toSafeObject() : fallback;
+      }
+    }
+    throw err;
+  }
+};
+
+const getWalkInCustomer = async (workspaceId, companyId) => {
+  const customer = await customerRepository.findWalkInCustomer(companyId, workspaceId);
+  if (!customer) {
+    return null;
+  }
+  return customer.toSafeObject ? customer.toSafeObject() : customer;
+};
 
 const createCustomer = async (workspaceId, companyId, userId, payload) => {
   const {
@@ -58,9 +176,27 @@ const createCustomer = async (workspaceId, companyId, userId, payload) => {
   }
 
   if (customerCode) {
-    const existing = await customerRepository.findCustomerByCode(customerCode);
+    const existing = await customerRepository.findCustomerByCode(customerCode, companyId);
     if (existing) {
       throw new ApiError(400, "Customer with this code already exists");
+    }
+  }
+
+  // Prevent duplicate Walk-in customer creation
+  const isWalkInAttempt =
+    payload.isWalkIn === true ||
+    customerType === CUSTOMER_TYPE.WALK_IN ||
+    customerType === "walk_in" ||
+    customerCode === "WALK-IN" ||
+    name?.trim().toLowerCase() === "walk-in customer";
+
+  if (isWalkInAttempt) {
+    const existingWalkIn = await customerRepository.findWalkInCustomer(companyId, workspaceId);
+    if (existingWalkIn) {
+      throw new ApiError(
+        400,
+        "A Walk-in Customer already exists for this company. Each company is strictly restricted to only one Walk-in Customer."
+      );
     }
   }
 
@@ -197,6 +333,7 @@ const getCustomers = async (workspaceId, companyId, query = {}) => {
     obj.creditLimit = Number(obj.creditLimit || 0);
     obj.advanceBalance = Number(obj.advanceBalance || 0);
     obj.creditOutstanding = Number(obj.creditOutstanding || 0);
+    obj.creditNoteBalance = Number(obj.creditNoteBalance || 0);
     return obj;
   });
 
@@ -397,6 +534,7 @@ const getCustomerById = async (customerId, companyId, workspaceId) => {
     safeCustomer.creditOutstanding = Math.round(creditOutstanding * 100) / 100;
     safeCustomer.availableCredit = Math.max(0, (customer.creditLimit || 0) - creditOutstanding);
     safeCustomer.overdueCount = overdueCount;
+    safeCustomer.creditNoteBalance = Math.round(Number(customer.creditNoteBalance || 0) * 100) / 100;
   } catch (err) {
     console.warn("Failed to attach credit/advance summary to customer:", err.message);
     safeCustomer.advanceBalance = 0;
@@ -902,9 +1040,34 @@ const updateCustomer = async (
   if (payload.customerCode && payload.customerCode !== customer.customerCode) {
     const existing = await customerRepository.findCustomerByCode(
       payload.customerCode,
+      companyId,
     );
     if (existing && existing._id.toString() !== customer._id.toString()) {
       throw new ApiError(400, "Customer with this code already exists");
+    }
+  }
+
+  if (customer.isWalkIn) {
+    if (payload.customerType && payload.customerType !== CUSTOMER_TYPE.WALK_IN) {
+      throw new ApiError(400, "Walk-in Customer type cannot be changed.");
+    }
+    if (payload.creditLimit && Number(payload.creditLimit) > 0) {
+      throw new ApiError(400, "Credit Limit cannot be assigned to Walk-in Customer.");
+    }
+    if (payload.openingBalance && Number(payload.openingBalance) > 0) {
+      throw new ApiError(400, "Opening balance cannot be assigned to Walk-in Customer.");
+    }
+  } else {
+    if (
+      payload.isWalkIn === true ||
+      payload.customerType === CUSTOMER_TYPE.WALK_IN ||
+      payload.customerType === "walk_in" ||
+      payload.customerCode === "WALK-IN"
+    ) {
+      throw new ApiError(
+        400,
+        "Cannot convert an existing regular customer into a Walk-in Customer. Each company already has a dedicated singleton Walk-in Customer."
+      );
     }
   }
 
@@ -941,6 +1104,19 @@ const updateCustomer = async (
 };
 
 const deleteCustomer = async (customerId, companyId, workspaceId, userId) => {
+  const existing = await customerRepository.findCustomerByIdCompanyAndWorkspace(
+    customerId,
+    companyId,
+    workspaceId,
+  );
+
+  if (!existing) {
+    throw new ApiError(404, "Customer not found");
+  }
+
+  if (existing.isWalkIn || existing.isSystemCustomer) {
+    throw new ApiError(400, "System Walk-in Customer cannot be deleted.");
+  }
   const customer = await customerRepository.deleteCustomerById(
     customerId,
     companyId,
@@ -1636,6 +1812,8 @@ export default {
   confirmImport,
   previewB2BOutstandingImport,
   confirmB2BOutstandingImport,
+  findOrCreateWalkInCustomer,
+  getWalkInCustomer,
   createCustomer,
   getCustomers,
   getCustomerById,

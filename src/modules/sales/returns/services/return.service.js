@@ -13,11 +13,13 @@ import WorkspaceProduct from "../../../catalog/products/models/workspaceProduct.
 import gstLedgerRepository from "../../../finance/gst-ledger/repositories/gstLedger.repository.js";
 import Company from "../../../organization/companies/models/company.model.js";
 import SalesInvoice from "../../invoices/models/invoice.model.js";
+import creditNoteService from "../../credit-notes/services/creditNote.service.js";
 import Customer from "../../../parties/customers/models/customer.model.js";
 import CustomerAdvanceTransaction from "../../../parties/customers/models/customerAdvanceTransaction.model.js";
 import CustomerCreditTransaction from "../../../parties/customers/models/customerCreditTransaction.model.js";
 import { CUSTOMER_TRANSACTION_TYPE } from "../../../parties/customers/constants/customer.constant.js";
 import { Shift } from "../../../operations/shifts/shift.model.js";
+import BusinessDay from "../../../operations/business-days/businessDay.model.js";
 import branchCashRepository from "../../../finance/treasury/cash-management/branch-cash/repositories/branchCash.repository.js";
 import cashTransactionService from "../../../finance/treasury/cash-management/cash-transactions/services/cashTransaction.service.js";
 import { decomposeCashAmount } from "../../../parties/customers/services/customerAdvance.service.js";
@@ -258,12 +260,14 @@ const recordCustomerReturn = async (
   existingSession = null
 ) => {
   const session = existingSession || (await mongoose.startSession());
-  if (!existingSession) session.startTransaction();
+  if (!existingSession && !session.inTransaction()) session.startTransaction();
 
   try {
     // 1. Fetch customer and reference data
     const [customer, activeBranches, periods, company] = await Promise.all([
-      customerRepository.findCustomerById(customerId, companyId, workspaceId),
+      (customerId
+        ? customerRepository.findCustomerById(customerId, companyId, workspaceId)
+        : customerRepository.findWalkInCustomer(companyId, workspaceId)),
       branchRepository.getCompanyBranches(companyId),
       financialPeriodRepository.getPeriods(workspaceId, companyId, { isCurrent: true, all: true }),
       Company.findOne({ _id: companyId, workspaceId }),
@@ -315,6 +319,8 @@ const recordCustomerReturn = async (
 
     // 4. Generate sequential return memo number
     let finalReturnNo = returnData.invoiceNo || returnData.returnNo || null;
+    let sequenceNo = 1;
+
     if (!finalReturnNo || !finalReturnNo.startsWith(finalReturnPrefix)) {
       const lastReturnDoc = await SalesReturn.findOne({
         companyId: new mongoose.Types.ObjectId(companyId),
@@ -328,7 +334,6 @@ const recordCustomerReturn = async (
         .sort({ date: -1, createdAt: -1 })
         .session(session);
 
-      let sequenceNo = 1;
       const lastRetNum = lastReturnDoc?.returnNo || lastReturnDoc?.invoiceNo;
       if (lastRetNum && lastRetNum.startsWith(finalReturnPrefix)) {
         const parts = lastRetNum.split("-");
@@ -352,41 +357,73 @@ const recordCustomerReturn = async (
         }
       }
 
-      let candidateSeq = sequenceNo;
+      finalReturnNo = `${finalReturnPrefix}${sequenceNo.toString().padStart(4, "0")}`;
+    } else {
+      const parts = finalReturnNo.split("-");
+      if (parts.length >= 4) {
+        const parsed = parseInt(parts[parts.length - 1], 10);
+        if (!isNaN(parsed)) sequenceNo = parsed;
+      }
+    }
+
+    let candidateSeq = sequenceNo;
+    let collision = await SalesReturn.findOne({
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      $or: [{ returnNo: finalReturnNo }, { invoiceNo: finalReturnNo }],
+    }).session(session);
+
+    while (collision) {
+      candidateSeq += 1;
       finalReturnNo = `${finalReturnPrefix}${candidateSeq.toString().padStart(4, "0")}`;
-      let collision = await SalesReturn.findOne({
+      collision = await SalesReturn.findOne({
         workspaceId: new mongoose.Types.ObjectId(workspaceId),
         $or: [{ returnNo: finalReturnNo }, { invoiceNo: finalReturnNo }],
       }).session(session);
-
-      while (collision) {
-        candidateSeq += 1;
-        finalReturnNo = `${finalReturnPrefix}${candidateSeq.toString().padStart(4, "0")}`;
-        collision = await SalesReturn.findOne({
-          workspaceId: new mongoose.Types.ObjectId(workspaceId),
-          $or: [{ returnNo: finalReturnNo }, { invoiceNo: finalReturnNo }],
-        }).session(session);
-      }
     }
 
-    // 5. Auto-resolve open shift for branch
+    // 5. Shift and Business Day Gatekeeper Resolution
     let resolvedShiftId = returnData.shiftId || null;
-    if (resolvedShiftId && mongoose.Types.ObjectId.isValid(resolvedShiftId)) {
-      const shiftDoc = await Shift.findById(resolvedShiftId).session(session);
-      if (!shiftDoc || shiftDoc.status !== "open") {
-        resolvedShiftId = null;
-      }
-    }
-    if (!resolvedShiftId && resolvedBranchId) {
-      const activeOpenShift = await Shift.findOne({
-        workspaceId: workspaceId || customer.workspaceId,
-        companyId: companyId || customer.companyId,
+    let resolvedBusinessDayId = null;
+
+    if (resolvedBranchId) {
+      const openBusinessDay = await BusinessDay.findOne({
         branchId: resolvedBranchId,
         status: "open",
-      }).session(session);
-      if (activeOpenShift) {
-        resolvedShiftId = activeOpenShift._id;
+      });
+
+      const candidateShift = resolvedShiftId
+        ? await Shift.findById(resolvedShiftId)
+        : await Shift.findOne({
+            branchId: resolvedBranchId,
+            status: "open",
+          });
+
+      const isDayClosed = !openBusinessDay;
+      const isShiftClosed = !candidateShift || candidateShift.status !== "open";
+
+      if (isDayClosed && isShiftClosed) {
+        throw new ApiError(
+          400,
+          "Cannot process return. The shift is closed, the business day is closed. Please open a business day and shift before processing returns."
+        );
       }
+
+      if (isDayClosed) {
+        throw new ApiError(
+          400,
+          "Cannot process return. The Business Day is closed for this branch. Please open a Business Day before processing returns."
+        );
+      }
+
+      if (isShiftClosed) {
+        throw new ApiError(
+          400,
+          "Cannot process return. The shift is closed. Please open a new shift before processing returns."
+        );
+      }
+
+      resolvedBusinessDayId = openBusinessDay._id;
+      resolvedShiftId = candidateShift._id;
     }
 
     const grandTotal = Number(returnData.grandTotal || 0);
@@ -405,6 +442,15 @@ const recordCustomerReturn = async (
       : isCredit
       ? "credit_note"
       : "cash_refund";
+
+    if (customer.isWalkIn) {
+      if (isAdvance || isCredit || returnType !== "cash_refund") {
+        throw new ApiError(
+          400,
+          "Credit Note or Advance cannot be issued to anonymous Walk-in Customer. Please register the customer with a name and phone number to issue a Credit Note."
+        );
+      }
+    }
 
     // Extract cash denominations (notes dispensed to customer, or change received)
     const rawPayments = Array.isArray(returnData.payments) ? returnData.payments : [];
@@ -539,6 +585,7 @@ const recordCustomerReturn = async (
       date: returnData.date || new Date(),
       financialPeriodId,
       shiftId: resolvedShiftId || null,
+      businessDayId: resolvedBusinessDayId || null,
       billingMode: returnData.billingMode || "B2C",
       subtotal: returnData.subtotal || 0,
       discount: returnData.discount || 0,
@@ -769,66 +816,48 @@ const recordCustomerReturn = async (
       );
     }
 
-    // B. Credit Note adjustment against pending credit outstanding
+    // B. Credit Note: Issue official Credit Note voucher
     else if (returnType === "credit_note") {
-      const pendingCredits = await CustomerCreditTransaction.find({
-        customerId: customer._id,
-        companyId: savedReturn.companyId,
-        status: { $in: ["PENDING", "PARTIAL"] },
-      })
-        .sort({ invoiceDate: 1 })
-        .session(session);
+      const isIgst = Boolean(
+        customer?.gstNumber &&
+        String(customer.gstNumber).slice(0, 2) !== String(savedReturn.workspaceId?.stateCode || "").slice(0, 2)
+      );
 
-      let remainingRefund = grandTotal;
-      for (const cr of pendingCredits) {
-        if (remainingRefund <= 0) break;
-        const curDue = Number(cr.balanceDue || 0);
-        const settleAmt = Math.min(curDue, remainingRefund);
+      const issuedNote = await creditNoteService.issueCreditNote(
+        {
+          workspaceId: savedReturn.workspaceId,
+          companyId: savedReturn.companyId,
+          branchId: resolvedBranchId,
+          financialPeriodId: savedReturn.financialPeriodId,
+          shiftId: resolvedShiftId || null,
+          businessDayId: savedReturn.businessDayId || null,
+          customerId: customer._id,
+          customerName: customer.name || savedReturn.customerName,
+          customerPhone: customer.mobile || customer.phone || savedReturn.customerPhone,
+          customerGst: customer.gstNumber || null,
+          billingMode: savedReturn.billingMode || "B2C",
+          source: "SALES_RETURN",
+          sourceReturnId: savedReturn._id,
+          sourceReturnNo: savedReturn.invoiceNo || savedReturn.returnNo,
+          originalInvoiceId: savedReturn.originalInvoiceId || null,
+          originalInvoiceNo: savedReturn.originalInvoiceNo || null,
+          subtotal: savedReturn.subtotal || 0,
+          discount: savedReturn.discount || 0,
+          tax: savedReturn.tax || 0,
+          cgst: isIgst ? 0 : Number(savedReturn.tax || 0) / 2,
+          sgst: isIgst ? 0 : Number(savedReturn.tax || 0) / 2,
+          igst: isIgst ? Number(savedReturn.tax || 0) : 0,
+          roundOff: savedReturn.roundOff || 0,
+          totalAmount: grandTotal,
+          items: savedReturn.items || [],
+          notes: savedReturn.notes || `Credit Note issued for Return Memo ${savedReturn.invoiceNo}`,
+        },
+        { session, user }
+      );
 
-        cr.paidAmount = (Number(cr.paidAmount) || 0) + settleAmt;
-        cr.balanceDue = curDue - settleAmt;
-        if (cr.balanceDue <= 0.01) {
-          cr.status = "SETTLED";
-          cr.balanceDue = 0;
-        } else {
-          cr.status = "PARTIAL";
-        }
-        cr.settlements = cr.settlements || [];
-        cr.settlements.push({
-          settlementDate: new Date(),
-          amount: settleAmt,
-          paymentMethod: "Credit Note",
-          referenceNumber: savedReturn.invoiceNo,
-          narration: `Adjusted against Sales Return Memo ${savedReturn.invoiceNo}`,
-        });
-        await cr.save({ session });
-        remainingRefund -= settleAmt;
-      }
-
-      // If credit note exceeded total outstanding debt, store excess into customer advance
-      if (remainingRefund > 0.01) {
-        customer.advanceBalance = (Number(customer.advanceBalance) || 0) + remainingRefund;
-        await customer.save({ session });
-        await CustomerAdvanceTransaction.create(
-          [
-            {
-              workspaceId: savedReturn.workspaceId,
-              companyId: savedReturn.companyId,
-              branchId: resolvedBranchId,
-              customerId: customer._id,
-              type: CUSTOMER_TRANSACTION_TYPE.ADVANCE_RECEIVED,
-              amount: remainingRefund,
-              paymentMethod: "Advance",
-              referenceId: savedReturn._id,
-              narration: `Credit note excess advance balance from return memo ${savedReturn.invoiceNo}`,
-              status: "ACTIVE",
-              shiftId: resolvedShiftId || null,
-              createdBy: user?._id || null,
-            },
-          ],
-          { session }
-        );
-      }
+      savedReturn.creditNoteId = issuedNote._id;
+      savedReturn.creditNoteNo = issuedNote.creditNoteNo;
+      await savedReturn.save({ session });
     }
 
     // C. Cash Refund: deduct from running cash counter & update Branch Cash
@@ -874,6 +903,7 @@ const recordCustomerReturn = async (
           returnInc.returnAdvanceTotal = grandTotal;
         } else if (retType === "credit_note" || pMethod.includes("CREDIT")) {
           returnInc.returnCreditTotal = grandTotal;
+          returnInc.returnCreditNoteTotal = grandTotal;
         } else if (pMethod.includes("UPI") || pMethod.includes("QR")) {
           returnInc.returnUpiTotal = grandTotal;
         } else {
@@ -922,17 +952,23 @@ const recordCustomerReturn = async (
     }
 
     if (!existingSession) {
-      await session.commitTransaction();
+      if (session.inTransaction()) {
+        await session.commitTransaction();
+      }
       session.endSession();
     }
 
     return savedReturn;
   } catch (error) {
-    if (!existingSession) {
+    if (!existingSession && session) {
+      if (session.inTransaction()) {
+        try {
+          await session.abortTransaction();
+        } catch (abortErr) {}
+      }
       try {
-        await session.abortTransaction();
-      } catch (abortErr) {}
-      session.endSession();
+        session.endSession();
+      } catch (e) {}
     }
     throw error;
   }

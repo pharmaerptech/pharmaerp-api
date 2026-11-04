@@ -39,16 +39,33 @@ const findCustomerByIdCompanyAndWorkspace = async (
     .select(options.select || "");
 };
 
-const findCustomerByCode = async (customerCode, options = {}) => {
+const findCustomerByCode = async (customerCode, companyId = null, options = {}) => {
   if (!customerCode) {
     return null;
   }
-  return Customer.findOne({
+  const query = {
     customerCode: String(customerCode).trim().toUpperCase(),
+    isDeleted: false,
+  };
+  if (companyId) {
+    query.companyId = companyId;
+  }
+  return Customer.findOne(query)
+    .populate("branchId", "name")
+    .select(options.select || "");
+};
+
+const findWalkInCustomer = async (companyId, workspaceId, options = {}) => {
+  if (!companyId || !workspaceId) return null;
+  return Customer.findOne({
+    companyId,
+    workspaceId,
+    isWalkIn: true,
     isDeleted: false,
   })
     .populate("branchId", "name")
-    .select(options.select || "");
+    .select(options.select || "")
+    .session(options.session || null);
 };
 
 const createCustomer = async (payload, options = {}) => {
@@ -73,6 +90,10 @@ const getCustomers = async (workspaceId, companyId, filters = {}, options = {}) 
     companyId,
     isDeleted: false,
   };
+
+  if (filters.isWalkIn !== undefined) {
+    query.isWalkIn = filters.isWalkIn === true || filters.isWalkIn === "true";
+  }
 
   if (filters.status) {
     query.status = filters.status;
@@ -114,7 +135,20 @@ const getCustomers = async (workspaceId, companyId, filters = {}, options = {}) 
   const page = Math.max(1, parseInt(options.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(options.limit) || 20));
   const skip = (page - 1) * limit;
-  const sort = options.sort || { createdAt: -1 };
+
+  // Default to recently updated descending for pharmacy workflow, with createdAt fallback
+  let baseSort = { updatedAt: -1, createdAt: -1 };
+  if (options.sort) {
+    if (typeof options.sort === "object") {
+      baseSort = options.sort;
+    } else if (typeof options.sort === "string") {
+      const isDesc = options.sort.startsWith("-") || options.sort.endsWith(":desc");
+      const cleanField = options.sort.replace(/^-/, "").replace(/:desc$|:asc$/, "").trim();
+      baseSort = { [cleanField]: isDesc ? -1 : 1 };
+    }
+  }
+  // Prioritize Walk-in customer first whenever it matches the query filters
+  const sort = { isWalkIn: -1, ...baseSort };
 
   const [customers, total] = await Promise.all([
     Customer.find(query)
@@ -301,4 +335,5 @@ export default {
   saveCustomer,
   getCustomers,
   deleteCustomerById,
+  findWalkInCustomer,
 };

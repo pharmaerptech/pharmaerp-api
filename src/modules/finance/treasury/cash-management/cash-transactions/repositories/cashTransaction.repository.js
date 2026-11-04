@@ -1,6 +1,7 @@
-import mongoose from "mongoose";
+﻿import mongoose from "mongoose";
 import CashTransaction from "../models/cashTransaction.model.js";
 import SalesInvoice from "../../../../../sales/invoices/models/invoice.model.js";
+import User from "../../../../../core/users/models/user.model.js";
 
 const POPULATE_FIELDS = [
   { path: "counterpartyAccountId", select: "accountName accountCode accountNature accountCategory" },
@@ -365,3 +366,4 @@ export default {
   getCashTransactions,
   getNextTransactionNumber,
 };
+

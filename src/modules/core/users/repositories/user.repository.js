@@ -44,8 +44,8 @@ const updateActiveContext = async (userId, activeContext) => {
     {
       activeContext: {
         workspaceId: activeContext.workspaceId || null,
-        companyId: activeContext.companyId || null,
-        branchId: activeContext.branchId || null,
+        companyId: null,
+        branchId: null,
         updatedAt: new Date(),
       },
     },

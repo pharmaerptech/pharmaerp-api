@@ -37,6 +37,12 @@ const salesReturnSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    businessDayId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BusinessDay",
+      default: null,
+      index: true,
+    },
     returnNo: {
       type: String,
       required: true,
@@ -163,6 +169,18 @@ const salesReturnSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "CustomerCreditTransaction",
       default: null,
+    },
+    creditNoteId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CreditNote",
+      default: null,
+      index: true,
+    },
+    creditNoteNo: {
+      type: String,
+      default: null,
+      trim: true,
+      index: true,
     },
     gstLedgerId: {
       type: mongoose.Schema.Types.ObjectId,

@@ -73,13 +73,20 @@ export const formatBusinessDate = (date) => {
  */
 export const parseISTTransactionDate = (dateInput) => {
   if (!dateInput) return new Date();
-  if (dateInput instanceof Date && !isNaN(dateInput.getTime())) return dateInput;
 
-  if (typeof dateInput === "string") {
-    const trimmed = dateInput.trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+  // If a Date instance is provided:
+  if (dateInput instanceof Date && !isNaN(dateInput.getTime())) {
+    // If it is midnight UTC (e.g. from canonical date or YYYY-MM-DD parse), attach current time
+    const isMidnight =
+      dateInput.getUTCHours() === 0 &&
+      dateInput.getUTCMinutes() === 0 &&
+      dateInput.getUTCSeconds() === 0 &&
+      dateInput.getUTCMilliseconds() === 0;
+
+    if (isMidnight) {
+      const dateStr = formatBusinessDate(dateInput);
       const todayIST = formatBusinessDate(new Date());
-      if (trimmed === todayIST) {
+      if (dateStr === todayIST) {
         return new Date();
       }
       const now = new Date();
@@ -89,7 +96,29 @@ export const parseISTTransactionDate = (dateInput) => {
       const minutes = String(istDate.getUTCMinutes()).padStart(2, "0");
       const seconds = String(istDate.getUTCSeconds()).padStart(2, "0");
       const ms = String(istDate.getUTCMilliseconds()).padStart(3, "0");
-      return new Date(`${trimmed}T${hours}:${minutes}:${seconds}.${ms}+05:30`);
+      return new Date(`${dateStr}T${hours}:${minutes}:${seconds}.${ms}+05:30`);
+    }
+
+    return dateInput;
+  }
+
+  if (typeof dateInput === "string") {
+    const trimmed = dateInput.trim();
+    // Check YYYY-MM-DD or ISO string ending at 00:00:00.000Z
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed) || /^\d{4}-\d{2}-\d{2}T00:00:00(\.000)?Z?$/.test(trimmed)) {
+      const cleanDate = trimmed.split("T")[0];
+      const todayIST = formatBusinessDate(new Date());
+      if (cleanDate === todayIST) {
+        return new Date();
+      }
+      const now = new Date();
+      const istMs = now.getTime() + 5.5 * 60 * 60 * 1000;
+      const istDate = new Date(istMs);
+      const hours = String(istDate.getUTCHours()).padStart(2, "0");
+      const minutes = String(istDate.getUTCMinutes()).padStart(2, "0");
+      const seconds = String(istDate.getUTCSeconds()).padStart(2, "0");
+      const ms = String(istDate.getUTCMilliseconds()).padStart(3, "0");
+      return new Date(`${cleanDate}T${hours}:${minutes}:${seconds}.${ms}+05:30`);
     }
     const parsed = new Date(trimmed);
     if (!isNaN(parsed.getTime())) return parsed;

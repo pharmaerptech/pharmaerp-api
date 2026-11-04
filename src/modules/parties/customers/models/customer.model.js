@@ -198,6 +198,13 @@ const customerSchema = new mongoose.Schema(
       index: true,
     },
 
+    creditNoteBalance: {
+      type: Number,
+      min: [0, "Credit note balance cannot be negative"],
+      default: 0,
+      index: true,
+    },
+
     creditOutstanding: {
       type: Number,
       min: [0, "Credit outstanding cannot be negative"],
@@ -230,6 +237,18 @@ const customerSchema = new mongoose.Schema(
       type: String,
       enum: Object.values(CUSTOMER_STATUS),
       default: CUSTOMER_STATUS.ACTIVE,
+      index: true,
+    },
+
+    isWalkIn: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    isSystemCustomer: {
+      type: Boolean,
+      default: false,
       index: true,
     },
 
@@ -279,6 +298,14 @@ export const generateCustomerCode = async () => {
 };
 
 customerSchema.pre("validate", async function () {
+  if (this.isWalkIn) {
+    this.creditLimit = 0;
+    this.creditDays = 0;
+    this.openingBalance = 0;
+    this.advanceBalance = 0;
+    this.creditNoteBalance = 0;
+    this.creditOutstanding = 0;
+  }
   if (this.customerCode === "") {
     this.customerCode = null;
   }
@@ -289,6 +316,17 @@ customerSchema.pre("validate", async function () {
   }
 });
 
+customerSchema.index(
+  { companyId: 1, isWalkIn: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      isDeleted: false,
+      isWalkIn: true,
+    },
+  },
+);
+
 customerSchema.methods.toSafeObject = function () {
   const customer = this.toObject();
 
@@ -298,7 +336,7 @@ customerSchema.methods.toSafeObject = function () {
 };
 
 customerSchema.index(
-  { customerCode: 1 },
+  { companyId: 1, customerCode: 1 },
   {
     unique: true,
     partialFilterExpression: {
@@ -338,6 +376,13 @@ customerSchema.index({
 customerSchema.index({
   createdBy: 1,
   isDeleted: 1,
+});
+
+customerSchema.index({
+  companyId: 1,
+  isDeleted: 1,
+  isWalkIn: -1,
+  updatedAt: -1,
 });
 
 const Customer =

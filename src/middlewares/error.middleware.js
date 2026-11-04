@@ -5,6 +5,9 @@ const errorHandler = (err, req, res, next) => {
 
   // log error
   logger.error(`${req.method} ${req.originalUrl} - ${err.message}`);
+  if (err.stack) {
+    logger.error(err.stack);
+  }
 
   res.status(statusCode).json({
     success: false,

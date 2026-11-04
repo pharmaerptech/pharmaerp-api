@@ -11,19 +11,18 @@ import {
 
 const router = Router();
 
-// Middleware chain for dashboard overview.
+// Base middleware chain for all dashboard routes
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
-router.use(companyContextMiddleware);
 
-// GET /api/v1/dashboard/branch
-router.get("/branch", getBranchDashboard);
-
-// GET /api/v1/dashboard/company
-router.get("/company", getCompanyDashboard);
-
-// GET /api/v1/dashboard/workspace
+// GET /api/v1/dashboard/workspace (Only workspace context required)
 router.get("/workspace", getWorkspaceDashboard);
+
+// GET /api/v1/dashboard/company (Requires company context)
+router.get("/company", companyContextMiddleware, getCompanyDashboard);
+
+// GET /api/v1/dashboard/branch (Scoped to branch/company)
+router.get("/branch", getBranchDashboard);
 
 // GET /api/v1/dashboard/overview
 router.get("/overview", getDashboardOverview);

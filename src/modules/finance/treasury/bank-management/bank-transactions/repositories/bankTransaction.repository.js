@@ -69,6 +69,8 @@ const getBankTransactions = async (
   if (filters.category && filters.category !== "all") query.category = filters.category;
   if (filters.direction && filters.direction !== "all") query.direction = filters.direction;
   if (filters.status && filters.status !== "all") query.status = filters.status;
+  if (filters.shiftId) query.shiftId = filters.shiftId;
+  if (filters.businessDayId) query.businessDayId = filters.businessDayId;
 
   let startDt = null;
   let endDt = null;

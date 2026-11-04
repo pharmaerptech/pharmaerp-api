@@ -266,6 +266,7 @@ const createBankTransaction = async (
       counterpartyAccountId: offsetLedgerAccountId,
       journalVoucherId: journalVoucher._id,
       shiftId: payload.shiftId || null,
+      businessDayId: payload.businessDayId || null,
       status: payload.status || BANK_TRANSACTION_STATUS.POSTED,
       postedAt: payload.status === BANK_TRANSACTION_STATUS.PENDING_SHIFT_CLOSE ? null : new Date(),
       postedBy: payload.status === BANK_TRANSACTION_STATUS.PENDING_SHIFT_CLOSE ? null : userId,

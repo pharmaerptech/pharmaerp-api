@@ -10,7 +10,22 @@ export const CUSTOMER_TYPE = {
   HOSPITAL: "hospital",
   CLINIC: "clinic",
   CORPORATE: "corporate",
+  WALK_IN: "walk_in",
   OTHER: "other",
+};
+
+export const WALK_IN_CUSTOMER_DEFAULTS = {
+  name: "Walk-in Customer",
+  customerCode: "WALK-IN",
+  customerType: "walk_in",
+  isWalkIn: true,
+  isSystemCustomer: true,
+  creditLimit: 0,
+  creditDays: 0,
+  openingBalance: 0,
+  advanceBalance: 0,
+  creditOutstanding: 0,
+  creditNoteBalance: 0,
 };
 
 export const CUSTOMER_OPENING_BALANCE_TYPE = {

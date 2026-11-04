@@ -6,6 +6,8 @@ import companyContextMiddleware from "../../../../middlewares/companyContext.mid
 import validate from "../../../../middlewares/validate.middleware.js";
 
 import {
+  getWalkInCustomer,
+  ensureWalkInCustomer,
   createCustomer,
   getCustomers,
   getCustomerById,
@@ -30,6 +32,7 @@ import {
   addCustomerRelationship,
   updateCustomerRelationship,
   deleteCustomerRelationship,
+  getCustomerCreditNotes,
 } from "../controllers/customer.controller.js";
 
 import {
@@ -78,6 +81,10 @@ router.post(
 router.post("/", validate(createCustomerSchema), createCustomer);
 
 router.get("/", validate(getCustomersQuerySchema, "query"), getCustomers);
+
+// Walk-in Customer routes (must precede /:customerId)
+router.get("/walk-in", getWalkInCustomer);
+router.post("/walk-in", ensureWalkInCustomer);
 
 router.get("/credits/pending", getAllPendingCredits);
 
@@ -157,6 +164,12 @@ router.get(
   validate(customerIdParamSchema, "params"),
   validate(getTransactionsQuerySchema, "query"),
   getCustomerTransactions,
+);
+
+router.get(
+  "/:customerId/credit-notes",
+  validate(customerIdParamSchema, "params"),
+  getCustomerCreditNotes
 );
 
 router.get(

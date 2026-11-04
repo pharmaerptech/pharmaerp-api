@@ -392,9 +392,23 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
       andConditions.push({
         $or: [
           { paymentMethod: { $regex: /^credit$/i } },
-          { "payments.paymentType": { $regex: /credit/i } },
-          { "payments.paymentMode": { $regex: /credit/i } },
-          { "payments.type": { $regex: /credit/i } },
+          {
+            $and: [
+              {
+                $or: [
+                  { paymentMethod: { $regex: /^split$/i } },
+                  { "payments.1": { $exists: true } },
+                ],
+              },
+              {
+                $or: [
+                  { "payments.paymentType": { $regex: /^credit$/i } },
+                  { "payments.paymentMode": { $regex: /^credit$/i } },
+                  { "payments.type": { $regex: /^credit$/i } },
+                ],
+              },
+            ],
+          },
           { creditStatus: { $in: ["PENDING", "PARTIAL", "SETTLED"] } },
           { creditTransactionId: { $ne: null } },
         ],
@@ -403,9 +417,50 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
       andConditions.push({
         $or: [
           { paymentMethod: { $regex: /^advance$/i } },
-          { "payments.paymentType": { $regex: /advance/i } },
-          { "payments.paymentMode": { $regex: /advance/i } },
-          { "payments.type": { $regex: /advance/i } },
+          {
+            $and: [
+              {
+                $or: [
+                  { paymentMethod: { $regex: /^split$/i } },
+                  { "payments.1": { $exists: true } },
+                ],
+              },
+              {
+                $or: [
+                  { "payments.paymentType": { $regex: /advance/i } },
+                  { "payments.paymentMode": { $regex: /advance/i } },
+                  { "payments.type": { $regex: /advance/i } },
+                ],
+              },
+            ],
+          },
+        ],
+      });
+    } else if (
+      pm.toLowerCase() === "creditnote" ||
+      pm.toLowerCase() === "credit_note" ||
+      pm.toLowerCase() === "credit note"
+    ) {
+      andConditions.push({
+        $or: [
+          { paymentMethod: { $regex: /^credit[\s_-]?note$/i } },
+          {
+            $and: [
+              {
+                $or: [
+                  { paymentMethod: { $regex: /^split$/i } },
+                  { "payments.1": { $exists: true } },
+                ],
+              },
+              {
+                $or: [
+                  { "payments.paymentType": { $regex: /credit[\s_-]?note/i } },
+                  { "payments.paymentMode": { $regex: /credit[\s_-]?note/i } },
+                  { "payments.type": { $regex: /credit[\s_-]?note/i } },
+                ],
+              },
+            ],
+          },
         ],
       });
     } else {
@@ -504,11 +559,21 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
   let totalAmount = 0;
   let pureCashInvoices = 0;
   let pureUpiInvoices = 0;
+  let pureCreditInvoices = 0;
+  let pureAdvanceInvoices = 0;
+  let pureCreditNoteInvoices = 0;
   let pureSplitInvoices = 0;
+
   let pureCashAmount = 0;
   let splitCashAmount = 0;
   let pureUpiAmount = 0;
   let splitUpiAmount = 0;
+  let pureCreditAmount = 0;
+  let splitCreditAmount = 0;
+  let pureAdvanceAmount = 0;
+  let splitAdvanceAmount = 0;
+  let pureCreditNoteAmount = 0;
+  let splitCreditNoteAmount = 0;
   let matchingSplitInvoices = 0;
 
   for (const inv of summaryRows) {
@@ -527,20 +592,37 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
       totalAmount += grandTotal;
       let hasCash = false;
       let hasUpi = false;
+      let hasCreditNote = false;
+      let hasAdvance = false;
+      let hasCredit = false;
       let invoiceCashPortion = 0;
       let invoiceUpiPortion = 0;
+      let invoiceCreditNotePortion = 0;
+      let invoiceAdvancePortion = 0;
+      let invoiceCreditPortion = 0;
 
       if (Array.isArray(inv.payments) && inv.payments.length > 0) {
         for (const p of inv.payments) {
           const type = String(p.paymentType || p.paymentMode || p.type || p.mode || "").toUpperCase();
           const amt = Number(p.amount || 0);
+          if (amt <= 0) continue;
+
           if (type.includes("UPI") || type.includes("QR")) {
             invoiceUpiPortion += amt;
             hasUpi = true;
+          } else if (type.includes("CREDIT_NOTE") || type.includes("CREDITNOTE")) {
+            invoiceCreditNotePortion += amt;
+            hasCreditNote = true;
+          } else if (type.includes("CREDIT")) {
+            invoiceCreditPortion += amt;
+            hasCredit = true;
+          } else if (type.includes("ADVANCE") || type.includes("WALLET")) {
+            invoiceAdvancePortion += amt;
+            hasAdvance = true;
           } else if (type.includes("CASH")) {
             invoiceCashPortion += amt;
             hasCash = true;
-          } else if (!type.includes("CARD") && !type.includes("WALLET") && !type.includes("CREDIT")) {
+          } else {
             invoiceCashPortion += amt;
             hasCash = true;
           }
@@ -552,13 +634,33 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
         hasUpi = invoiceUpiPortion > 0;
       }
 
+      // Respect change due if any on cash portion
+      if (invoiceCashPortion > 0 && inv.changeDue > 0 && inv.cashTendered > 0) {
+        const netCash = Math.max(0, Number(inv.cashTendered) - Number(inv.changeDue));
+        if (netCash < invoiceCashPortion) {
+          invoiceCashPortion = netCash;
+        }
+      }
+
       splitCashAmount += invoiceCashPortion;
       splitUpiAmount += invoiceUpiPortion;
+      splitCreditAmount += invoiceCreditPortion;
+      splitAdvanceAmount += invoiceAdvancePortion;
+      splitCreditNoteAmount += invoiceCreditNotePortion;
 
       const filterPm = String(filters.paymentMethod || "").trim().toLowerCase();
       if (filterPm === "cash" && hasCash) {
         matchingSplitInvoices += 1;
       } else if (filterPm === "upi" && hasUpi) {
+        matchingSplitInvoices += 1;
+      } else if (
+        (filterPm === "creditnote" || filterPm === "credit_note" || filterPm === "credit note") &&
+        hasCreditNote
+      ) {
+        matchingSplitInvoices += 1;
+      } else if (filterPm === "credit" && hasCredit) {
+        matchingSplitInvoices += 1;
+      } else if (filterPm === "advance" && hasAdvance) {
         matchingSplitInvoices += 1;
       } else if (filterPm === "split" || filterPm === "all" || !filters.paymentMethod) {
         matchingSplitInvoices += 1;
@@ -571,27 +673,55 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
       pureUpiInvoices += 1;
       pureUpiAmount += grandTotal;
       totalAmount += grandTotal;
+    } else if (methodUpper.includes("CREDIT_NOTE") || methodUpper.includes("CREDITNOTE")) {
+      pureCreditNoteInvoices += 1;
+      pureCreditNoteAmount += grandTotal;
+      totalAmount += grandTotal;
+    } else if (methodUpper.includes("CREDIT")) {
+      pureCreditInvoices += 1;
+      pureCreditAmount += grandTotal;
+      totalAmount += grandTotal;
+    } else if (methodUpper.includes("ADVANCE")) {
+      pureAdvanceInvoices += 1;
+      pureAdvanceAmount += grandTotal;
+      totalAmount += grandTotal;
     } else {
-      // Other single payment methods (e.g. Card, Credit)
+      pureCashInvoices += 1;
+      pureCashAmount += grandTotal;
       totalAmount += grandTotal;
     }
   }
 
   const cashAmount = pureCashAmount + splitCashAmount;
   const upiAmount = pureUpiAmount + splitUpiAmount;
+  const creditAmount = pureCreditAmount + splitCreditAmount;
+  const advanceAmount = pureAdvanceAmount + splitAdvanceAmount;
+  const creditNoteAmount = pureCreditNoteAmount + splitCreditNoteAmount;
 
   const summary = {
     totalInvoices: total,
     totalAmount,
     cashAmount,
     upiAmount,
+    creditAmount,
+    advanceAmount,
+    creditNoteAmount,
     pureCashInvoices,
-    pureUpiInvoices,
-    pureSplitInvoices,
     pureCashAmount,
     splitCashAmount,
+    pureUpiInvoices,
     pureUpiAmount,
     splitUpiAmount,
+    pureCreditInvoices,
+    pureCreditAmount,
+    splitCreditAmount,
+    pureAdvanceInvoices,
+    pureAdvanceAmount,
+    splitAdvanceAmount,
+    pureCreditNoteInvoices,
+    pureCreditNoteAmount,
+    splitCreditNoteAmount,
+    pureSplitInvoices,
     matchingSplitInvoices,
   };
 

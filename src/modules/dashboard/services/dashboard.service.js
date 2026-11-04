@@ -17,18 +17,33 @@ const getBranchDashboardData = async ({ workspaceId, companyId, branchId = null,
   });
 };
 
-const getCompanyDashboardData = async ({ workspaceId, companyId, timeframe = "THIS_MONTH" }) => {
+const getCompanyDashboardData = async ({
+  workspaceId,
+  companyId,
+  timeframe = "THIS_MONTH",
+  startDate = null,
+  endDate = null,
+}) => {
   return dashboardRepository.getCompanyDashboardData({
     workspaceId,
     companyId,
     timeframe,
+    startDate,
+    endDate,
   });
 };
 
-const getWorkspaceDashboardData = async ({ workspaceId, timeframe = "THIS_MONTH" }) => {
+const getWorkspaceDashboardData = async ({
+  workspaceId,
+  timeframe = "THIS_MONTH",
+  startDate = null,
+  endDate = null,
+}) => {
   return dashboardRepository.getWorkspaceDashboardData({
     workspaceId,
     timeframe,
+    startDate,
+    endDate,
   });
 };
 

@@ -165,13 +165,24 @@ export const closeShift = async (
   let splitInvoiceCount = 0;
   let splitCashAmount = 0;
   let splitUpiAmount = 0;
+  let splitCreditAmount = 0;
+  let splitAdvanceAmount = 0;
+  let splitCreditNoteAmount = 0;
   let pureCashAmount = 0;
   let pureUpiAmount = 0;
+  let pureCreditAmount = 0;
+  let pureAdvanceAmount = 0;
+  let pureCreditNoteAmount = 0;
   let pureCashCount = 0;
   let pureUpiCount = 0;
   let creditSalesTotal = 0;
   let creditInvoiceCount = 0;
+  let advanceSalesTotal = 0;
   let advanceInvoiceCount = 0;
+  let creditNoteSalesTotal = 0;
+  let creditNoteInvoiceCount = 0;
+  let returnCreditNoteTotal = 0;
+  const splitCombinationsMap = new Map();
 
   // Return metrics tracking
   let returnInvoiceCount = 0;
@@ -186,6 +197,7 @@ export const closeShift = async (
     cash: { count: 0, amount: 0 },
     advance: { count: 0, amount: 0 },
     credit: { count: 0, amount: 0 },
+    creditNote: { count: 0, amount: 0 },
     upi: { count: 0, amount: 0 },
     split: { count: 0, amount: 0 },
     other: { count: 0, amount: 0 },
@@ -202,6 +214,9 @@ export const closeShift = async (
     cash: { count: 0, amount: 0 },
     upi: { count: 0, amount: 0 },
     split: { count: 0, amount: 0 },
+    creditNote: { count: 0, amount: 0 },
+    advance: { count: 0, amount: 0 },
+    credit: { count: 0, amount: 0 },
     card: { count: 0, amount: 0 },
     wallet: { count: 0, amount: 0 },
     other: { count: 0, amount: 0 },
@@ -267,6 +282,15 @@ export const closeShift = async (
         cancelledCashTotal += billTotal;
         cancelledBreakdown.cash.count += 1;
         cancelledBreakdown.cash.amount += billTotal;
+      } else if (pMethod.includes("CREDIT_NOTE") || pMethod.includes("CREDITNOTE")) {
+        cancelledBreakdown.creditNote.count += 1;
+        cancelledBreakdown.creditNote.amount += billTotal;
+      } else if (pMethod.includes("ADVANCE")) {
+        cancelledBreakdown.advance.count += 1;
+        cancelledBreakdown.advance.amount += billTotal;
+      } else if (pMethod.includes("CREDIT")) {
+        cancelledBreakdown.credit.count += 1;
+        cancelledBreakdown.credit.amount += billTotal;
       } else if (pMethod.includes("CARD")) {
         cancelledBreakdown.card.count += 1;
         cancelledBreakdown.card.amount += billTotal;
@@ -323,7 +347,9 @@ export const closeShift = async (
               returnUpiTotal += amt;
             } else if (pt.includes("ADVANCE") || pt.includes("WALLET")) {
               returnAdvanceTotal += amt;
-            } else if (pt.includes("CREDIT")) {
+            } else if (pt.includes("CREDIT_NOTE") || pt.includes("CREDITNOTE")) {
+            creditNoteSalesTotal += amt;
+          } else if (pt.includes("CREDIT")) {
               returnCreditTotal += amt;
             }
           }
@@ -336,6 +362,10 @@ export const closeShift = async (
         returnCreditTotal += billTotal;
         returnBreakdown.credit.count += 1;
         returnBreakdown.credit.amount += billTotal;
+        returnCreditNoteTotal += billTotal;
+        if (!returnBreakdown.creditNote) returnBreakdown.creditNote = { count: 0, amount: 0 };
+        returnBreakdown.creditNote.count += 1;
+        returnBreakdown.creditNote.amount += billTotal;
       } else if (pMethod.includes("UPI") || pMethod.includes("QR")) {
         upiSalesTotal -= billTotal;
         returnUpiTotal += billTotal;
@@ -381,75 +411,126 @@ export const closeShift = async (
       continue;
     }
 
-    const isSplit = inv.paymentMethod === "Split";
+    const billGrandTotal = Number(inv.grandTotal || 0);
+    const isSplit = inv.paymentMethod === "Split" || (Array.isArray(inv.payments) && inv.payments.length > 1);
     if (isSplit) {
       splitInvoiceCount += 1;
-      splitSalesTotal += inv.grandTotal || 0;
+      splitSalesTotal += billGrandTotal;
 
       let billSplitCash = 0;
       let billSplitUpi = 0;
-      let hasCreditInBill = false;
-      let hasAdvanceInBill = false;
+      let billSplitCredit = 0;
+      let billSplitAdvance = 0;
+      let billSplitCreditNote = 0;
+      const modesInBill = new Set();
+
       if (Array.isArray(inv.payments) && inv.payments.length > 0) {
         for (const p of inv.payments) {
           const pt = String(p.paymentType || p.mode || "").toUpperCase();
           const amt = Number(p.amount) || 0;
+          if (amt <= 0) continue;
+
           if (pt.includes("UPI") || pt.includes("QR")) {
             billSplitUpi += amt;
             upiSalesTotal += amt;
+            modesInBill.add("UPI");
             _trackUpi(p.paymentQrId || inv.paymentQrId, amt, inv._id, true);
+          } else if (pt.includes("CREDIT_NOTE") || pt.includes("CREDITNOTE")) {
+            billSplitCreditNote += amt;
+            creditNoteSalesTotal += amt;
+            modesInBill.add("Credit Note");
           } else if (pt.includes("CREDIT")) {
+            billSplitCredit += amt;
             creditSalesTotal += amt;
-            hasCreditInBill = true;
+            modesInBill.add("Credit");
           } else if (pt.includes("ADVANCE") || pt.includes("WALLET")) {
+            billSplitAdvance += amt;
             advanceSalesTotal += amt;
-            hasAdvanceInBill = true;
-          } else if (
-            pt.includes("CASH") ||
-            (!pt.includes("CARD"))
-          ) {
+            modesInBill.add("Advance");
+          } else if (pt.includes("CASH")) {
             billSplitCash += amt;
             totalCashSales += amt;
+            modesInBill.add("Cash");
+          } else {
+            billSplitCash += amt;
+            totalCashSales += amt;
+            modesInBill.add("Cash");
           }
         }
       } else {
         const tendered = Number(inv.cashTendered || 0);
-        billSplitCash = Math.min(Number(inv.grandTotal || 0), tendered);
-        billSplitUpi = Math.max(0, Number(inv.grandTotal || 0) - billSplitCash);
+        billSplitCash = Math.min(billGrandTotal, tendered);
+        billSplitUpi = Math.max(0, billGrandTotal - billSplitCash);
         totalCashSales += billSplitCash;
         upiSalesTotal += billSplitUpi;
+        if (billSplitCash > 0) modesInBill.add("Cash");
+        if (billSplitUpi > 0) modesInBill.add("UPI");
       }
-      if (hasCreditInBill) creditInvoiceCount += 1;
-      if (hasAdvanceInBill) advanceInvoiceCount += 1;
+
+      // Check change due on cash portion in split
+      if (billSplitCash > 0 && inv.changeDue > 0 && inv.cashTendered > 0) {
+        const netCashTendered = Math.max(0, Number(inv.cashTendered) - Number(inv.changeDue));
+        if (netCashTendered < billSplitCash) {
+          const cashDiff = billSplitCash - netCashTendered;
+          billSplitCash = netCashTendered;
+          totalCashSales = Math.max(0, totalCashSales - cashDiff);
+        }
+      }
+
+      if (billSplitCredit > 0) creditInvoiceCount += 1;
+      if (billSplitAdvance > 0) advanceInvoiceCount += 1;
+      if (billSplitCreditNote > 0) creditNoteInvoiceCount += 1;
+
       splitCashAmount += billSplitCash;
       splitUpiAmount += billSplitUpi;
+      splitCreditAmount += billSplitCredit;
+      splitAdvanceAmount += billSplitAdvance;
+      splitCreditNoteAmount += billSplitCreditNote;
+
+      const sortedModes = Array.from(modesInBill).sort();
+      const combKey = sortedModes.join(" + ") || "Split";
+      if (!splitCombinationsMap.has(combKey)) {
+        splitCombinationsMap.set(combKey, {
+          combination: combKey,
+          modes: sortedModes,
+          count: 0,
+          totalAmount: 0,
+        });
+      }
+      const comb = splitCombinationsMap.get(combKey);
+      comb.count += 1;
+      comb.totalAmount += billGrandTotal;
     } else {
       const pMethod = String(inv.paymentMethod || "CASH").toUpperCase();
       if (pMethod.includes("UPI") || pMethod.includes("QR")) {
         pureUpiCount += 1;
-        const amt = inv.grandTotal || 0;
-        pureUpiAmount += amt;
-        upiSalesTotal += amt;
-        _trackUpi(inv.paymentQrId, amt, inv._id, false);
+        pureUpiAmount += billGrandTotal;
+        upiSalesTotal += billGrandTotal;
+        _trackUpi(inv.paymentQrId, billGrandTotal, inv._id, false);
       } else if (pMethod.includes("CASH")) {
         pureCashCount += 1;
         const cashCollected =
           inv.cashTendered - inv.changeDue > 0
             ? inv.cashTendered - inv.changeDue
-            : inv.grandTotal || 0;
+            : billGrandTotal;
         pureCashAmount += cashCollected;
         totalCashSales += cashCollected;
+      } else if (pMethod.includes("CREDIT_NOTE") || pMethod.includes("CREDITNOTE")) {
+        creditNoteInvoiceCount += 1;
+        pureCreditNoteAmount += billGrandTotal;
+        creditNoteSalesTotal += billGrandTotal;
       } else if (pMethod.includes("CREDIT")) {
         creditInvoiceCount += 1;
-        creditSalesTotal += inv.grandTotal || 0;
+        pureCreditAmount += billGrandTotal;
+        creditSalesTotal += billGrandTotal;
       } else if (pMethod.includes("ADVANCE")) {
         advanceInvoiceCount += 1;
-        advanceSalesTotal += inv.grandTotal || 0;
+        pureAdvanceAmount += billGrandTotal;
+        advanceSalesTotal += billGrandTotal;
       } else {
         pureCashCount += 1;
-        const amt = inv.grandTotal || 0;
-        pureCashAmount += amt;
-        totalCashSales += amt;
+        pureCashAmount += billGrandTotal;
+        totalCashSales += billGrandTotal;
       }
     }
   }
@@ -670,14 +751,23 @@ export const closeShift = async (
   shift.splitInvoiceCount = splitInvoiceCount;
   shift.splitCashAmount = splitCashAmount;
   shift.splitUpiAmount = splitUpiAmount;
+  shift.splitCreditAmount = splitCreditAmount;
+  shift.splitAdvanceAmount = splitAdvanceAmount;
+  shift.splitCreditNoteAmount = splitCreditNoteAmount;
   shift.pureCashAmount = pureCashAmount;
   shift.pureUpiAmount = pureUpiAmount;
+  shift.pureCreditAmount = pureCreditAmount;
+  shift.pureAdvanceAmount = pureAdvanceAmount;
+  shift.pureCreditNoteAmount = pureCreditNoteAmount;
+  shift.splitCombinations = Array.from(splitCombinationsMap.values());
   shift.cashInvoiceCount = pureCashCount;
   shift.paymentQrCount = pureUpiCount;
   shift.creditSalesTotal = creditSalesTotal;
   shift.creditInvoiceCount = creditInvoiceCount;
   shift.advanceSalesTotal = advanceSalesTotal;
   shift.advanceInvoiceCount = advanceInvoiceCount;
+  shift.creditNoteSalesTotal = creditNoteSalesTotal;
+  shift.creditNoteInvoiceCount = creditNoteInvoiceCount;
   shift.cancelledInvoiceCount = cancelledInvoiceCount;
   shift.cancelledSalesTotal = cancelledSalesTotal;
   shift.cancelledCashTotal = cancelledCashTotal;
@@ -693,6 +783,7 @@ export const closeShift = async (
   shift.returnUpiTotal = returnUpiTotal;
   shift.returnAdvanceTotal = returnAdvanceTotal;
   shift.returnCreditTotal = returnCreditTotal;
+  shift.returnCreditNoteTotal = returnCreditNoteTotal;
   shift.returnSplitTotal = returnSplitTotal;
   shift.returnInvoices = returnInvoices;
   shift.returnBreakdown = returnBreakdown;
@@ -961,137 +1052,32 @@ export const closeShift = async (
     console.error("[Shift] Error flushing legacy pending UPI bank transactions:", btFlushErr);
   }
 
-  // 2. Standard Shift-Consolidated UPI Settlement:
-  // If no legacy individual transactions were flushed, aggregate net UPI collections by bank account
-  // and create EXACTLY ONE BankTransaction and JournalVoucher per bank account.
-  if (!hasLegacyPendingFlushed) {
+  // 2. Business Day Consolidated UPI Settlement:
+  // Shift close NO LONGER creates individual or shift-level BankTransactions in Treasury.
+  // All net UPI collections (sales, advances, credit settlements) are held in SYS-UPI-CLEARING
+  // and will be consolidated into exactly ONE BankTransaction per bank account when the Business Day is closed.
+  shift.upiSettlementStatus = "PENDING_BUSINESS_DAY_CLOSE";
+
+  // If this shift was opened without a businessDayId (e.g. opened before migration),
+  // automatically link it to the currently open BusinessDay for this branch
+  if (!shift.businessDayId && shift.branchId) {
     try {
-      // Find fallback primary active bank account if unlinked/unattributed QRs exist
-      const defaultBank =
-        (await BankAccount.findOne({
-          companyId: shift.companyId,
-          workspaceId: shift.workspaceId,
-          isDeleted: false,
-          isActive: true,
-          isPrimary: true,
-        })) ||
-        (await BankAccount.findOne({
-          companyId: shift.companyId,
-          workspaceId: shift.workspaceId,
-          isDeleted: false,
-          isActive: true,
-        }));
-
-      const bankTotalsMap = new Map();
-
-      // Aggregate from Sales UPI breakdown
-      for (const item of (shift.upiBreakdown || [])) {
-        const amt = Number(item.totalAmount || 0);
-        if (amt <= 0) continue;
-        const bankId = item.bankAccountId
-          ? String(item.bankAccountId)
-          : (defaultBank ? String(defaultBank._id) : null);
-        if (!bankId) continue;
-
-        if (!bankTotalsMap.has(bankId)) {
-          bankTotalsMap.set(bankId, {
-            bankAccountId: bankId,
-            bankName: item.bankName || "Bank Account",
-            totalAmount: 0,
-            transactionCount: 0,
-            billCount: 0,
-          });
-        }
-        const entry = bankTotalsMap.get(bankId);
-        entry.totalAmount += amt;
-        entry.transactionCount += Number(item.transactionCount || 0);
-        entry.billCount += Number(item.billCount || 0);
-      }
-
-      // Aggregate from Customer Advance & Credit Settlement UPI breakdown
-      for (const item of (shift.advanceCreditUpiBreakdown || [])) {
-        const amt = Number(item.totalAmount || 0);
-        if (amt <= 0) continue;
-        const bankId = item.bankAccountId
-          ? String(item.bankAccountId)
-          : (defaultBank ? String(defaultBank._id) : null);
-        if (!bankId) continue;
-
-        if (!bankTotalsMap.has(bankId)) {
-          bankTotalsMap.set(bankId, {
-            bankAccountId: bankId,
-            bankName: item.bankName || "Bank Account",
-            totalAmount: 0,
-            transactionCount: 0,
-            billCount: 0,
-          });
-        }
-        const entry = bankTotalsMap.get(bankId);
-        entry.totalAmount += amt;
-        entry.transactionCount += Number(item.transactionCount || 0);
-      }
-
-      // Safety Fallback: If bankTotalsMap is empty but shift has recorded positive UPI collections,
-      // attribute the total UPI collection to the default bank so funds are never trapped!
-      const totalRecordedUpi = Math.round(
-        Number(
-          shift.actualClosingUpiAmount ||
-          shift.expectedClosingUpiAmount ||
-          ((Number(shift.salesUpiTotal || 0)) + (Number(shift.advanceUpiTotal || 0)) + (Number(shift.creditUpiTotal || 0)))
-        ) * 100
-      ) / 100;
-
-      if (bankTotalsMap.size === 0 && totalRecordedUpi > 0 && defaultBank?._id) {
-        const defaultBankId = String(defaultBank._id);
-        bankTotalsMap.set(defaultBankId, {
-          bankAccountId: defaultBankId,
-          bankName: defaultBank.bankMasterId?.name || defaultBank.accountName || "Bank Account",
-          totalAmount: totalRecordedUpi,
-          transactionCount: 1,
-          billCount: 1,
+      const openBusinessDay = await BusinessDay.findOne({
+        branchId: shift.branchId,
+        status: "open",
+      });
+      if (openBusinessDay) {
+        shift.businessDayId = openBusinessDay._id;
+        await BusinessDay.findByIdAndUpdate(openBusinessDay._id, {
+          $addToSet: { shifts: shift._id },
         });
       }
-
-      const upiClearingAccount = await getUpiClearingAccount(
-        shift.workspaceId,
-        shift.companyId,
-        userId
-      );
-
-
-      for (const [bankId, bankData] of bankTotalsMap.entries()) {
-        const netAmount = Math.round(Number(bankData.totalAmount) * 100) / 100;
-        if (netAmount <= 0) continue;
-
-        const totalTxCount = bankData.transactionCount || bankData.billCount || 1;
-        const shiftDisplay = shift.shiftName || shift.shiftNo || "Shift";
-
-        const settlementPayload = {
-          transactionDate: now,
-          bankAccountId: bankId,
-          transactionType: BANK_TRANSACTION_TYPE.UPI,
-          paymentMode: BANK_TRANSACTION_PAYMENT_MODE.UPI,
-          category: BANK_TRANSACTION_CATEGORY.UPI_SETTLEMENT,
-          direction: BANK_TRANSACTION_DIRECTION.CREDIT,
-          amount: netAmount,
-          referenceNumber: `SHIFT-${shift.shiftNo}`,
-          narration: `${shiftDisplay} UPI Settlement (${totalTxCount} payments)`,
-          counterpartyAccountId: upiClearingAccount?._id || null,
-          shiftId: shift._id,
-          status: BANK_TRANSACTION_STATUS.POSTED,
-        };
-
-        await bankTransactionService.createBankTransaction(
-          shift.workspaceId,
-          shift.companyId,
-          userId,
-          settlementPayload
-        );
-      }
-    } catch (settleErr) {
-      console.error("[Shift] Error creating consolidated UPI bank transactions at shift close:", settleErr);
+    } catch (bdLinkErr) {
+      console.warn("[Shift] Could not auto-link legacy shift to open BusinessDay:", bdLinkErr.message);
     }
   }
+
+  console.log(`[Shift] Shift ${shift.shiftNo} closed. UPI collections held for Business Day settlement.`);
 
   await shift.save();
   return shift;

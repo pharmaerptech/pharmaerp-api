@@ -37,6 +37,12 @@ const invoiceSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    businessDayId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BusinessDay",
+      default: null,
+      index: true,
+    },
     invoiceNo: {
       type: String,
       required: true,
@@ -128,6 +134,15 @@ const invoiceSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "CustomerCreditTransaction",
       default: null,
+    },
+    creditNoteTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    creditNoteAllocations: {
+      type: Array,
+      default: [],
     },
     cancelledAt: {
       type: Date,

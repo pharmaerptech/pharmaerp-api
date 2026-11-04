@@ -347,6 +347,10 @@ export const receiveCustomerAdvance = async (
       throw new ApiError(404, "Customer not found");
     }
 
+    if (customer.isWalkIn) {
+      throw new ApiError(400, "Advance payment cannot be received for Walk-in Customer. Please register customer with name and mobile number.");
+    }
+
     const customerLedgerAccount = await ensureCustomerLedgerAccount(
       customer,
       workspaceId,
@@ -921,6 +925,10 @@ export const settleCustomerCredit = async (
 
     if (!customer) {
       throw new ApiError(404, "Customer not found");
+    }
+
+    if (customer.isWalkIn) {
+      throw new ApiError(400, "Credit settlement cannot be performed for Walk-in Customer.");
     }
 
     if (!customer.ledgerAccountId) {

@@ -1,4 +1,4 @@
-import mongoose from "mongoose";
+﻿import mongoose from "mongoose";
 import BranchCash from "../models/branchCash.model.js";
 import BranchCashBalance from "../models/branchCashBalance.model.js";
 
@@ -138,8 +138,27 @@ const addRunningDenominations = async (
   options = {},
 ) => {
   const { session } = options;
-  const bal = await BranchCashBalance.findOne({ branchId, companyId }).session(session);
-  if (!bal) return null;
+  let bal = await BranchCashBalance.findOne({ branchId, companyId }).session(session);
+  if (!bal) {
+    const merged = mergeDenominations([], denominations, "add");
+    const runningTotal = merged.reduce((s, d) => s + d.subtotal, 0);
+    const [createdBal] = await BranchCashBalance.create(
+      [
+        {
+          branchId,
+          companyId,
+          runningTotal,
+          runningDenominations: merged,
+          frozenTotal: 0,
+          frozenDenominations: [],
+          lastUpdatedAt: new Date(),
+          lastUpdatedBy: userId,
+        },
+      ],
+      session ? { session } : {},
+    );
+    return createdBal;
+  }
 
   const merged = mergeDenominations(bal.runningDenominations, denominations, "add");
   const runningTotal = merged.reduce((s, d) => s + d.subtotal, 0);
@@ -169,8 +188,27 @@ const subtractRunningDenominations = async (
   options = {},
 ) => {
   const { session } = options;
-  const bal = await BranchCashBalance.findOne({ branchId, companyId }).session(session);
-  if (!bal) return null;
+  let bal = await BranchCashBalance.findOne({ branchId, companyId }).session(session);
+  if (!bal) {
+    const merged = mergeDenominations([], denominations, "add");
+    const runningTotal = merged.reduce((s, d) => s + d.subtotal, 0);
+    const [createdBal] = await BranchCashBalance.create(
+      [
+        {
+          branchId,
+          companyId,
+          runningTotal,
+          runningDenominations: merged,
+          frozenTotal: 0,
+          frozenDenominations: [],
+          lastUpdatedAt: new Date(),
+          lastUpdatedBy: userId,
+        },
+      ],
+      session ? { session } : {},
+    );
+    return createdBal;
+  }
 
   const merged = mergeDenominations(bal.runningDenominations, denominations, "subtract");
   const runningTotal = merged.reduce((s, d) => s + d.subtotal, 0);
@@ -491,4 +529,6 @@ export default {
   pushFrozenLedgerEntry,
   // Helper
   computeTotals,
+  decomposeCashAmount,
 };
+

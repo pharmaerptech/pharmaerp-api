@@ -184,6 +184,48 @@ const businessDaySchema = new mongoose.Schema(
       default: 0,
     },
 
+    // ── Consolidated UPI Settlement (populated at Business Day Close) ──────────
+    upiSettlementStatus: {
+      type: String,
+      enum: ["PENDING", "SETTLED", "NOT_APPLICABLE"],
+      default: "PENDING",
+      index: true,
+    },
+    upiSettledAt: {
+      type: Date,
+      default: null,
+    },
+    upiSettledBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    totalUpiAmount: {
+      type: Number,
+      default: 0,
+    },
+    totalUpiTransactions: {
+      type: Number,
+      default: 0,
+    },
+    upiBankBreakdown: [
+      {
+        bankAccountId: { type: mongoose.Schema.Types.ObjectId, ref: "BankAccount" },
+        bankName: { type: String, default: "" },
+        accountNumber: { type: String, default: "" },
+        totalAmount: { type: Number, default: 0 },
+        transactionCount: { type: Number, default: 0 },
+        billCount: { type: Number, default: 0 },
+        bankTransactionId: { type: mongoose.Schema.Types.ObjectId, ref: "BankTransaction", default: null },
+      },
+    ],
+    upiSettlementTransactions: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "BankTransaction",
+      },
+    ],
+
     // ── Notes ─────────────────────────────────────────────────────────────────
     note: {
       type: String,
@@ -224,3 +266,4 @@ businessDaySchema.index({ branchId: 1, businessDate: -1 });
 businessDaySchema.index({ companyId: 1, businessDate: -1 });
 
 export const BusinessDay = mongoose.model("BusinessDay", businessDaySchema);
+export default BusinessDay;

@@ -1,4 +1,4 @@
-import mongoose from "mongoose";
+﻿import mongoose from "mongoose";
 import ApiError from "../../../../../../utils/ApiError.js";
 import cashTransactionRepository from "../repositories/cashTransaction.repository.js";
 import {
@@ -8,6 +8,7 @@ import {
 
 import BranchCash from "../../branch-cash/models/branchCash.model.js";
 import branchCashRepository from "../../branch-cash/repositories/branchCash.repository.js";
+import branchCashService from "../../branch-cash/services/branchCash.service.js";
 import Account from "../../../../chart-of-accounts/models/account.model.js";
 import accountGroupRepository from "../../../../chart-of-accounts/repositories/accountGroup.repository.js";
 import accountRepository from "../../../../chart-of-accounts/repositories/account.repository.js";
@@ -239,25 +240,26 @@ const createCashTransaction = async (workspaceId, companyId, userId, payload, op
     };
 
     // 10. Update branch cash running/frozen denomination balance
-    if (denominations && denominations.length > 0) {
+    let activeDenominations = processedDenominations;
+    if ((!activeDenominations || activeDenominations.length === 0 || activeDenominations.every(d => Number(d.quantity) === 0)) && Number(amount) > 0) {
+      activeDenominations = branchCashRepository.decomposeCashAmount(amount);
+    }
+
+    if (activeDenominations && activeDenominations.length > 0) {
       if (direction === CASH_TRANSACTION_DIRECTION.CREDIT) {
         if (partition === "running") {
-          // addRunningDenominations recomputes runningTotal from sums — no scalar increment needed
-          await branchCashRepository.addRunningDenominations(branchId, companyId, processedDenominations, userId, { session });
+          await branchCashRepository.addRunningDenominations(branchId, companyId, activeDenominations, userId, { session });
         } else {
-          // addFrozenDenominations recomputes frozenTotal from sums — no scalar increment needed
-          await branchCashRepository.addFrozenDenominations(branchId, companyId, processedDenominations, userId, { session });
+          await branchCashRepository.addFrozenDenominations(branchId, companyId, activeDenominations, userId, { session });
         }
       } else {
         if (partition === "running") {
-          // subtractRunningDenominations recomputes runningTotal from sums — no scalar decrement needed
-          await branchCashRepository.subtractRunningDenominations(branchId, companyId, processedDenominations, userId, { session });
+          await branchCashRepository.subtractRunningDenominations(branchId, companyId, activeDenominations, userId, { session });
         } else {
-          // subtractFrozenDenominations recomputes frozenTotal from sums — no scalar decrement needed
-          await branchCashRepository.subtractFrozenDenominations(branchId, companyId, processedDenominations, userId, { session });
+          await branchCashRepository.subtractFrozenDenominations(branchId, companyId, activeDenominations, userId, { session });
         }
       }
-      txPayload.denominations = processedDenominations;
+      txPayload.denominations = activeDenominations;
     }
 
     const cashTransaction = await cashTransactionRepository.createCashTransaction(
@@ -270,7 +272,12 @@ const createCashTransaction = async (workspaceId, companyId, userId, payload, op
       session.endSession();
     }
 
-    return getCashTransactionById(cashTransaction._id, companyId, workspaceId, { session });
+    return getCashTransactionById(
+      cashTransaction._id,
+      companyId,
+      workspaceId,
+      providedSession ? { session } : {},
+    );
   } catch (error) {
     if (!providedSession) {
       await session.abortTransaction();
@@ -384,3 +391,6 @@ export default {
   getCashTransactionById,
   cancelCashTransaction,
 };
+
+
+

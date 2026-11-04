@@ -6,6 +6,15 @@ import validate from "../../../middlewares/validate.middleware.js";
 
 import {
   getDailySalesReport,
+  getSalesDetailReport,
+  getCustomerSalesReport,
+  getProductSalesReport,
+  getSalesReturnReport,
+  getPurchaseSummaryReport,
+  getPurchaseDetailReport,
+  getSupplierPurchaseReport,
+  getPurchaseReturnReport,
+  getPurchaseGrnReport,
   getNearExpiryReport,
   getLowStockReorderReport,
   getStockValuationReport,
@@ -27,7 +36,21 @@ router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);
 
-// 1. Daily Sales & Payment Split
+// 1. Sales Reports Suite
+router.get("/sales/summary", validate(reportQuerySchema, "query"), getDailySalesReport);
+router.get("/sales/detail", validate(reportQuerySchema, "query"), getSalesDetailReport);
+router.get("/sales/customer", validate(reportQuerySchema, "query"), getCustomerSalesReport);
+router.get("/sales/product", validate(reportQuerySchema, "query"), getProductSalesReport);
+router.get("/sales/return", validate(reportQuerySchema, "query"), getSalesReturnReport);
+
+// 2. Purchase Reports Suite
+router.get("/purchase/summary", validate(reportQuerySchema, "query"), getPurchaseSummaryReport);
+router.get("/purchase/detail", validate(reportQuerySchema, "query"), getPurchaseDetailReport);
+router.get("/purchase/supplier", validate(reportQuerySchema, "query"), getSupplierPurchaseReport);
+router.get("/purchase/return", validate(reportQuerySchema, "query"), getPurchaseReturnReport);
+router.get("/purchase/grn", validate(reportQuerySchema, "query"), getPurchaseGrnReport);
+
+// Backward-compatibility alias
 router.get("/daily-sales", validate(reportQuerySchema, "query"), getDailySalesReport);
 
 // 2. Near-Expiry Medicines
