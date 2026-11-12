@@ -15,6 +15,7 @@ export const getMemberAccess = asyncHandler(async (req, res) => {
     req.workspaceId,
     req.user._id,
     memberUserId,
+    { branchId: req.headers["x-branch-id"] || req.query?.branchId || null },
   );
 
   return res

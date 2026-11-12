@@ -122,6 +122,7 @@ const buildCashResponse = (cash, balance, currentShiftId = null) => {
 
   return {
     ...cash.toSafeObject(),
+    isInitialized: true,
     currentShiftId,
     // Computed totals (denomination-derived, never stale)
     runningCash,
@@ -221,24 +222,31 @@ const initializeBranchCashWithOpeningBalance = async (
 ) => {
   const { branchId, openingAmount, openingDenominations = [], narration } = payload;
 
-  if (!openingDenominations || openingDenominations.length === 0) {
+  const normalizedOpeningAmount = Number(openingAmount ?? 0);
+  if (!Number.isFinite(normalizedOpeningAmount) || normalizedOpeningAmount < 0) {
+    throw new ApiError(400, "Opening amount cannot be negative.");
+  }
+
+  const processedDenoms = (Array.isArray(openingDenominations) ? openingDenominations : [])
+    .map((d) => ({
+      denomination: Number(d.denomination),
+      quantity:     Number(d.quantity) || 0,
+      subtotal:     Number(d.denomination) * (Number(d.quantity) || 0),
+    }))
+    .filter((d) => d.quantity > 0);
+
+  if (normalizedOpeningAmount > 0 && processedDenoms.length === 0) {
     throw new ApiError(
       400,
-      "Denomination breakdown is required to initialize branch cash.",
+      "Denomination breakdown is required to initialize branch cash with a positive opening balance.",
     );
   }
 
-  const processedDenoms = openingDenominations.map((d) => ({
-    denomination: Number(d.denomination),
-    quantity:     Number(d.quantity) || 0,
-    subtotal:     Number(d.denomination) * (Number(d.quantity) || 0),
-  }));
-
   const denomSum = processedDenoms.reduce((s, d) => s + d.subtotal, 0);
-  if (Math.abs(denomSum - Number(openingAmount)) > 0.01) {
+  if (Math.abs(denomSum - normalizedOpeningAmount) > 0.01) {
     throw new ApiError(
       400,
-      `Denomination sum (Rs.${denomSum}) does not match declared opening amount (Rs.${openingAmount}).`,
+      `Denomination sum (Rs.${denomSum}) does not match declared opening amount (Rs.${normalizedOpeningAmount}).`,
     );
   }
 

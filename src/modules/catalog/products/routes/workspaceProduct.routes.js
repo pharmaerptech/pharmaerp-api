@@ -29,6 +29,9 @@ import {
 } from "../validations/workspaceProduct.validation.js";
 
 import companyContextMiddleware from "../../../../middlewares/companyContext.middleware.js";
+import workAccessMiddleware, {
+  getMethodAwareModes,
+} from "../../../../middlewares/workAccess.middleware.js";
 import uploadFile from "../../../../middlewares/upload.middleware.js";
 
 const router = Router();
@@ -37,6 +40,17 @@ const router = Router();
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);
+router.use(
+  workAccessMiddleware((req) => ({
+    minLevel:
+      req.method === "DELETE" ||
+      req.path.startsWith("/import") ||
+      req.path === "/detect"
+        ? "company"
+        : "branch",
+    modes: getMethodAwareModes(req),
+  })),
+);
 
 // ---------------------
 // POST /catalog/products/detect

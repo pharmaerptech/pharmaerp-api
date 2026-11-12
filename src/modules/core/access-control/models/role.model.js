@@ -3,6 +3,12 @@
 import mongoose from "mongoose";
 
 import { ROLE_STATUS } from "../constants/role.constant.js";
+import {
+  normalizeRoleWorkAccess,
+  VALID_WORK_MODES,
+  WORK_LEVELS,
+  WORK_MODES,
+} from "../utils/workAccess.helper.js";
 import { ALL_PERMISSIONS } from "../constants/permission.constant.js";
 
 const roleSchema = new mongoose.Schema(
@@ -50,6 +56,25 @@ const roleSchema = new mongoose.Schema(
       },
     },
 
+    workModes: {
+      type: [String],
+      enum: VALID_WORK_MODES,
+      default: undefined,
+      validate: {
+        validator(value) {
+          return Array.isArray(value) && value.length > 0;
+        },
+        message: "At least one work mode is required",
+      },
+    },
+
+    workLevel: {
+      type: String,
+      enum: Object.values(WORK_LEVELS),
+      default: undefined,
+      index: true,
+    },
+
     isSystem: {
       type: Boolean,
       default: false,
@@ -95,6 +120,24 @@ const roleSchema = new mongoose.Schema(
     timestamps: true,
   },
 );
+
+roleSchema.pre("validate", function syncWorkModeAndLevel() {
+  const shouldPreferPermissionModes =
+    this.isModified("permissions") && !this.isModified("workModes");
+  const shouldPreferPermissionLevel =
+    this.isModified("permissions") && !this.isModified("workLevel");
+
+  const normalized = normalizeRoleWorkAccess({
+    permissions: this.permissions || [],
+    workModes: shouldPreferPermissionModes ? undefined : this.workModes,
+    workLevel: shouldPreferPermissionLevel ? undefined : this.workLevel,
+    roleCode: this.code,
+  });
+
+  this.workModes = normalized.workModes;
+  this.workLevel = normalized.workLevel;
+  this.permissions = normalized.syncedPermissions;
+});
 
 roleSchema.methods.toSafeObject = function () {
   const role = this.toObject();

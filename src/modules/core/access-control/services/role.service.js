@@ -14,13 +14,19 @@ import {
 
 import {
   DEFAULT_ROLE_PERMISSIONS,
+  DEFAULT_ROLE_WORK_ACCESS,
   ALL_PERMISSIONS,
+  PERMISSIONS,
 } from "../constants/permission.constant.js";
 
+import { WORKSPACE_MEMBER_STATUS } from "../../../organization/workspaces/constants/workspace.constant.js";
+
+import { ensureWorkspaceMemberActor } from "../utils/accessControlActor.helper.js";
 import {
-  WORKSPACE_STATUS,
-  WORKSPACE_MEMBER_STATUS,
-} from "../../../organization/workspaces/constants/workspace.constant.js";
+  canActorManageRoleSpec,
+  normalizeRoleWorkAccess,
+  resolveEffectiveWorkAccess,
+} from "../utils/workAccess.helper.js";
 
 const createCode = (name) => {
   return String(name)
@@ -30,40 +36,21 @@ const createCode = (name) => {
     .replace(/^_+|_+$/g, "");
 };
 
-const ensureWorkspaceAccess = async (workspaceId, userId) => {
-  const workspace = await workspaceRepository.findWorkspaceById(workspaceId);
-
-  if (!workspace || workspace.status === WORKSPACE_STATUS.DELETED) {
-    throw new ApiError(404, "Workspace not found");
-  }
-
-  if (workspace.status !== WORKSPACE_STATUS.ACTIVE) {
-    throw new ApiError(403, "Workspace is not active");
-  }
-
-  const member = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (!member || member.status !== WORKSPACE_MEMBER_STATUS.ACTIVE) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
+const toEnrichedRoleObject = (roleDoc) => {
+  const roleSafe = roleDoc?.toSafeObject ? roleDoc.toSafeObject() : { ...roleDoc };
+  const workAccess = resolveEffectiveWorkAccess({
+    role: roleSafe,
+    permissions: roleSafe?.permissions,
+    isOwner: roleSafe?.code === SYSTEM_ROLES.OWNER,
+  });
 
   return {
-    workspace,
-    member,
+    ...roleSafe,
+    workModes: workAccess.allowedWorkModes,
+    workLevel: workAccess.highestWorkLevel,
+    allowedWorkLevels: workAccess.allowedWorkLevels,
+    workAccess,
   };
-};
-
-const ensureOwnerAccess = async (workspaceId, userId) => {
-  const { member } = await ensureWorkspaceAccess(workspaceId, userId);
-
-  if (!member.isOwner) {
-    throw new ApiError(403, "Only workspace owner can manage roles");
-  }
-
-  return member;
 };
 
 const createDefaultRolesForWorkspace = async (workspaceId, userId) => {
@@ -80,14 +67,24 @@ const createDefaultRolesForWorkspace = async (workspaceId, userId) => {
       continue;
     }
 
+    const defaultWorkAccess = DEFAULT_ROLE_WORK_ACCESS[roleCode] || {};
+    const normalized = normalizeRoleWorkAccess({
+      permissions: DEFAULT_ROLE_PERMISSIONS[roleCode] || [],
+      workModes: defaultWorkAccess.workModes,
+      workLevel: defaultWorkAccess.workLevel,
+      roleCode,
+    });
+
     const role = await roleRepository.createRole({
       workspaceId,
       name: SYSTEM_ROLE_LABELS[roleCode],
       code: roleCode,
       description: SYSTEM_ROLE_DESCRIPTIONS[roleCode],
-      permissions: DEFAULT_ROLE_PERMISSIONS[roleCode] || [],
+      workModes: normalized.workModes,
+      workLevel: normalized.workLevel,
+      permissions: normalized.syncedPermissions,
       isSystem: true,
-      isEditable: true,
+      isEditable: roleCode !== SYSTEM_ROLES.OWNER,
       status: ROLE_STATUS.ACTIVE,
       createdBy: userId,
     });
@@ -95,7 +92,7 @@ const createDefaultRolesForWorkspace = async (workspaceId, userId) => {
     createdRoles.push(role);
   }
 
-  return createdRoles.map((role) => role.toSafeObject());
+  return createdRoles.map((role) => toEnrichedRoleObject(role));
 };
 
 const getOwnerRoleForWorkspace = async (workspaceId) => {
@@ -131,9 +128,16 @@ const getStaffRoleForWorkspace = async (workspaceId) => {
 };
 
 const createRole = async (workspaceId, userId, payload) => {
-  await ensureOwnerAccess(workspaceId, userId);
+  const actor = await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [PERMISSIONS.ROLE_CREATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can create roles",
+  });
 
   const code = payload.code || createCode(payload.name);
+
+  if (code === SYSTEM_ROLES.OWNER) {
+    throw new ApiError(400, "Owner role code is reserved");
+  }
 
   const existingRole = await roleRepository.findRoleByCode(workspaceId, code);
 
@@ -141,23 +145,46 @@ const createRole = async (workspaceId, userId, payload) => {
     throw new ApiError(400, "Role with this code already exists");
   }
 
+  const normalized = normalizeRoleWorkAccess({
+    permissions: payload.permissions || [],
+    workModes: payload.workModes,
+    workLevel: payload.workLevel,
+    roleCode: code,
+  });
+
+  const manageCheck = canActorManageRoleSpec({
+    actorIsOwner: actor.isOwner,
+    actorWorkAccess: actor.actorWorkAccess,
+    actorPermissions: actor.actorPermissions,
+    targetWorkModes: normalized.workModes,
+    targetWorkLevel: normalized.workLevel,
+    targetPermissions: normalized.syncedPermissions,
+    targetRoleCode: code,
+  });
+
+  if (!manageCheck.allowed) {
+    throw new ApiError(403, manageCheck.message);
+  }
+
   const role = await roleRepository.createRole({
     workspaceId,
     name: payload.name,
     code,
     description: payload.description,
-    permissions: payload.permissions || [],
+    workModes: normalized.workModes,
+    workLevel: normalized.workLevel,
+    permissions: normalized.syncedPermissions,
     isSystem: false,
     isEditable: true,
     status: ROLE_STATUS.ACTIVE,
     createdBy: userId,
   });
 
-  return role.toSafeObject();
+  return toEnrichedRoleObject(role);
 };
 
 const getWorkspaceRoles = async (workspaceId, userId) => {
-  await ensureWorkspaceAccess(workspaceId, userId);
+  await ensureWorkspaceMemberActor(workspaceId, userId);
 
   const [roles, members] = await Promise.all([
     roleRepository.getWorkspaceRoles(workspaceId),
@@ -165,7 +192,7 @@ const getWorkspaceRoles = async (workspaceId, userId) => {
   ]);
 
   return roles.map((role) => {
-    const roleSafe = role.toSafeObject();
+    const roleSafe = toEnrichedRoleObject(role);
     const strRoleId = String(role._id);
     const isOwnerRole = role.code === SYSTEM_ROLES.OWNER;
     const assignedMembers = (members || []).filter((m) => {
@@ -180,7 +207,7 @@ const getWorkspaceRoles = async (workspaceId, userId) => {
 };
 
 const getRoleById = async (roleId, workspaceId, userId) => {
-  await ensureWorkspaceAccess(workspaceId, userId);
+  await ensureWorkspaceMemberActor(workspaceId, userId);
 
   const [role, members] = await Promise.all([
     roleRepository.findRoleByIdAndWorkspace(roleId, workspaceId),
@@ -191,7 +218,7 @@ const getRoleById = async (roleId, workspaceId, userId) => {
     throw new ApiError(404, "Role not found");
   }
 
-  const roleSafe = role.toSafeObject();
+  const roleSafe = toEnrichedRoleObject(role);
   const strRoleId = String(role._id);
   const isOwnerRole = role.code === SYSTEM_ROLES.OWNER;
   const assignedMembers = (members || []).filter((m) => {
@@ -206,7 +233,10 @@ const getRoleById = async (roleId, workspaceId, userId) => {
 };
 
 const updateRole = async (roleId, workspaceId, userId, payload) => {
-  await ensureOwnerAccess(workspaceId, userId);
+  const actor = await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [PERMISSIONS.ROLE_UPDATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can update roles",
+  });
 
   const role = await roleRepository.findRoleByIdAndWorkspace(
     roleId,
@@ -225,21 +255,68 @@ const updateRole = async (roleId, workspaceId, userId, payload) => {
     throw new ApiError(400, "This role cannot be updated");
   }
 
-  const allowedFields = ["name", "description", "permissions", "status"];
+  const actorRoleId = String(actor.member?.roleId?._id || actor.member?.roleId || "");
+  if (!actor.isOwner && actorRoleId && actorRoleId === String(role._id)) {
+    throw new ApiError(403, "You cannot modify your own assigned role");
+  }
 
-  allowedFields.forEach((field) => {
-    if (payload[field] !== undefined) {
-      role[field] = payload[field];
+  if (payload.name !== undefined) role.name = payload.name;
+  if (payload.description !== undefined) role.description = payload.description;
+  if (payload.status !== undefined) role.status = payload.status;
+
+  const hasAccessChanges =
+    payload.permissions !== undefined ||
+    payload.workModes !== undefined ||
+    payload.workLevel !== undefined;
+
+  if (hasAccessChanges) {
+    const normalized = normalizeRoleWorkAccess({
+      permissions:
+        payload.permissions !== undefined ? payload.permissions : role.permissions,
+      workModes:
+        payload.workModes !== undefined
+          ? payload.workModes
+          : payload.permissions !== undefined
+            ? undefined
+            : role.workModes,
+      workLevel:
+        payload.workLevel !== undefined
+          ? payload.workLevel
+          : payload.permissions !== undefined
+            ? undefined
+            : role.workLevel,
+      roleCode: role.code,
+    });
+
+    const manageCheck = canActorManageRoleSpec({
+      actorIsOwner: actor.isOwner,
+      actorWorkAccess: actor.actorWorkAccess,
+      actorPermissions: actor.actorPermissions,
+      targetWorkModes: normalized.workModes,
+      targetWorkLevel: normalized.workLevel,
+      targetPermissions: normalized.syncedPermissions,
+      targetRoleCode: role.code,
+    });
+
+    if (!manageCheck.allowed) {
+      throw new ApiError(403, manageCheck.message);
     }
-  });
+
+    role.workModes = normalized.workModes;
+    role.workLevel = normalized.workLevel;
+    role.permissions = normalized.syncedPermissions;
+  }
 
   await roleRepository.saveRole(role);
 
-  return role.toSafeObject();
+  return toEnrichedRoleObject(role);
 };
 
 const deleteRole = async (roleId, workspaceId, userId) => {
-  await ensureOwnerAccess(workspaceId, userId);
+  const actor = await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [PERMISSIONS.ROLE_DELETE],
+    forbiddenMessage: "Only workspace owner or authorized admin can delete roles",
+  });
 
   const role = await roleRepository.findRoleByIdAndWorkspace(
     roleId,
@@ -252,6 +329,21 @@ const deleteRole = async (roleId, workspaceId, userId) => {
 
   if (role.isSystem) {
     throw new ApiError(400, "System role cannot be deleted");
+  }
+
+  const targetWorkAccess = resolveEffectiveWorkAccess({ role });
+  const manageCheck = canActorManageRoleSpec({
+    actorIsOwner: actor.isOwner,
+    actorWorkAccess: actor.actorWorkAccess,
+    actorPermissions: actor.actorPermissions,
+    targetWorkModes: targetWorkAccess.allowedWorkModes,
+    targetWorkLevel: targetWorkAccess.highestWorkLevel,
+    targetPermissions: role.permissions || [],
+    targetRoleCode: role.code,
+  });
+
+  if (!manageCheck.allowed) {
+    throw new ApiError(403, "You cannot delete a role with higher privileges than yours");
   }
 
   const deletedRole = await roleRepository.deleteRoleById(
@@ -275,7 +367,18 @@ const assignRoleToMember = async (
   memberUserId,
   roleId,
 ) => {
-  await ensureOwnerAccess(workspaceId, userId);
+  const actor = await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [
+      PERMISSIONS.ROLE_UPDATE,
+      PERMISSIONS.MEMBER_ACCESS_UPDATE,
+      PERMISSIONS.WORKSPACE_MEMBER_UPDATE,
+    ],
+    forbiddenMessage: "Only workspace owner or authorized admin can assign roles",
+  });
+
+  if (!actor.isOwner && String(userId) === String(memberUserId)) {
+    throw new ApiError(403, "You cannot change your own role");
+  }
 
   const member = await workspaceRepository.findWorkspaceMember(
     workspaceId,
@@ -305,6 +408,21 @@ const assignRoleToMember = async (
 
   if (role.status !== ROLE_STATUS.ACTIVE) {
     throw new ApiError(400, "Role is not active");
+  }
+
+  const targetWorkAccess = resolveEffectiveWorkAccess({ role });
+  const manageCheck = canActorManageRoleSpec({
+    actorIsOwner: actor.isOwner,
+    actorWorkAccess: actor.actorWorkAccess,
+    actorPermissions: actor.actorPermissions,
+    targetWorkModes: targetWorkAccess.allowedWorkModes,
+    targetWorkLevel: targetWorkAccess.highestWorkLevel,
+    targetPermissions: role.permissions || [],
+    targetRoleCode: role.code,
+  });
+
+  if (!manageCheck.allowed) {
+    throw new ApiError(403, manageCheck.message);
   }
 
   member.roleId = role._id;

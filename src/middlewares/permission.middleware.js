@@ -8,6 +8,7 @@ import memberAccessRepository from "../modules/core/access-control/repositories/
 
 import { WORKSPACE_MEMBER_STATUS } from "../modules/organization/workspaces/constants/workspace.constant.js";
 import { ROLE_STATUS } from "../modules/core/access-control/constants/role.constant.js";
+import { resolveEffectiveWorkAccess } from "../modules/core/access-control/utils/workAccess.helper.js";
 
 const normalizePermissions = (permissions) => {
   if (!permissions) return [];
@@ -106,13 +107,29 @@ const permissionMiddleware = (permissions, options = {}) => {
 
       if (member.isOwner && options.skipOwnerCheck !== true) {
         req.workspaceMember = member;
+        req.workAccess = resolveEffectiveWorkAccess({ isOwner: true });
         return next();
       }
 
-      if (requiredPermissions.length) {
-        let role = member.roleId;
+      let primaryRole = member.roleId;
+      if (primaryRole && !primaryRole.permissions) {
+        primaryRole = await roleRepository.findRoleByIdAndWorkspace(
+          primaryRole,
+          req.workspaceId,
+        );
+      }
 
-        // --- PBAC: Dynamic Branch-Specific Role Resolution ---
+      const primaryWorkAccess = resolveEffectiveWorkAccess({
+        role: primaryRole,
+        permissions: primaryRole?.permissions || [],
+        isOwner: false,
+      });
+      req.workAccess = primaryWorkAccess;
+
+      if (requiredPermissions.length) {
+        let role = primaryRole;
+
+        // Dynamic branch-specific role override (level hierarchy stays capped by primaryRole)
         const activeBranchId =
           req.branchId || req.branch?._id || getScopedId(req, "branchId");
 

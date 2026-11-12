@@ -15,6 +15,12 @@ import {
   WORKSPACE_STATUS,
   WORKSPACE_MEMBER_STATUS,
 } from "../constants/workspace.constant.js";
+import { PERMISSIONS } from "../../../core/access-control/constants/permission.constant.js";
+import {
+  assertActorCanAssignRoleIds,
+  ensureWorkspaceMemberActor,
+} from "../../../core/access-control/utils/accessControlActor.helper.js";
+import { resolveEffectiveWorkAccess } from "../../../core/access-control/utils/workAccess.helper.js";
 
 const createSlug = (name) => {
   return String(name)
@@ -106,24 +112,10 @@ const getWorkspaceById = async (workspaceId, userId) => {
 };
 
 const updateWorkspace = async (workspaceId, userId, payload) => {
-  const member = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (!member || member.status !== WORKSPACE_MEMBER_STATUS.ACTIVE) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
-
-  if (!member.isOwner) {
-    throw new ApiError(403, "Only workspace owner can update workspace");
-  }
-
-  const workspace = await workspaceRepository.findWorkspaceById(workspaceId);
-
-  if (!workspace) {
-    throw new ApiError(404, "Workspace not found");
-  }
+  const { workspace } = await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [PERMISSIONS.WORKSPACE_UPDATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can update workspace",
+  });
 
   const allowedFields = ["name", "type", "logo"];
 
@@ -226,6 +218,13 @@ const getWorkspaceMembers = async (workspaceId, userId) => {
     const companyCount = (isOwner || accessAllCompanies) ? totalCompanies : (companyIds?.length || 0);
     const branchCount = (isOwner || accessAllBranches) ? totalBranches : (branchIds?.length || 0);
 
+    const roleObj = safeObj.roleId || null;
+    const workAccess = resolveEffectiveWorkAccess({
+      role: roleObj,
+      permissions: roleObj?.permissions || [],
+      isOwner,
+    });
+
     return {
       ...safeObj,
       access: access ? (access.toSafeObject ? access.toSafeObject() : access) : null,
@@ -237,6 +236,7 @@ const getWorkspaceMembers = async (workspaceId, userId) => {
       branchCount,
       totalWorkspaceCompanies: totalCompanies,
       totalWorkspaceBranches: totalBranches,
+      workAccess,
     };
   });
 };
@@ -251,21 +251,10 @@ const updateWorkspaceMemberStatus = async (
   memberUserId,
   status,
 ) => {
-  const currentMember = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (
-    !currentMember ||
-    currentMember.status !== WORKSPACE_MEMBER_STATUS.ACTIVE
-  ) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
-
-  if (!currentMember.isOwner) {
-    throw new ApiError(403, "Only workspace owner can update members");
-  }
+  await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [PERMISSIONS.WORKSPACE_MEMBER_UPDATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can update members",
+  });
 
   if (userId.toString() === memberUserId.toString()) {
     throw new ApiError(400, "You cannot update your own member status");
@@ -292,24 +281,13 @@ const updateWorkspaceMemberStatus = async (
 };
 
 const removeWorkspaceMember = async (workspaceId, userId, memberUserId) => {
-  const currentMember = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (
-    !currentMember ||
-    currentMember.status !== WORKSPACE_MEMBER_STATUS.ACTIVE
-  ) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
-
-  if (!currentMember.isOwner) {
-    throw new ApiError(403, "Only workspace owner can remove members");
-  }
+  await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [PERMISSIONS.WORKSPACE_MEMBER_DELETE],
+    forbiddenMessage: "Only workspace owner or authorized admin can remove members",
+  });
 
   if (userId.toString() === memberUserId.toString()) {
-    throw new ApiError(400, "Workspace owner cannot remove themselves");
+    throw new ApiError(400, "Workspace member cannot remove themselves");
   }
 
   const member = await workspaceRepository.findWorkspaceMember(
@@ -335,19 +313,12 @@ const removeWorkspaceMember = async (workspaceId, userId, memberUserId) => {
 };
 
 const directCreateMember = async (workspaceId, adminUserId, payload) => {
-  const adminMember = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    adminUserId,
-  );
+  const actor = await ensureWorkspaceMemberActor(workspaceId, adminUserId, {
+    requiredPermissions: [PERMISSIONS.WORKSPACE_MEMBER_CREATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can add team members",
+  });
 
-  if (!adminMember || adminMember.status !== WORKSPACE_MEMBER_STATUS.ACTIVE) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
-
-  const workspace = await workspaceRepository.findWorkspaceById(workspaceId);
-  if (!workspace || workspace.status === WORKSPACE_STATUS.DELETED) {
-    throw new ApiError(404, "Workspace not found");
-  }
+  const workspace = actor.workspace;
 
   // Enforce prerequisite: At least 1 company and 1 branch must exist
   const totalCompanies = await companyRepository.countWorkspaceCompanies(workspaceId);
@@ -371,6 +342,15 @@ const directCreateMember = async (workspaceId, adminUserId, payload) => {
     accessAllCompanies = false,
     accessAllBranches = false,
   } = payload;
+
+  const branchRoleIds = Array.isArray(branchAccess)
+    ? branchAccess.map((b) => b?.roleId).filter(Boolean)
+    : [];
+  await assertActorCanAssignRoleIds({
+    workspaceId,
+    actor,
+    roleIds: [roleId, ...branchRoleIds].filter(Boolean),
+  });
 
   const cleanPhone = phone ? String(phone).trim() : null;
   const cleanEmail = email ? String(email).trim().toLowerCase() : null;
@@ -492,11 +472,17 @@ const directCreateMember = async (workspaceId, adminUserId, payload) => {
     branchAccess: branchAccess || [],
   });
 
-  // Return populated member object so Redux immediately displays user details
+  const resolvedWorkAccess = resolveEffectiveWorkAccess({
+    role: resolvedRole,
+    permissions: resolvedRole?.permissions || [],
+    isOwner: false,
+  });
+
   const populatedMember = {
     ...member.toSafeObject(),
     userId: user.toSafeObject(),
     roleId: resolvedRole?.toSafeObject ? resolvedRole.toSafeObject() : resolvedRole,
+    workAccess: resolvedWorkAccess,
   };
 
   return {
@@ -518,18 +504,10 @@ const resetMemberPassword = async (
   memberUserId,
   newPassword,
 ) => {
-  const adminMember = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    adminUserId,
-  );
-
-  if (!adminMember || adminMember.status !== WORKSPACE_MEMBER_STATUS.ACTIVE) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
-
-  if (!adminMember.isOwner) {
-    throw new ApiError(403, "Only workspace owner or admin can reset staff passwords");
-  }
+  await ensureWorkspaceMemberActor(workspaceId, adminUserId, {
+    requiredPermissions: [PERMISSIONS.WORKSPACE_MEMBER_UPDATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can reset staff passwords",
+  });
 
   const targetUser = await authRepository.findUserById(memberUserId);
   if (!targetUser) {
@@ -545,7 +523,6 @@ const resetMemberPassword = async (
   };
 };
 
-// Named export so onboarding service can import it directly
 export { createWorkspace, directCreateMember, resetMemberPassword };
 
 export default {

@@ -16,12 +16,14 @@ import {
 import authMiddleware from "../../../middlewares/auth.middleware.js";
 import workspaceContextMiddleware from "../../../middlewares/workspaceContext.middleware.js";
 import companyContextMiddleware from "../../../middlewares/companyContext.middleware.js";
+import { requireMethodWorkAccess } from "../../../middlewares/workAccess.middleware.js";
 
 const router = Router();
 
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);
+router.use(requireMethodWorkAccess({ minLevel: "branch" }));
 
 router.post("/", createShift);
 router.get("/", listShifts);

@@ -2,6 +2,9 @@ import { Router } from "express";
 
 import validate from "../../../../middlewares/validate.middleware.js";
 import authMiddleware from "../../../../middlewares/auth.middleware.js";
+import workAccessMiddleware, {
+  requireWorkAccess,
+} from "../../../../middlewares/workAccess.middleware.js";
 
 import {
   createWorkspace,
@@ -59,34 +62,48 @@ router.post(
 // --- PROTECTED ROUTES ---
 router.use(authMiddleware);
 
+const bootSafeWorkspaceRead = workAccessMiddleware({ allowBootDiscovery: true });
+const workspaceViewOrOp = requireWorkAccess({
+  minLevel: "workspace",
+  modes: ["view", "operation"],
+});
+const workspaceOperationOnly = requireWorkAccess({
+  minLevel: "workspace",
+  modes: ["operation"],
+});
+
 router.post("/", validate(createWorkspaceSchema), createWorkspace);
 
 router.get("/", getMyWorkspaces);
 
 router.post(
   "/:workspaceId/invitations",
+  workspaceOperationOnly,
   validate(inviteWorkspaceMemberSchema),
   inviteWorkspaceMember,
 );
 
 router.get("/user-inbox/invitations", getIncomingUserInvitations);
 
-router.get("/:workspaceId/invitations", getWorkspaceInvitations);
+router.get("/:workspaceId/invitations", workspaceViewOrOp, getWorkspaceInvitations);
 
 router.patch(
   "/:workspaceId/invitations/:invitationId",
+  workspaceOperationOnly,
   validate(updateWorkspaceInvitationSchema),
   updateWorkspaceInvitation,
 );
 
 router.post(
   "/:workspaceId/invitations/:invitationId/resend",
+  workspaceOperationOnly,
   validate(resendWorkspaceInvitationSchema),
   resendWorkspaceInvitation,
 );
 
 router.patch(
   "/:workspaceId/invitations/:invitationId/cancel",
+  workspaceOperationOnly,
   validate(cancelWorkspaceInvitationSchema),
   cancelWorkspaceInvitation,
 );
@@ -97,35 +114,47 @@ router.post(
   acceptWorkspaceInvitation,
 );
 
-// Setup Center
-router.get("/:workspaceId/setup-status", getWorkspaceSetupStatus);
+// Setup Center & Boot-Safe Workspace Summary
+router.get("/:workspaceId/setup-status", bootSafeWorkspaceRead, getWorkspaceSetupStatus);
 
-router.get("/:workspaceId", getWorkspaceById);
+router.get("/:workspaceId", bootSafeWorkspaceRead, getWorkspaceById);
 
-router.patch("/:workspaceId", validate(updateWorkspaceSchema), updateWorkspace);
+router.patch(
+  "/:workspaceId",
+  workspaceOperationOnly,
+  validate(updateWorkspaceSchema),
+  updateWorkspace,
+);
 
-router.delete("/:workspaceId", deleteWorkspace);
+router.delete("/:workspaceId", workspaceOperationOnly, deleteWorkspace);
 
-router.get("/:workspaceId/members", getWorkspaceMembers);
+router.get("/:workspaceId/members", workspaceViewOrOp, getWorkspaceMembers);
 
 router.post(
   "/:workspaceId/members/direct-create",
+  workspaceOperationOnly,
   validate(directCreateWorkspaceMemberSchema),
   directCreateWorkspaceMember,
 );
 
 router.post(
   "/:workspaceId/members/:memberUserId/reset-password",
+  workspaceOperationOnly,
   validate(resetMemberPasswordSchema),
   resetMemberPassword,
 );
 
 router.patch(
   "/:workspaceId/members/:memberUserId/status",
+  workspaceOperationOnly,
   validate(updateWorkspaceMemberStatusSchema),
   updateWorkspaceMemberStatus,
 );
 
-router.delete("/:workspaceId/members/:memberUserId", removeWorkspaceMember);
+router.delete(
+  "/:workspaceId/members/:memberUserId",
+  workspaceOperationOnly,
+  removeWorkspaceMember,
+);
 
 export default router;

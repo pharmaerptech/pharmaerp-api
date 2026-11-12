@@ -3,6 +3,9 @@ import { Router } from "express";
 import authMiddleware from "../../../../middlewares/auth.middleware.js";
 import workspaceContextMiddleware from "../../../../middlewares/workspaceContext.middleware.js";
 import companyContextMiddleware from "../../../../middlewares/companyContext.middleware.js";
+import workAccessMiddleware, {
+  getMethodAwareModes,
+} from "../../../../middlewares/workAccess.middleware.js";
 import validate from "../../../../middlewares/validate.middleware.js";
 
 import {
@@ -55,6 +58,15 @@ const router = Router();
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);
+router.use(
+  workAccessMiddleware((req) => ({
+    minLevel:
+      req.method === "DELETE" || req.path.startsWith("/import")
+        ? "company"
+        : "branch",
+    modes: getMethodAwareModes(req),
+  })),
+);
 
 
 import uploadFile from "../../../../middlewares/upload.middleware.js";

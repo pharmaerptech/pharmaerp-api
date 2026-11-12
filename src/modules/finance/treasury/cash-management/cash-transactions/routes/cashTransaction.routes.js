@@ -2,6 +2,7 @@ import { Router } from "express";
 import authMiddleware from "../../../../../../middlewares/auth.middleware.js";
 import workspaceContextMiddleware from "../../../../../../middlewares/workspaceContext.middleware.js";
 import companyContextMiddleware from "../../../../../../middlewares/companyContext.middleware.js";
+import { requireMethodWorkAccess } from "../../../../../../middlewares/workAccess.middleware.js";
 import validate from "../../../../../../middlewares/validate.middleware.js";
 
 import {
@@ -22,6 +23,7 @@ const router = Router();
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);
+router.use(requireMethodWorkAccess({ minLevel: "branch" }));
 
 // Routes
 router.get("/", validate(getCashTransactionsQuerySchema, "query"), getCashTransactions);

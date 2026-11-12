@@ -3,6 +3,9 @@ import { Router } from "express";
 import authMiddleware from "../../../../middlewares/auth.middleware.js";
 import workspaceContextMiddleware from "../../../../middlewares/workspaceContext.middleware.js";
 import companyContextMiddleware from "../../../../middlewares/companyContext.middleware.js";
+import workAccessMiddleware, {
+  requireWorkAccess,
+} from "../../../../middlewares/workAccess.middleware.js";
 
 import validate from "../../../../middlewares/validate.middleware.js";
 
@@ -24,7 +27,6 @@ import {
 const router = Router();
 
 router.use(authMiddleware);
-
 router.use(workspaceContextMiddleware);
 
 /*
@@ -33,10 +35,23 @@ router.use(workspaceContextMiddleware);
 |--------------------------------------------------------------------------
 */
 
-router.get("/workspace/all", getWorkspaceBranches);
+// Boot hydration needs permitted branch discovery regardless of active level/mode
+router.get(
+  "/workspace/all",
+  workAccessMiddleware({ allowBootDiscovery: true }),
+  getWorkspaceBranches,
+);
 
-router.get("/:branchId/members", getBranchMembers);
-router.get("/:branchId/employees", getBranchMembers);
+router.get(
+  "/:branchId/members",
+  requireWorkAccess({ minLevel: "branch", modes: ["view", "operation"] }),
+  getBranchMembers,
+);
+router.get(
+  "/:branchId/employees",
+  requireWorkAccess({ minLevel: "branch", modes: ["view", "operation"] }),
+  getBranchMembers,
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -46,14 +61,36 @@ router.get("/:branchId/employees", getBranchMembers);
 
 router.use(companyContextMiddleware);
 
-router.post("/", validate(createBranchSchema), createBranch);
+router.post(
+  "/",
+  requireWorkAccess({ minLevel: "company", modes: ["operation"] }),
+  validate(createBranchSchema),
+  createBranch,
+);
 
-router.get("/", getCompanyBranches);
+router.get(
+  "/",
+  workAccessMiddleware({ allowBootDiscovery: true }),
+  getCompanyBranches,
+);
 
-router.get("/:branchId", getBranchById);
+router.get(
+  "/:branchId",
+  requireWorkAccess({ minLevel: "branch", modes: ["view", "operation"] }),
+  getBranchById,
+);
 
-router.patch("/:branchId", validate(updateBranchSchema), updateBranch);
+router.patch(
+  "/:branchId",
+  requireWorkAccess({ minLevel: "company", modes: ["operation"] }),
+  validate(updateBranchSchema),
+  updateBranch,
+);
 
-router.delete("/:branchId", deleteBranch);
+router.delete(
+  "/:branchId",
+  requireWorkAccess({ minLevel: "company", modes: ["operation"] }),
+  deleteBranch,
+);
 
 export default router;

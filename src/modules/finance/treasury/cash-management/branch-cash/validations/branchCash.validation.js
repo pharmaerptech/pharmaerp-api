@@ -12,7 +12,11 @@ export const getBranchCashSchema = Joi.object({
 export const initializeBranchCashSchema = Joi.object({
   branchId: Joi.string().hex().length(24).required(),
   openingAmount: Joi.number().min(0).required(),
-  openingDenominations: Joi.array().items(denominationSchema).min(1).required(),
+  openingDenominations: Joi.when("openingAmount", {
+    is: Joi.number().greater(0),
+    then: Joi.array().items(denominationSchema).min(1).required(),
+    otherwise: Joi.array().items(denominationSchema).optional().default([]),
+  }),
   narration: Joi.string().max(500).optional().allow("", null),
 });
 

@@ -3,6 +3,10 @@
 import Joi from "joi";
 
 import { ROLE_STATUS } from "../constants/role.constant.js";
+import {
+  VALID_WORK_MODES,
+  WORK_LEVELS,
+} from "../utils/workAccess.helper.js";
 import { ALL_PERMISSIONS } from "../constants/permission.constant.js";
 
 const objectId = Joi.string()
@@ -28,6 +32,16 @@ export const createRoleSchema = Joi.object({
 
   description: Joi.string().trim().max(500).allow(null, "").optional(),
 
+  workModes: Joi.array()
+    .items(Joi.string().valid(...VALID_WORK_MODES))
+    .min(1)
+    .unique()
+    .optional(),
+
+  workLevel: Joi.string()
+    .valid(...Object.values(WORK_LEVELS))
+    .optional(),
+
   permissions: Joi.array()
     .items(Joi.string().valid(...ALL_PERMISSIONS))
     .default([])
@@ -38,6 +52,16 @@ export const updateRoleSchema = Joi.object({
   name: Joi.string().trim().min(2).max(80).optional(),
 
   description: Joi.string().trim().max(500).allow(null, "").optional(),
+
+  workModes: Joi.array()
+    .items(Joi.string().valid(...VALID_WORK_MODES))
+    .min(1)
+    .unique()
+    .optional(),
+
+  workLevel: Joi.string()
+    .valid(...Object.values(WORK_LEVELS))
+    .optional(),
 
   permissions: Joi.array()
     .items(Joi.string().valid(...ALL_PERMISSIONS))

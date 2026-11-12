@@ -19,11 +19,13 @@ import {
 } from "../validations/marketplaceProduct.validation.js";
 
 import workspaceContextMiddleware from "../../../../middlewares/workspaceContext.middleware.js";
+import { requireMethodWorkAccess } from "../../../../middlewares/workAccess.middleware.js";
 
 const router = Router();
 
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
+router.use(requireMethodWorkAccess({ minLevel: "branch" }));
 
 router.get("/", validate(listProductsQuerySchema, "query"), getEnabledProducts);
 

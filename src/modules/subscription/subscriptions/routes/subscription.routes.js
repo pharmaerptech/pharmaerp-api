@@ -2,6 +2,7 @@ import { Router } from "express";
 
 import validate from "../../../../middlewares/validate.middleware.js";
 import authMiddleware from "../../../../middlewares/auth.middleware.js";
+import { requireMethodWorkAccess } from "../../../../middlewares/workAccess.middleware.js";
 
 import {
   renewSubscription,
@@ -29,6 +30,7 @@ import {
 const router = Router();
 
 router.use(authMiddleware);
+router.use(requireMethodWorkAccess({ minLevel: "workspace" }));
 
 router.post("/renew", validate(renewSubscriptionSchema), renewSubscription);
 

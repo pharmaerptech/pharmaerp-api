@@ -1,3 +1,5 @@
+// src/modules/core/access-control/services/memberAccess.service.js
+
 import ApiError from "../../../../utils/ApiError.js";
 
 import memberAccessRepository from "../repositories/memberAccess.repository.js";
@@ -6,15 +8,15 @@ import companyRepository from "../../../organization/companies/repositories/comp
 import branchRepository from "../../../organization/branches/repositories/branch.repository.js";
 import userRepository from "../../users/repositories/user.repository.js";
 
-
-import {
-  WORKSPACE_STATUS,
-  WORKSPACE_MEMBER_STATUS,
-} from "../../../organization/workspaces/constants/workspace.constant.js";
-
+import { WORKSPACE_MEMBER_STATUS } from "../../../organization/workspaces/constants/workspace.constant.js";
 import { COMPANY_STATUS } from "../../../organization/companies/constants/company.constant.js";
 import { BRANCH_STATUS } from "../../../organization/branches/constants/branch.constant.js";
-import { ALL_PERMISSIONS } from "../constants/permission.constant.js";
+import { ALL_PERMISSIONS, PERMISSIONS } from "../constants/permission.constant.js";
+import {
+  assertActorCanAssignRoleIds,
+  ensureWorkspaceMemberActor,
+} from "../utils/accessControlActor.helper.js";
+import { resolveEffectiveWorkAccess } from "../utils/workAccess.helper.js";
 
 const normalizeIds = (ids = []) => {
   if (!ids) return [];
@@ -24,42 +26,6 @@ const normalizeIds = (ids = []) => {
   }
 
   return ids;
-};
-
-const ensureWorkspaceAccess = async (workspaceId, userId) => {
-  const workspace = await workspaceRepository.findWorkspaceById(workspaceId);
-
-  if (!workspace || workspace.status === WORKSPACE_STATUS.DELETED) {
-    throw new ApiError(404, "Workspace not found");
-  }
-
-  if (workspace.status !== WORKSPACE_STATUS.ACTIVE) {
-    throw new ApiError(403, "Workspace is not active");
-  }
-
-  const member = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (!member || member.status !== WORKSPACE_MEMBER_STATUS.ACTIVE) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
-
-  return {
-    workspace,
-    member,
-  };
-};
-
-const ensureOwnerAccess = async (workspaceId, userId) => {
-  const { member } = await ensureWorkspaceAccess(workspaceId, userId);
-
-  if (!member.isOwner) {
-    throw new ApiError(403, "Only workspace owner can manage member access");
-  }
-
-  return member;
 };
 
 const validateCompanies = async (workspaceId, companyIds = []) => {
@@ -111,10 +77,10 @@ const createDefaultAccessForMember = async ({
   const normalizedBranchIds = normalizeIds(branchIds);
   const normalizedBranchAccess = Array.isArray(branchAccess) ? branchAccess : [];
 
-  // Extract branch IDs from branchAccess if branchIds is empty
-  const allBranchIds = normalizedBranchIds.length > 0 
-    ? normalizedBranchIds 
-    : normalizedBranchAccess.map(ba => ba.branchId).filter(Boolean);
+  const allBranchIds =
+    normalizedBranchIds.length > 0
+      ? normalizedBranchIds
+      : normalizedBranchAccess.map((ba) => ba.branchId).filter(Boolean);
 
   return memberAccessRepository.upsertMemberAccess({
     workspaceId,
@@ -133,8 +99,29 @@ const createDefaultAccessForMember = async ({
   });
 };
 
-const getMemberAccess = async (workspaceId, userId, memberUserId) => {
-  await ensureWorkspaceAccess(workspaceId, userId);
+const toSafeRole = (roleDoc) => {
+  if (!roleDoc) return null;
+  return roleDoc.toSafeObject ? roleDoc.toSafeObject() : roleDoc;
+};
+
+const getMemberAccess = async (
+  workspaceId,
+  userId,
+  memberUserId,
+  options = {},
+) => {
+  const actor = await ensureWorkspaceMemberActor(workspaceId, userId);
+
+  // Only owners/admins with member view rights can inspect other members' access
+  if (
+    String(userId) !== String(memberUserId) &&
+    !actor.isOwner &&
+    !actor.actorPermissions.includes("*") &&
+    !actor.actorPermissions.includes(PERMISSIONS.MEMBER_ACCESS_VIEW) &&
+    !actor.actorPermissions.includes(PERMISSIONS.WORKSPACE_MEMBER_VIEW)
+  ) {
+    throw new ApiError(403, "You do not have permission to view member access");
+  }
 
   const member = await workspaceRepository.findWorkspaceMember(
     workspaceId,
@@ -164,15 +151,46 @@ const getMemberAccess = async (workspaceId, userId, memberUserId) => {
   }
 
   const isOwner = Boolean(member.isOwner);
-  const role = member.roleId
-    ? member.roleId.toSafeObject
-      ? member.roleId.toSafeObject()
-      : member.roleId
-    : null;
-
-  const permissions = isOwner
+  const primaryRole = toSafeRole(member.roleId);
+  const primaryPermissions = isOwner
     ? ALL_PERMISSIONS
-    : role?.permissions || [];
+    : primaryRole?.permissions || [];
+
+  const workAccess = resolveEffectiveWorkAccess({
+    role: primaryRole,
+    permissions: primaryPermissions,
+    isOwner,
+  });
+
+  // Optional branch override inspection (never escalates level ceiling beyond primary role)
+  let activeRole = primaryRole;
+  let permissions = primaryPermissions;
+  const activeBranchId = options?.branchId ? String(options.branchId).trim() : null;
+
+  if (!isOwner && activeBranchId && Array.isArray(access?.branchAccess)) {
+    const branchMatch = access.branchAccess.find(
+      (ba) =>
+        String(ba.branchId?._id || ba.branchId || "") === activeBranchId &&
+        ba.roleId,
+    );
+    if (branchMatch?.roleId) {
+      const overrideRole = toSafeRole(branchMatch.roleId);
+      if (overrideRole) {
+        activeRole = overrideRole;
+        permissions = overrideRole.permissions || [];
+      }
+    }
+  }
+
+  const roleWithWorkAccess = activeRole
+    ? {
+        ...activeRole,
+        workModes: workAccess.allowedWorkModes,
+        workLevel: workAccess.highestWorkLevel,
+        allowedWorkLevels: workAccess.allowedWorkLevels,
+        workAccess,
+      }
+    : null;
 
   if (!access) {
     return {
@@ -186,9 +204,10 @@ const getMemberAccess = async (workspaceId, userId, memberUserId) => {
       branchAccess: [],
       companies: [],
       branches: [],
-      role,
+      role: roleWithWorkAccess,
       permissions,
       isOwner,
+      workAccess,
     };
   }
 
@@ -198,23 +217,50 @@ const getMemberAccess = async (workspaceId, userId, memberUserId) => {
     ...safeAccess,
     companies: safeAccess.companyIds || [],
     branches: safeAccess.branchIds || [],
-    role,
+    role: roleWithWorkAccess,
     permissions,
     isOwner,
+    workAccess,
   };
 };
 
 const getWorkspaceMemberAccessList = async (workspaceId, userId) => {
-  await ensureOwnerAccess(workspaceId, userId);
+  await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [
+      PERMISSIONS.MEMBER_ACCESS_VIEW,
+      PERMISSIONS.WORKSPACE_MEMBER_VIEW,
+    ],
+    forbiddenMessage:
+      "Only workspace owner or authorized admin can view member access list",
+  });
 
   const accessList = await memberAccessRepository.getWorkspaceMemberAccessList(
     workspaceId,
     {
-      populate: "workspaceMemberId userId companyIds branchIds branchAccess.branchId branchAccess.roleId",
+      populate: [
+        { path: "workspaceMemberId", populate: { path: "roleId" } },
+        "userId",
+        "companyIds",
+        "branchIds",
+        "branchAccess.branchId",
+        "branchAccess.roleId",
+      ],
     },
   );
 
-  return accessList.map((access) => access.toSafeObject());
+  return accessList.map((access) => {
+    const safeObj = access.toSafeObject();
+    const memberRole = toSafeRole(safeObj.workspaceMemberId?.roleId);
+    const memberIsOwner = Boolean(safeObj.workspaceMemberId?.isOwner);
+    return {
+      ...safeObj,
+      workAccess: resolveEffectiveWorkAccess({
+        role: memberRole,
+        permissions: memberRole?.permissions || [],
+        isOwner: memberIsOwner,
+      }),
+    };
+  });
 };
 
 const updateMemberAccess = async (
@@ -223,11 +269,19 @@ const updateMemberAccess = async (
   memberUserId,
   payload,
 ) => {
-  await ensureOwnerAccess(workspaceId, userId);
+  const actor = await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [
+      PERMISSIONS.MEMBER_ACCESS_UPDATE,
+      PERMISSIONS.WORKSPACE_MEMBER_UPDATE,
+    ],
+    forbiddenMessage:
+      "Only workspace owner or authorized admin can manage member access",
+  });
 
   const member = await workspaceRepository.findWorkspaceMember(
     workspaceId,
     memberUserId,
+    { populate: "roleId" },
   );
 
   if (!member) {
@@ -245,22 +299,40 @@ const updateMemberAccess = async (
   const accessAllCompanies = Boolean(payload.accessAllCompanies);
   const rawCompanyIds = accessAllCompanies ? [] : normalizeIds(payload.companyIds);
 
-  // If a member has 0 companies (accessAllCompanies is false and companyIds is empty),
-  // they cannot have access to any branches.
   const hasCompanyAccessScope = accessAllCompanies || rawCompanyIds.length > 0;
-  const accessAllBranches = hasCompanyAccessScope ? Boolean(payload.accessAllBranches) : false;
+  const accessAllBranches = hasCompanyAccessScope
+    ? Boolean(payload.accessAllBranches)
+    : false;
 
   const companyIds = rawCompanyIds;
-  const branchAccess = hasCompanyAccessScope && Array.isArray(payload.branchAccess) ? payload.branchAccess : [];
+  const branchAccess =
+    hasCompanyAccessScope && Array.isArray(payload.branchAccess)
+      ? payload.branchAccess
+      : [];
 
-  let branchIds = hasCompanyAccessScope && !accessAllBranches ? normalizeIds(payload.branchIds) : [];
-  if (hasCompanyAccessScope && !accessAllBranches && branchIds.length === 0 && branchAccess.length > 0) {
+  let branchIds =
+    hasCompanyAccessScope && !accessAllBranches
+      ? normalizeIds(payload.branchIds)
+      : [];
+  if (
+    hasCompanyAccessScope &&
+    !accessAllBranches &&
+    branchIds.length === 0 &&
+    branchAccess.length > 0
+  ) {
     branchIds = branchAccess.map((item) => item.branchId).filter(Boolean);
+  }
+
+  if (!actor.isOwner && branchAccess.length > 0) {
+    await assertActorCanAssignRoleIds({
+      workspaceId,
+      actor,
+      roleIds: branchAccess.map((item) => item?.roleId).filter(Boolean),
+    });
   }
 
   await validateCompanies(workspaceId, companyIds);
   await validateBranches(workspaceId, branchIds);
-
 
   const access = await memberAccessRepository.upsertMemberAccess({
     workspaceId,
@@ -330,7 +402,6 @@ const updateMemberAccess = async (
   }
 
   return access.toSafeObject();
-
 };
 
 const hasCompanyAccess = async (workspaceId, userId, companyId) => {

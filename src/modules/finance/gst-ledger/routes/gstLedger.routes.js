@@ -3,6 +3,7 @@ import { Router } from "express";
 import authMiddleware from "../../../../middlewares/auth.middleware.js";
 import workspaceContextMiddleware from "../../../../middlewares/workspaceContext.middleware.js";
 import companyContextMiddleware from "../../../../middlewares/companyContext.middleware.js";
+import { requireMethodWorkAccess } from "../../../../middlewares/workAccess.middleware.js";
 
 import {
   getGstr1Ledger,
@@ -19,6 +20,7 @@ const router = Router();
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);
+router.use(requireMethodWorkAccess({ minLevel: "company" }));
 
 // Routes
 router.get("/gstr-1/summary", getGstr1Summary);

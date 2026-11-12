@@ -15,6 +15,11 @@ import roleService from "../../../core/access-control/services/role.service.js";
 import memberAccessService from "../../../core/access-control/services/memberAccess.service.js";
 
 import { SYSTEM_ROLES } from "../../../core/access-control/constants/role.constant.js";
+import { PERMISSIONS } from "../../../core/access-control/constants/permission.constant.js";
+import {
+  assertActorCanAssignRoleIds,
+  ensureWorkspaceMemberActor,
+} from "../../../core/access-control/utils/accessControlActor.helper.js";
 import {
   WORKSPACE_MEMBER_STATUS,
   WORKSPACE_INVITATION_STATUS,
@@ -30,21 +35,10 @@ import WorkspaceInvitation from "../models/workspaceInvitation.model.js";
 const INVITATION_EXPIRY_HOURS = 72;
 
 const inviteMember = async (workspaceId, invitedBy, payload) => {
-  const currentMember = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    invitedBy,
-  );
-
-  if (
-    !currentMember ||
-    currentMember.status !== WORKSPACE_MEMBER_STATUS.ACTIVE
-  ) {
-    throw new ApiError(403, "You do not have access to this workspace");
-  }
-
-  if (!currentMember.isOwner) {
-    throw new ApiError(403, "Only workspace owner can invite members");
-  }
+  const actor = await ensureWorkspaceMemberActor(workspaceId, invitedBy, {
+    requiredPermissions: [PERMISSIONS.WORKSPACE_MEMBER_CREATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can invite members",
+  });
 
   // Enforce prerequisite: At least 1 company and 1 branch must exist
   const totalCompanies = await companyRepository.countWorkspaceCompanies(workspaceId);
@@ -117,6 +111,12 @@ const inviteMember = async (workspaceId, invitedBy, payload) => {
   const branchAccess = Array.isArray(payload.branchAccess)
     ? payload.branchAccess
     : [];
+
+  await assertActorCanAssignRoleIds({
+    workspaceId,
+    actor,
+    roleIds: [roleId, ...branchAccess.map((b) => b?.roleId)].filter(Boolean),
+  });
 
   const companyIds = Array.isArray(payload.companyIds)
     ? payload.companyIds
@@ -221,18 +221,13 @@ const getIncomingUserInvitations = async (userEmail) => {
 };
 
 const cancelInvitation = async (workspaceId, userId, invitationId) => {
-  const member = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (!member) {
-    throw new ApiError(403, "Access denied");
-  }
-
-  if (!member.isOwner) {
-    throw new ApiError(403, "Only workspace owner can cancel invitations");
-  }
+  await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [
+      PERMISSIONS.WORKSPACE_MEMBER_UPDATE,
+      PERMISSIONS.WORKSPACE_MEMBER_DELETE,
+    ],
+    forbiddenMessage: "Only workspace owner or authorized admin can cancel invitations",
+  });
 
   const invitation =
     await workspaceInvitationRepository.findInvitationById(invitationId);
@@ -255,14 +250,13 @@ const cancelInvitation = async (workspaceId, userId, invitationId) => {
 };
 
 const resendInvitation = async (workspaceId, userId, invitationId) => {
-  const member = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (!member || !member.isOwner) {
-    throw new ApiError(403, "Only workspace owner can resend invitations");
-  }
+  await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [
+      PERMISSIONS.WORKSPACE_MEMBER_CREATE,
+      PERMISSIONS.WORKSPACE_MEMBER_UPDATE,
+    ],
+    forbiddenMessage: "Only workspace owner or authorized admin can resend invitations",
+  });
 
   const invitation =
     await workspaceInvitationRepository.findInvitationById(invitationId);
@@ -323,14 +317,10 @@ This invitation expires in ${INVITATION_EXPIRY_HOURS} hours.
 };
 
 const updateInvitation = async (workspaceId, userId, invitationId, payload) => {
-  const member = await workspaceRepository.findWorkspaceMember(
-    workspaceId,
-    userId,
-  );
-
-  if (!member || !member.isOwner) {
-    throw new ApiError(403, "Only workspace owner can update invitations");
-  }
+  const actor = await ensureWorkspaceMemberActor(workspaceId, userId, {
+    requiredPermissions: [PERMISSIONS.WORKSPACE_MEMBER_UPDATE],
+    forbiddenMessage: "Only workspace owner or authorized admin can update invitations",
+  });
 
   const invitation =
     await workspaceInvitationRepository.findInvitationById(invitationId);
@@ -341,6 +331,21 @@ const updateInvitation = async (workspaceId, userId, invitationId, payload) => {
 
   if (invitation.workspaceId.toString() !== workspaceId.toString()) {
     throw new ApiError(403, "Invitation does not belong to workspace");
+  }
+
+  const candidateRoleIds = [
+    ...(payload.roleId !== undefined ? [payload.roleId] : []),
+    ...(Array.isArray(payload.branchAccess)
+      ? payload.branchAccess.map((b) => b?.roleId)
+      : []),
+  ].filter(Boolean);
+
+  if (candidateRoleIds.length > 0) {
+    await assertActorCanAssignRoleIds({
+      workspaceId,
+      actor,
+      roleIds: candidateRoleIds,
+    });
   }
 
   if (payload.roleId !== undefined) invitation.roleId = payload.roleId;

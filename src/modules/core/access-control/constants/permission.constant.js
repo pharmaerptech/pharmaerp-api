@@ -231,12 +231,82 @@ export const PERMISSIONS = {
   SUBSCRIPTION_UPDATE: "subscription:update",
 
   DASHBOARD_VIEW: "dashboard:view",
+
+  // Work Mode Permissions (strict explicit assignment — no hierarchy)
+  WORK_MODE_VIEW: "work-mode:view",
+  WORK_MODE_OPERATION: "work-mode:operation",
+
+  // Work Level Permissions (hierarchical: workspace > company > branch)
+  WORK_LEVEL_WORKSPACE: "work-level:workspace",
+  WORK_LEVEL_COMPANY: "work-level:company",
+  WORK_LEVEL_BRANCH: "work-level:branch",
+};
+
+export const WORK_MODE_PERMISSIONS = [
+  PERMISSIONS.WORK_MODE_VIEW,
+  PERMISSIONS.WORK_MODE_OPERATION,
+];
+
+export const WORK_LEVEL_PERMISSIONS = [
+  PERMISSIONS.WORK_LEVEL_WORKSPACE,
+  PERMISSIONS.WORK_LEVEL_COMPANY,
+  PERMISSIONS.WORK_LEVEL_BRANCH,
+];
+
+export const DEFAULT_ROLE_WORK_ACCESS = {
+  [SYSTEM_ROLES.OWNER]: {
+    workModes: ["view", "operation"],
+    workLevel: "workspace",
+  },
+  [SYSTEM_ROLES.ADMIN]: {
+    workModes: ["view", "operation"],
+    workLevel: "workspace",
+  },
+  [SYSTEM_ROLES.MANAGER]: {
+    workModes: ["view", "operation"],
+    workLevel: "company",
+  },
+  [SYSTEM_ROLES.ACCOUNTANT]: {
+    workModes: ["view", "operation"],
+    workLevel: "company",
+  },
+  [SYSTEM_ROLES.INVENTORY_MANAGER]: {
+    workModes: ["view", "operation"],
+    workLevel: "company",
+  },
+  [SYSTEM_ROLES.PHARMACIST]: {
+    workModes: ["view", "operation"],
+    workLevel: "branch",
+  },
+  [SYSTEM_ROLES.CASHIER]: {
+    workModes: ["operation"],
+    workLevel: "branch",
+  },
+  [SYSTEM_ROLES.SALESMAN]: {
+    workModes: ["operation"],
+    workLevel: "branch",
+  },
+  [SYSTEM_ROLES.STAFF]: {
+    workModes: ["view"],
+    workLevel: "branch",
+  },
 };
 
 export const ALL_PERMISSIONS = Object.values(PERMISSIONS);
 
-export const DEFAULT_ROLE_PERMISSIONS = {
-  [SYSTEM_ROLES.OWNER]: ALL_PERMISSIONS,
+const WORK_MODE_KEY_MAP = {
+  view: PERMISSIONS.WORK_MODE_VIEW,
+  operation: PERMISSIONS.WORK_MODE_OPERATION,
+};
+
+const WORK_LEVEL_KEY_MAP = {
+  workspace: PERMISSIONS.WORK_LEVEL_WORKSPACE,
+  company: PERMISSIONS.WORK_LEVEL_COMPANY,
+  branch: PERMISSIONS.WORK_LEVEL_BRANCH,
+};
+
+const BASE_DEFAULT_ROLE_PERMISSIONS = {
+
 
   [SYSTEM_ROLES.ADMIN]: [
     PERMISSIONS.WORKSPACE_VIEW,
@@ -293,7 +363,7 @@ export const DEFAULT_ROLE_PERMISSIONS = {
     PERMISSIONS.FUND_TRANSFER_VIEW,
     PERMISSIONS.CHEQUE_VIEW,
     PERMISSIONS.PAYMENT_QR_VIEW,
-    PERMISSIONS.CASH_DENOMINATION_VIEW,
+
     PERMISSIONS.SETTINGS_VIEW,
     PERMISSIONS.SETTINGS_UPDATE,
     PERMISSIONS.SUBSCRIPTION_VIEW,
@@ -379,8 +449,8 @@ export const DEFAULT_ROLE_PERMISSIONS = {
     PERMISSIONS.BILL_VIEW,
     PERMISSIONS.BILL_CREATE,
     PERMISSIONS.BRANCH_CASH_VIEW,
-    PERMISSIONS.CASH_DENOMINATION_VIEW,
-    PERMISSIONS.CASH_DENOMINATION_CREATE,
+
+
     PERMISSIONS.PAYMENT_QR_VIEW,
     PERMISSIONS.DASHBOARD_VIEW,
   ],
@@ -487,3 +557,33 @@ export const DEFAULT_ROLE_PERMISSIONS = {
     PERMISSIONS.PRODUCT_VIEW,
   ],
 };
+
+
+export const DEFAULT_ROLE_PERMISSIONS = Object.fromEntries(
+  Object.values(SYSTEM_ROLES).map((roleCode) => {
+    const access = DEFAULT_ROLE_WORK_ACCESS[roleCode] || {
+      workModes: ["view"],
+      workLevel: "branch",
+    };
+
+    const accessPerms = [
+      ...access.workModes.map((mode) => WORK_MODE_KEY_MAP[mode]).filter(Boolean),
+      WORK_LEVEL_KEY_MAP[access.workLevel],
+    ].filter(Boolean);
+
+    if (roleCode === SYSTEM_ROLES.OWNER) {
+      const nonWorkAccessPerms = ALL_PERMISSIONS.filter(
+        (permission) =>
+          !WORK_LEVEL_PERMISSIONS.includes(permission) &&
+          !WORK_MODE_PERMISSIONS.includes(permission),
+      );
+      return [
+        roleCode,
+        Array.from(new Set([...accessPerms, ...nonWorkAccessPerms])),
+      ];
+    }
+
+    const basePermissions = BASE_DEFAULT_ROLE_PERMISSIONS[roleCode] || [];
+    return [roleCode, Array.from(new Set([...accessPerms, ...basePermissions]))];
+  }),
+);
