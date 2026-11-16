@@ -58,15 +58,17 @@ const getLedgerEntries = async (
   const Account = mongoose.model("Account");
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { entries: [], total: 0, page: 1, limit: 20 };
   }
 
   const query = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
-    companyId: new mongoose.Types.ObjectId(companyId),
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    query.companyId = new mongoose.Types.ObjectId(companyId);
+  }
   
   console.log("getLedgerEntries query:", query);
 
@@ -93,20 +95,26 @@ const getLedgerEntries = async (
   // Branch isolation for Cash Accounts: STRICT whitelist approach
   if (filters.branchId) {
     const Account = mongoose.model("Account");
-    const allCashAccounts = await Account.find({
-      companyId: new mongoose.Types.ObjectId(companyId),
+    const accountFilter = {
       isActive: true,
-      accountCategory: "CASH"
-    }).select("_id");
+      accountCategory: "CASH",
+    };
+    if (query.companyId) {
+      accountFilter.companyId = query.companyId;
+    }
+    const allCashAccounts = await Account.find(accountFilter).select("_id");
     const allCashAccountIds = allCashAccounts.map(a => a._id.toString());
 
     const BranchCash = mongoose.model("BranchCash");
     const targetBranchId = new mongoose.Types.ObjectId(filters.branchId);
-    const validBranchCashAccounts = await BranchCash.find({
-      companyId: new mongoose.Types.ObjectId(companyId),
+    const branchCashFilter = {
       isActive: true,
-      branchId: targetBranchId
-    }).select("ledgerAccountId");
+      branchId: targetBranchId,
+    };
+    if (query.companyId) {
+      branchCashFilter.companyId = query.companyId;
+    }
+    const validBranchCashAccounts = await BranchCash.find(branchCashFilter).select("ledgerAccountId");
     const validLedgerIds = validBranchCashAccounts
       .map(c => c.ledgerAccountId?.toString())
       .filter(Boolean);

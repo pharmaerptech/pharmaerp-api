@@ -1,4 +1,4 @@
-﻿import mongoose from "mongoose";
+import mongoose from "mongoose";
 import BranchCash from "../models/branchCash.model.js";
 import BranchCashBalance from "../models/branchCashBalance.model.js";
 
@@ -96,7 +96,7 @@ const findBalanceByBranchId = async (branchId, companyId, options = {}) => {
 
 const findAllByCompany = async (workspaceId, companyId, options = {}) => {
   const { session } = options;
-  const query = BranchCash.find({ workspaceId, companyId, isActive: true });
+  const query = BranchCash.find({ workspaceId, companyId, isActive: true }).populate("branchId", "name branchCode");
   if (session) query.session(session);
   return query.lean(false);
 };

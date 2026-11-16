@@ -36,7 +36,7 @@ const router = Router();
 router.use(authMiddleware);
 router.use(workspaceContextMiddleware);
 router.use(companyContextMiddleware);
-router.use(requireMethodWorkAccess({ minLevel: "company", readModes: ["view"] }));
+router.use(requireMethodWorkAccess({ minLevel: "company" }));
 
 // ── Trial Balance ──────────────────────────────────────────────
 router.get(

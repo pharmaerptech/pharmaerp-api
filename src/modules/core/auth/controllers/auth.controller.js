@@ -41,11 +41,21 @@ export const logout = asyncHandler(async (req, res) => {
 });
 
 export const forgotPassword = asyncHandler(async (req, res) => {
-  await authService.forgotPassword(req.body);
+  const clientOrigin = req.get("origin") || req.headers.referer;
+  const result = await authService.forgotPassword({
+    ...req.body,
+    clientOrigin,
+  });
 
   return res
     .status(200)
-    .json(new ApiResponse(200, "If account exists, reset link has been sent"));
+    .json(
+      new ApiResponse(
+        200,
+        result.message || "Password reset link has been sent to your email",
+        result,
+      ),
+    );
 });
 
 export const resetPassword = asyncHandler(async (req, res) => {

@@ -67,9 +67,12 @@ const getFundTransfers = async (
 ) => {
   const query = {
     workspaceId,
-    companyId,
     isDeleted: false,
   };
+
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    query.companyId = companyId;
+  }
 
   if (filters.transferType) query.transferType = filters.transferType;
   if (filters.status) query.status = filters.status;

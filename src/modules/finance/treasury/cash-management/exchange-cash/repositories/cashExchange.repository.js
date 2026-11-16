@@ -4,6 +4,7 @@ import CashExchange from "../models/cashExchange.model.js";
 const POPULATE_CONFIG = [
   { path: "createdBy", select: "name email" },
   { path: "cancelledBy", select: "name email" },
+  { path: "branchId", select: "name branchCode" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -69,7 +70,7 @@ const getCashExchanges = async (
 
   if (filters.status) query.status = filters.status;
   if (filters.shiftId) query.shiftId = filters.shiftId;
-  if (filters.branchId) query.branchId = filters.branchId;
+  if (filters.branchId && filters.branchId !== "all") query.branchId = filters.branchId;
 
   if (filters.startDate || filters.endDate) {
     query.exchangeDate = {};

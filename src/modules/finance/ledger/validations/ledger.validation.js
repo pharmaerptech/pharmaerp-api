@@ -16,7 +16,8 @@ export const getLedgerQuerySchema = Joi.object({
   all: Joi.boolean().default(false).optional(),
   sort: Joi.string().trim().optional(),
   branchId: objectId.optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 export const recalculateLedgerSchema = Joi.object({
   accountId: objectId.required(),

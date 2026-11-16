@@ -31,7 +31,7 @@ const POPULATE_USERS = [
 ];
 
 const POPULATE_BRANCH = [
-  { path: "branchId", select: "name code" },
+  { path: "branchId", select: "name code branchCode" },
 ];
 
 const buildPopulate = () => [
@@ -95,7 +95,7 @@ const getSlips = async (workspaceId, companyId, filters = {}, options = {}) => {
   if (filters.status) query.status = filters.status;
   if (filters.fromCashAccountId) query.fromCashAccountId = filters.fromCashAccountId;
   if (filters.toBankAccountId) query.toBankAccountId = filters.toBankAccountId;
-  if (filters.branchId) query.branchId = filters.branchId;
+  if (filters.branchId && filters.branchId !== "all") query.branchId = filters.branchId;
   if (filters.dayClosingId) query.dayClosingId = filters.dayClosingId;
   if (filters.businessDayId) query.businessDayId = filters.businessDayId;
 

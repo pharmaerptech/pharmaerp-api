@@ -2,7 +2,13 @@ import asyncHandler from "../../../utils/asyncHandler.js";
 import ApiError from "../../../utils/ApiError.js";
 import { Shift } from "./shift.model.js";
 import { DayClosing } from "../day-closings/dayClosing.model.js";
-import { openShift as openShiftService, closeShift, cancelShift as cancelShiftService } from "./shift.service.js";
+import {
+  openShift as openShiftService,
+  closeShift,
+  cancelShift as cancelShiftService,
+  initiateShiftClose as initiateShiftCloseService,
+  abortShiftClose as abortShiftCloseService,
+} from "./shift.service.js";
 import SalesInvoice from "../../sales/invoices/models/invoice.model.js";
 import SalesReturn from "../../sales/returns/models/salesReturn.model.js";
 import FundTransfer from "../../finance/treasury/fund-transfers/models/fundTransfer.model.js";
@@ -18,9 +24,12 @@ export const createShift = asyncHandler(async (req, res, next) => {
   
   if (!branchId) return next(new ApiError(400, "Branch ID is missing in context"));
 
-  // Check by branchId only — ensure no shift is already open
-  const existingOpenShift = await Shift.findOne({ branchId, status: "open" });
-  if (existingOpenShift) {
+  // Check by branchId only — ensure no shift is already active (open or closing)
+  const existingActiveShift = await Shift.findOne({ branchId, status: { $in: ["open", "closing"] } });
+  if (existingActiveShift) {
+    if (existingActiveShift.status === "closing") {
+      return next(new ApiError(400, "The previous shift is currently in the closing process. Please complete or abort shift closing first."));
+    }
     return next(new ApiError(400, "A shift is already open for this branch. Please close it first."));
   }
 
@@ -65,7 +74,16 @@ export const createShift = asyncHandler(async (req, res, next) => {
 });
 
 export const listShifts = asyncHandler(async (req, res, next) => {
-  const branchId = req.headers["x-branch-id"] || req.branchId || req.query.branchId || null;
+  const rawBranchId =
+    req.query.branchId !== undefined
+      ? req.query.branchId
+      : (req.headers["x-branch-id"] || req.branchId || null);
+
+  const branchId =
+    rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+      ? rawBranchId
+      : null;
+
   const { date, status, sort = "desc" } = req.query;
   
   const filter = {
@@ -84,7 +102,8 @@ export const listShifts = asyncHandler(async (req, res, next) => {
   const shifts = await Shift.find(filter)
     .sort({ createdAt: sortOrder })
     .populate("openedBy", "fullName email")
-    .populate("closedBy", "fullName email");
+    .populate("closedBy", "fullName email")
+    .populate("branchId", "name branchCode");
     
   res.status(200).json({ success: true, data: shifts });
 });
@@ -92,7 +111,9 @@ export const listShifts = asyncHandler(async (req, res, next) => {
 export const getOpenShift = asyncHandler(async (req, res, next) => {
   const branchId = req.headers["x-branch-id"] || req.branchId || req.query.branchId || null;
   if (!branchId) return next(new ApiError(400, "branchId is required"));
-  const shift = await Shift.findOne({ branchId, status: "open" });
+  const shift = await Shift.findOne({ branchId, status: { $in: ["open", "closing"] } })
+    .populate("openedBy", "fullName firstName lastName email")
+    .populate("closingInitiatedBy", "fullName firstName lastName email");
   if (!shift) return next(new ApiError(404, "No open shift found"));
   res.status(200).json({ success: true, data: shift });
 });
@@ -1004,6 +1025,11 @@ export const updateShiftStatus = asyncHandler(async (req, res, next) => {
   const { status, actualClosingCashAmount, closingDenominations, note, carryForwardAmount, frozenDenominations } = req.body;
   const userId = req.user?._id;
   
+  if (status === "closing") {
+    const shift = await initiateShiftCloseService(req.params.id, userId);
+    return res.status(200).json({ success: true, data: shift });
+  }
+
   if (status === "closed") {
     const shift = await closeShift(
       req.params.id,
@@ -1018,6 +1044,19 @@ export const updateShiftStatus = asyncHandler(async (req, res, next) => {
   }
 
   const shift = await Shift.findByIdAndUpdate(req.params.id, { status, note }, { new: true });
+  res.status(200).json({ success: true, data: shift });
+});
+
+export const initiateShiftClose = asyncHandler(async (req, res, next) => {
+  const userId = req.user?._id;
+  const shift = await initiateShiftCloseService(req.params.id, userId);
+  res.status(200).json({ success: true, data: shift });
+});
+
+export const abortShiftClose = asyncHandler(async (req, res, next) => {
+  const userId = req.user?._id;
+  const userRole = req.user?.role;
+  const shift = await abortShiftCloseService(req.params.id, userId, userRole);
   res.status(200).json({ success: true, data: shift });
 });
 

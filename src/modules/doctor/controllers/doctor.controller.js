@@ -16,9 +16,14 @@ export const createDoctor = asyncHandler(async (req, res) => {
 });
 
 export const getDoctors = asyncHandler(async (req, res) => {
+  const companyId =
+    req.query.companyId && req.query.companyId !== "all"
+      ? req.query.companyId
+      : req.companyId;
+
   const result = await doctorService.getDoctors(
     req.workspaceId,
-    req.companyId,
+    companyId || null,
     req.query
   );
 

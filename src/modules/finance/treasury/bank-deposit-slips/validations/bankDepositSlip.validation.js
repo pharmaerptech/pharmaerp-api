@@ -108,7 +108,7 @@ export const getBankDepositSlipsQuerySchema = Joi.object({
 
   fromCashAccountId: objectId.optional(),
   toBankAccountId: objectId.optional(),
-  branchId: objectId.optional(),
+  branchId: Joi.string().trim().allow("all", "", null).optional(),
   dayClosingId: objectId.allow(null, "").optional(),
   businessDayId: objectId.allow(null, "").optional(),
 
@@ -141,7 +141,7 @@ export const withdrawFromSlipSchema = Joi.object({
 // ── Cash In Transit Query ──────────────────────────────────────────────────────
 
 export const getCashInTransitQuerySchema = Joi.object({
-  branchId: objectId.optional(),
+  branchId: Joi.string().trim().allow("all", "", null).optional(),
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(200).default(50).optional(),
 });

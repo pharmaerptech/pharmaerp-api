@@ -78,5 +78,6 @@ export const getPurchaseBillsQuerySchema = Joi.object({
   sort: Joi.string().trim().max(50).optional(),
   search: Joi.string().trim().max(100).allow("").optional(),
   supplierId: objectId.optional(),
+  branchId: Joi.string().trim().allow("all", "", null).optional(),
   status: Joi.string().trim().optional(),
 });

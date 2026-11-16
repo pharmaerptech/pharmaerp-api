@@ -62,9 +62,12 @@ const saveSupplier = async (supplier) => {
 const buildSupplierQuery = (workspaceId, companyId, filters) => {
   const query = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
-    companyId: new mongoose.Types.ObjectId(companyId),
     isDeleted: false,
   };
+
+  if (companyId) {
+    query.companyId = new mongoose.Types.ObjectId(companyId);
+  }
 
   if (filters.status) {
     query.status = filters.status;
@@ -103,10 +106,10 @@ const buildSupplierQuery = (workspaceId, companyId, filters) => {
 };
 
 const getSuppliers = async (workspaceId, companyId, filters = {}, options = {}) => {
-  if (
-    !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
-  ) {
+  if (!mongoose.Types.ObjectId.isValid(workspaceId)) {
+    return { suppliers: [], total: 0, page: 1, limit: 20 };
+  }
+  if (companyId && !mongoose.Types.ObjectId.isValid(companyId)) {
     return { suppliers: [], total: 0, page: 1, limit: 20 };
   }
 
@@ -120,6 +123,7 @@ const getSuppliers = async (workspaceId, companyId, filters = {}, options = {}) 
   const [suppliers, total] = await Promise.all([
     Supplier.find(query)
       .populate("branchId", "name")
+      .populate("companyId", "name legalName code")
       .sort(sort)
       .skip(skip)
       .limit(limit)

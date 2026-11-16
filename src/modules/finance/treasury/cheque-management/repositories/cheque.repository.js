@@ -83,7 +83,10 @@ const getCheques = async (
   filters = {},
   options = {},
 ) => {
-  const query = { workspaceId, companyId, isDeleted: false };
+  const query = { workspaceId, isDeleted: false };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    query.companyId = companyId;
+  }
 
   const resolvedChequeType = filters.chequeType || filters.type;
   if (resolvedChequeType) query.chequeType = resolvedChequeType;

@@ -616,8 +616,18 @@ const deleteBranch = async (branchId, companyId, workspaceId, userId) => {
     throw new ApiError(404, "Branch not found");
   }
 
+  // Minimum Invariant: At least 1 branch must always remain in the workspace
+  const totalBranches = await branchRepository.countWorkspaceBranches(workspaceId);
+  if (totalBranches <= 1) {
+    throw new ApiError(
+      400,
+      "Cannot delete the only branch in the workspace. At least one branch must remain.",
+    );
+  }
+
+  // If this branch is primary, auto-promote another active branch in the same company
   if (branch.isPrimary) {
-    throw new ApiError(400, "Primary branch cannot be deleted");
+    await branchRepository.promoteNextPrimaryBranch(companyId, branch._id);
   }
 
   const deletedBranch = await branchRepository.deleteBranchById(

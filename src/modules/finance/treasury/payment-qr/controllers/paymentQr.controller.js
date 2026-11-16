@@ -23,15 +23,18 @@ export const createPaymentQr = asyncHandler(async (req, res) => {
 });
 
 export const getPaymentQrs = asyncHandler(async (req, res) => {
-  const branchId =
-    req.query.branchId ||
-    req.headers["x-branch-id"] ||
-    req.branchId ||
-    null;
+  const rawBranchId = req.query.branchId !== undefined
+    ? req.query.branchId
+    : (req.headers["x-branch-id"] || req.branchId || null);
+  const branchId = rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+    ? rawBranchId
+    : null;
 
   const query = { ...req.query };
-  if (!query.branchId && branchId && branchId !== "all") {
+  if (branchId) {
     query.branchId = branchId;
+  } else {
+    delete query.branchId;
   }
 
   const result = await paymentQrService.getPaymentQrs(
@@ -104,11 +107,12 @@ export const getStats = asyncHandler(async (req, res) => {
 });
 
 export const getUpiTransactions = asyncHandler(async (req, res) => {
-  const branchId =
-    req.query.branchId ||
-    req.headers["x-branch-id"] ||
-    req.branchId ||
-    null;
+  const rawBranchId = req.query.branchId !== undefined
+    ? req.query.branchId
+    : (req.headers["x-branch-id"] || req.branchId || null);
+  const branchId = rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+    ? rawBranchId
+    : null;
 
   const result = await paymentQrStatsService.getUpiTransactions(
     req.workspaceId,

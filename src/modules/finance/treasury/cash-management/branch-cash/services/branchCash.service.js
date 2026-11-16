@@ -367,7 +367,8 @@ const getAllByCompany = async (workspaceId, companyId) => {
   // or resolve them in a batch. For simplicity, we just pass null here since getAllByCompany is for overview.
 
   return cashDocs.map((c) => {
-    const balance = balanceMap.get(c.branchId.toString());
+    const bId = c.branchId?._id ? c.branchId._id.toString() : c.branchId.toString();
+    const balance = balanceMap.get(bId);
     return buildCashResponse(c, balance, null);
   });
 };

@@ -386,20 +386,41 @@ const recordCustomerReturn = async (
     let resolvedBusinessDayId = null;
 
     if (resolvedBranchId) {
-      const openBusinessDay = await BusinessDay.findOne({
-        branchId: resolvedBranchId,
-        status: "open",
-      });
+      const [activeBusinessDay, candidateShift] = await Promise.all([
+        BusinessDay.findOne({
+          branchId: resolvedBranchId,
+          status: { $in: ["open", "closing"] },
+        }),
+        resolvedShiftId
+          ? Shift.findById(resolvedShiftId)
+          : Shift.findOne({
+              branchId: resolvedBranchId,
+              status: { $in: ["open", "closing"] },
+            }),
+      ]);
 
-      const candidateShift = resolvedShiftId
-        ? await Shift.findById(resolvedShiftId)
-        : await Shift.findOne({
-            branchId: resolvedBranchId,
-            status: "open",
-          });
+      const isDayClosed = !activeBusinessDay || activeBusinessDay.status === "closed";
+      const isDayClosing = activeBusinessDay && activeBusinessDay.status === "closing";
+      const isShiftClosed = !candidateShift || candidateShift.status === "closed";
+      const isShiftClosing = candidateShift && candidateShift.status === "closing";
 
-      const isDayClosed = !openBusinessDay;
-      const isShiftClosed = !candidateShift || candidateShift.status !== "open";
+      if (isDayClosing) {
+        const err = new ApiError(
+          409,
+          "Cannot process return. Business Day closing has been initiated on another device. Returns are locked."
+        );
+        err.code = "BUSINESS_DAY_CLOSING_IN_PROGRESS";
+        throw err;
+      }
+
+      if (isShiftClosing) {
+        const err = new ApiError(
+          409,
+          "Cannot process return. Shift closing has been initiated on another device. Returns are locked."
+        );
+        err.code = "SHIFT_CLOSING_IN_PROGRESS";
+        throw err;
+      }
 
       if (isDayClosed && isShiftClosed) {
         throw new ApiError(
@@ -415,14 +436,14 @@ const recordCustomerReturn = async (
         );
       }
 
-      if (isShiftClosed) {
+      if (isShiftClosed || candidateShift.status !== "open") {
         throw new ApiError(
           400,
           "Cannot process return. The shift is closed. Please open a new shift before processing returns."
         );
       }
 
-      resolvedBusinessDayId = openBusinessDay._id;
+      resolvedBusinessDayId = activeBusinessDay._id;
       resolvedShiftId = candidateShift._id;
     }
 

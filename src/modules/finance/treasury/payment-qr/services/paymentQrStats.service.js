@@ -386,9 +386,10 @@ const getUpiTransactions = async (workspaceId, companyId, branchId, query = {}) 
     }
 
     const invoices = await SalesInvoice.find(invMatch)
-      .select("invoiceNo date grandTotal subtotal tax discount paymentMethod paymentQrId payments customerId shiftId status items createdByName createdByEmail createdAt updatedAt")
+      .select("invoiceNo date grandTotal subtotal tax discount paymentMethod paymentQrId payments customerId shiftId branchId status items createdByName createdByEmail createdAt updatedAt")
       .populate({ path: "customerId", select: "name mobile phone" })
       .populate({ path: "shiftId", select: "shiftNo shiftName openPeriod status" })
+      .populate({ path: "branchId", select: "name branchCode" })
       .lean();
 
     for (const inv of invoices) {
@@ -448,6 +449,7 @@ const getUpiTransactions = async (workspaceId, companyId, branchId, query = {}) 
           rawId: inv._id,
           sourceType: "INVOICE",
           referenceNo: inv.invoiceNo,
+          branchId: inv.branchId || null,
           date: actualDate, // Exact actual transaction timestamp with accurate date & time
           upiAmount: upiPortion,
           totalAmount: Number(inv.grandTotal || 0),
@@ -491,10 +493,11 @@ const getUpiTransactions = async (workspaceId, companyId, branchId, query = {}) 
     }
 
     const creditDocs = await CustomerCreditTransaction.find(creditMatch)
-      .select("customerId invoiceNo invoiceAmount balanceDue settlements")
+      .select("customerId invoiceNo invoiceAmount balanceDue settlements branchId")
       .populate({ path: "customerId", select: "name mobile phone" })
       .populate({ path: "settlements.shiftId", select: "shiftNo shiftName" })
       .populate({ path: "settlements.createdBy", select: "name email" })
+      .populate({ path: "branchId", select: "name branchCode" })
       .lean();
 
     for (const doc of creditDocs) {
@@ -521,6 +524,7 @@ const getUpiTransactions = async (workspaceId, companyId, branchId, query = {}) 
           rawId: s._id,
           sourceType: "CREDIT_SETTLEMENT",
           referenceNo: doc.invoiceNo ? `SETTLE-${doc.invoiceNo}` : `SETTLE-${String(s._id).slice(-6).toUpperCase()}`,
+          branchId: doc.branchId || null,
           date: actualDate, // Exact actual settlement execution timestamp
           upiAmount: Number(s.settledAmount || 0),
           totalAmount: Number(doc.invoiceAmount || s.settledAmount || 0),
@@ -600,10 +604,11 @@ const getUpiTransactions = async (workspaceId, companyId, branchId, query = {}) 
     }
 
     const advances = await CustomerAdvanceTransaction.find(advMatch)
-      .select("customerId amount balanceAfter referenceType referenceId referenceNumber paymentQrId paymentDetails shiftId narration status createdBy createdAt")
+      .select("customerId amount balanceAfter referenceType referenceId referenceNumber paymentQrId paymentDetails shiftId branchId narration status createdBy createdAt")
       .populate({ path: "customerId", select: "name mobile phone" })
       .populate({ path: "shiftId", select: "shiftNo shiftName" })
       .populate({ path: "createdBy", select: "name email" })
+      .populate({ path: "branchId", select: "name branchCode" })
       .lean();
 
     for (const adv of advances) {
@@ -623,6 +628,7 @@ const getUpiTransactions = async (workspaceId, companyId, branchId, query = {}) 
         rawId: adv._id,
         sourceType: "ADVANCE_RECEIPT",
         referenceNo: adv.referenceNumber || `ADV-${String(adv._id).slice(-6).toUpperCase()}`,
+        branchId: adv.branchId || null,
         date: actualDate, // Exact actual advance deposit timestamp
         upiAmount: Number(adv.amount || 0),
         totalAmount: Number(adv.amount || 0),

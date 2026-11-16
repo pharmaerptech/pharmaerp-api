@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import ApiError from "../../../../utils/ApiError.js";
 
 import companyRepository from "../repositories/company.repository.js";
+import branchRepository from "../../branches/repositories/branch.repository.js";
 import workspaceRepository from "../../workspaces/repositories/workspace.repository.js";
 import memberAccessRepository from "../../../core/access-control/repositories/memberAccess.repository.js";
 import coaSeederService from "../../../finance/chart-of-accounts/services/coaSeeder.service.js";
@@ -52,9 +53,22 @@ const ensureWorkspaceAccess = async (workspaceId, userId) => {
 const createCompany = async (workspaceId, userId, payload) => {
   await ensureWorkspaceAccess(workspaceId, userId);
 
+  // Enforce Sequential Setup: Cannot create 2nd company until first branch setup is complete
+  const existingCompaniesCount = await companyRepository.countWorkspaceCompanies(workspaceId);
+  if (existingCompaniesCount >= 1) {
+    const branchesCount = await branchRepository.countWorkspaceBranches(workspaceId);
+    if (branchesCount === 0) {
+      throw new ApiError(
+        400,
+        "You must complete initial setup by creating your first branch before adding another company.",
+      );
+    }
+  }
+
   const {
     name,
     type,
+    industry,
     logo,
     email,
     phones,
@@ -97,6 +111,7 @@ const createCompany = async (workspaceId, userId, payload) => {
       name,
       slug,
       type,
+      industry: industry || null,
       logo,
       email,
       phones,
@@ -388,6 +403,7 @@ const updateCompany = async (companyId, workspaceId, userId, payload) => {
   const allowedFields = [
     "name",
     "type",
+    "industry",
     "logo",
     "email",
     "phones",
@@ -448,6 +464,25 @@ const deleteCompany = async (companyId, workspaceId, userId) => {
 
   if (!member.isOwner) {
     throw new ApiError(403, "Only workspace owner can delete company");
+  }
+
+  // Minimum Invariant: At least 1 company must always remain in the workspace
+  const totalCompanies = await companyRepository.countWorkspaceCompanies(workspaceId);
+  if (totalCompanies <= 1) {
+    throw new ApiError(
+      400,
+      "Cannot delete the only company in the workspace. At least one company must remain.",
+    );
+  }
+
+  // Minimum Invariant: At least 1 branch must always remain in the workspace
+  const totalWorkspaceBranches = await branchRepository.countWorkspaceBranches(workspaceId);
+  const companyBranchesCount = await branchRepository.countCompanyBranches(companyId);
+  if (totalWorkspaceBranches - companyBranchesCount < 1) {
+    throw new ApiError(
+      400,
+      "Cannot delete this company because it contains the only active branch in the workspace. Create a branch in another company first.",
+    );
   }
 
   const company = await companyRepository.deleteCompanyById(

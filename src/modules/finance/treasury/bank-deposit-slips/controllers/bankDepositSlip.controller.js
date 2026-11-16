@@ -6,11 +6,15 @@ import asyncHandler from "../../../../../utils/asyncHandler.js";
 
 export const createBankDepositSlip = asyncHandler(async (req, res) => {
   const { workspaceId, companyId, user } = req;
+  const payload = {
+    ...req.body,
+    branchId: req.body.branchId || req.headers["x-branch-id"] || req.branchId,
+  };
   const slip = await bankDepositSlipService.createBankDepositSlip(
     workspaceId,
     companyId,
     user._id,
-    req.body,
+    payload,
   );
   return res
     .status(201)
@@ -21,10 +25,22 @@ export const createBankDepositSlip = asyncHandler(async (req, res) => {
 
 export const getBankDepositSlips = asyncHandler(async (req, res) => {
   const { workspaceId, companyId } = req;
+  const rawBranchId = req.query.branchId !== undefined
+    ? req.query.branchId
+    : (req.headers["x-branch-id"] || req.branchId || null);
+  const branchId = rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+    ? rawBranchId
+    : null;
+
+  const query = {
+    ...req.query,
+    branchId: branchId || undefined,
+  };
+
   const result = await bankDepositSlipService.getBankDepositSlips(
     workspaceId,
     companyId,
-    req.query,
+    query,
   );
   return res
     .status(200)
@@ -99,10 +115,22 @@ export const withdrawFromBankDepositSlip = asyncHandler(async (req, res) => {
 
 export const getCashInTransit = asyncHandler(async (req, res) => {
   const { workspaceId, companyId } = req;
+  const rawBranchId = req.query.branchId !== undefined
+    ? req.query.branchId
+    : (req.headers["x-branch-id"] || req.branchId || null);
+  const branchId = rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+    ? rawBranchId
+    : null;
+
+  const query = {
+    ...req.query,
+    branchId: branchId || undefined,
+  };
+
   const result = await bankDepositSlipService.getCashInTransit(
     workspaceId,
     companyId,
-    req.query,
+    query,
   );
   return res
     .status(200)

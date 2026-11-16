@@ -19,12 +19,22 @@ const getCompanyIdFromRequest = (req) => {
 const companyContextMiddleware = asyncHandler(async (req, res, next) => {
   const companyId = getCompanyIdFromRequest(req);
 
-  if (!companyId) {
-    throw new ApiError(400, "Company id is required");
-  }
-
   if (!req.workspaceId) {
     throw new ApiError(400, "Workspace context is required");
+  }
+
+  // If request is from Workspace Level (or explicit "all" scope) and no specific company is selected
+  const isWorkspaceLevel =
+    req.headers["x-work-level"] === "workspace" ||
+    req.query.scope === "workspace";
+
+  if (!companyId || companyId === "all" || companyId === "undefined" || companyId === "null") {
+    if (isWorkspaceLevel) {
+      req.company = null;
+      req.companyId = null;
+      return next();
+    }
+    throw new ApiError(400, "Company id is required");
   }
 
   const company = await companyRepository.findCompanyByIdAndWorkspace(

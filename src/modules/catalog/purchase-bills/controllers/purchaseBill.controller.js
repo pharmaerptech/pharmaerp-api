@@ -42,10 +42,20 @@ export const updatePurchaseBill = asyncHandler(async (req, res) => {
 });
 
 export const getPurchaseBills = asyncHandler(async (req, res) => {
+  const rawBranchId =
+    req.query.branchId !== undefined
+      ? req.query.branchId
+      : (req.headers["x-branch-id"] || req.branchId || null);
+
+  const branchId =
+    rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+      ? rawBranchId
+      : undefined;
+
   const result = await purchaseBillService.getPurchaseBills(
     req.workspaceId,
     req.companyId,
-    req.query
+    { ...req.query, branchId }
   );
 
   return res

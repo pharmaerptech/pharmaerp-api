@@ -341,13 +341,17 @@ const getCustomers = async (workspaceId, companyId, query = {}) => {
 
   if (customerIds.length > 0) {
     try {
+      const matchCriteria = {
+        customerId: { $in: customerIds },
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        ...(companyId ? { companyId: new mongoose.Types.ObjectId(companyId) } : {}),
+      };
+
       const [advanceAgg, creditAgg] = await Promise.all([
         CustomerAdvanceTransaction.aggregate([
           {
             $match: {
-              customerId: { $in: customerIds },
-              companyId: new mongoose.Types.ObjectId(companyId),
-              workspaceId: new mongoose.Types.ObjectId(workspaceId),
+              ...matchCriteria,
               status: "ACTIVE",
             },
           },
@@ -379,9 +383,7 @@ const getCustomers = async (workspaceId, companyId, query = {}) => {
         CustomerCreditTransaction.aggregate([
           {
             $match: {
-              customerId: { $in: customerIds },
-              companyId: new mongoose.Types.ObjectId(companyId),
-              workspaceId: new mongoose.Types.ObjectId(workspaceId),
+              ...matchCriteria,
               status: { $in: ["PENDING", "PARTIAL"] },
             },
           },
@@ -420,12 +422,16 @@ const getCustomers = async (workspaceId, companyId, query = {}) => {
   // Enrich global stats with real-time global advance and credit totals
   const stats = { ...(result.stats || {}) };
   try {
+    const globalMatchCriteria = {
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      ...(companyId ? { companyId: new mongoose.Types.ObjectId(companyId) } : {}),
+    };
+
     const [globalAdvAgg, globalCreditAgg] = await Promise.all([
       CustomerAdvanceTransaction.aggregate([
         {
           $match: {
-            companyId: new mongoose.Types.ObjectId(companyId),
-            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            ...globalMatchCriteria,
             status: "ACTIVE",
           },
         },
@@ -457,8 +463,7 @@ const getCustomers = async (workspaceId, companyId, query = {}) => {
       CustomerCreditTransaction.aggregate([
         {
           $match: {
-            companyId: new mongoose.Types.ObjectId(companyId),
-            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            ...globalMatchCriteria,
             status: { $in: ["PENDING", "PARTIAL"] },
           },
         },

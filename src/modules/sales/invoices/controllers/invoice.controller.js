@@ -50,11 +50,15 @@ export const getCustomerSales = asyncHandler(async (req, res) => {
 });
 
 export const getAllCustomerSales = asyncHandler(async (req, res) => {
+  const rawBranchId =
+    req.query.branchId !== undefined
+      ? req.query.branchId
+      : (req.headers["x-branch-id"] || req.branchId || null);
+
   const branchId =
-    req.headers["x-branch-id"] ||
-    req.branchId ||
-    req.query.branchId ||
-    null;
+    rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+      ? rawBranchId
+      : null;
 
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;

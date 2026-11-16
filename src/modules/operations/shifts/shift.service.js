@@ -33,10 +33,19 @@ export const openShift = async (data) => {
   if (!openDay) {
     throw new ApiError(400, "No open Business Day found for this branch. Please open a Business Day first before starting a shift.");
   }
+  if (openDay.status === "closing") {
+    throw new ApiError(400, "Business Day closing is currently in progress. Cannot open a new shift.");
+  }
 
-  // Guard 2: Ensure no currently open shift for this branch
-  const existingOpenShift = await Shift.findOne({ branchId, status: "open" });
-  if (existingOpenShift) {
+  // Guard 2: Ensure no currently active shift (open or closing) for this branch
+  const existingActiveShift = await Shift.findOne({
+    branchId,
+    status: { $in: ["open", "closing"] },
+  });
+  if (existingActiveShift) {
+    if (existingActiveShift.status === "closing") {
+      throw new ApiError(400, "The previous shift is currently in the closing process. Please complete or abort shift closing first.");
+    }
     throw new ApiError(400, "An open shift already exists for this branch. Please close it first.");
   }
 
@@ -125,7 +134,9 @@ export const closeShift = async (
 ) => {
   const shift = await Shift.findById(shiftId);
   if (!shift) throw new ApiError(404, "Shift not found");
-  if (shift.status !== "open") throw new ApiError(400, "Shift is not open");
+  if (shift.status !== "open" && shift.status !== "closing") {
+    throw new ApiError(400, "Shift is not active or ready for closing");
+  }
 
   // Validate carryForwardAmount
   const safeCarry = Math.max(0, Number(carryForwardAmount) || 0);
@@ -1094,5 +1105,39 @@ export const cancelShift = async (shiftId, userId, note) => {
   if (note) shift.note = note;
 
   await shift.save();
+  return shift;
+};
+
+export const initiateShiftClose = async (shiftId, userId) => {
+  const shift = await Shift.findById(shiftId);
+  if (!shift) throw new ApiError(404, "Shift not found");
+  if (shift.status === "closed") throw new ApiError(400, "Shift is already closed");
+  if (shift.status === "cancelled") throw new ApiError(400, "Cancelled shift cannot be closed");
+
+  // If already in closing state, return populated shift so user/supervisor can proceed
+  if (shift.status === "closing") {
+    return shift.populate("closingInitiatedBy", "fullName firstName lastName email");
+  }
+
+  shift.status = "closing";
+  shift.closingInitiatedAt = new Date();
+  shift.closingInitiatedBy = userId;
+  await shift.save();
+
+  return shift.populate("closingInitiatedBy", "fullName firstName lastName email");
+};
+
+export const abortShiftClose = async (shiftId, userId, userRole) => {
+  const shift = await Shift.findById(shiftId);
+  if (!shift) throw new ApiError(404, "Shift not found");
+  if (shift.status !== "closing") {
+    throw new ApiError(400, "Shift is not currently in closing state");
+  }
+
+  shift.status = "open";
+  shift.closingInitiatedAt = null;
+  shift.closingInitiatedBy = null;
+  await shift.save();
+
   return shift;
 };

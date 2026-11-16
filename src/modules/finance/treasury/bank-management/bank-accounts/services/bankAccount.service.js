@@ -207,9 +207,10 @@ const getBankAccounts = async (workspaceId, companyId, query = {}) => {
       const ledgerAccountId = b.ledgerAccountId?._id || b.ledgerAccountId;
       let balance = 0;
       if (ledgerAccountId) {
+        const targetCompanyId = b.companyId?._id || b.companyId || companyId;
         const accountBalanceObj = await accountBalanceRepository.findBalanceByAccountId(
           ledgerAccountId,
-          companyId,
+          targetCompanyId,
           workspaceId
         );
         if (accountBalanceObj) {

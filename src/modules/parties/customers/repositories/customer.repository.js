@@ -78,18 +78,21 @@ const saveCustomer = async (customer) => {
 };
 
 const getCustomers = async (workspaceId, companyId, filters = {}, options = {}) => {
-  if (
-    !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
-  ) {
+  if (!mongoose.Types.ObjectId.isValid(workspaceId)) {
+    return { customers: [], total: 0, page: 1, limit: 20 };
+  }
+  if (companyId && !mongoose.Types.ObjectId.isValid(companyId)) {
     return { customers: [], total: 0, page: 1, limit: 20 };
   }
 
   const query = {
     workspaceId,
-    companyId,
     isDeleted: false,
   };
+
+  if (companyId) {
+    query.companyId = companyId;
+  }
 
   if (filters.isWalkIn !== undefined) {
     query.isWalkIn = filters.isWalkIn === true || filters.isWalkIn === "true";
@@ -153,6 +156,7 @@ const getCustomers = async (workspaceId, companyId, filters = {}, options = {}) 
   const [customers, total] = await Promise.all([
     Customer.find(query)
       .populate("branchId", "name")
+      .populate("companyId", "name legalName code")
       .sort(sort)
       .skip(skip)
       .limit(limit)

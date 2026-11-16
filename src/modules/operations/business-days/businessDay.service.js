@@ -69,7 +69,7 @@ const tomorrowCanonical = (clientDate) => {
  * Used as a shared guard across Shift and BankDepositSlip services.
  */
 export const getOpenBusinessDay = async (branchId) => {
-  return BusinessDay.findOne({ branchId, status: "open" });
+  return BusinessDay.findOne({ branchId, status: { $in: ["open", "closing"] } });
 };
 
 /**
@@ -86,11 +86,16 @@ export const getSuggestedBusinessDate = async (branchId, clientDate) => {
   const today = todayCanonical(clientDate);
   const tomorrow = tomorrowCanonical(clientDate);
 
-  const openDay = await BusinessDay.findOne({ branchId, status: "open" }).lean();
+  const openDay = await BusinessDay.findOne({
+    branchId,
+    status: { $in: ["open", "closing"] },
+  }).lean();
   if (openDay) {
     return {
       suggestedDate: null,
-      reason: "A Business Day is already open. Close it before opening a new one.",
+      reason: openDay.status === "closing"
+        ? "A Business Day is currently in the closing process. Please complete or abort day closing before opening a new one."
+        : "A Business Day is already open. Close it before opening a new one.",
       hasOpenDay: true,
       openDayId: openDay._id,
       openDayBusinessDate: openDay.businessDate,
@@ -146,12 +151,22 @@ export const getSuggestedBusinessDate = async (branchId, clientDate) => {
 export const openBusinessDay = async (data) => {
   const { workspaceId, companyId, branchId, businessDate, clientDate, createdBy, note } = data;
 
-  // Guard 1: Only one open Business Day per branch
-  const existingOpen = await BusinessDay.findOne({ branchId, status: "open" });
-  if (existingOpen) {
+  // Guard 1: Only one active (open or closing) Business Day per branch
+  const existingActive = await BusinessDay.findOne({
+    branchId,
+    status: { $in: ["open", "closing"] },
+  });
+  if (existingActive) {
+    if (existingActive.status === "closing") {
+      throw new ApiError(
+        400,
+        `A Business Day is currently in the closing process for this branch (${existingActive.businessDayNo}). ` +
+        `Please complete or abort day closing before opening a new one.`
+      );
+    }
     throw new ApiError(
       400,
-      `A Business Day is already open for this branch (${existingOpen.businessDayNo}). ` +
+      `A Business Day is already open for this branch (${existingActive.businessDayNo}). ` +
       `Please close it before opening a new one.`
     );
   }
@@ -349,14 +364,14 @@ export const closeBusinessDay = async (businessDayId, userId, payload = {}) => {
   if (businessDay.status === "cancelled") throw new ApiError(400, "Cancelled Business Day cannot be closed");
 
   // Guard: All linked shifts must be closed
-  const openShifts = await Shift.find({
+  const activeShifts = await Shift.find({
     businessDayId: businessDay._id,
-    status: "open",
+    status: { $in: ["open", "closing"] },
   });
-  if (openShifts.length > 0) {
+  if (activeShifts.length > 0) {
     throw new ApiError(
       400,
-      `Cannot close the Business Day. ${openShifts.length} shift(s) are still open. ` +
+      `Cannot close the Business Day. ${activeShifts.length} shift(s) are still active (open or closing). ` +
       `Please close all shifts first.`
     );
   }
@@ -545,5 +560,50 @@ export const cancelBusinessDay = async (businessDayId, userId, note) => {
   if (note) businessDay.note = note;
 
   await businessDay.save();
+  return businessDay;
+};
+
+export const initiateBusinessDayClose = async (businessDayId, userId) => {
+  const businessDay = await BusinessDay.findById(businessDayId);
+  if (!businessDay) throw new ApiError(404, "Business Day not found");
+  if (businessDay.status === "closed") throw new ApiError(400, "Business Day is already closed");
+  if (businessDay.status === "cancelled") throw new ApiError(400, "Cancelled Business Day cannot be closed");
+
+  // Guard: Verify all linked shifts are closed
+  const activeShifts = await Shift.find({
+    businessDayId: businessDay._id,
+    status: { $in: ["open", "closing"] },
+  });
+  if (activeShifts.length > 0) {
+    throw new ApiError(
+      400,
+      `Cannot initiate closing for Business Day. ${activeShifts.length} shift(s) are still active (open or closing). Please close all shifts first.`
+    );
+  }
+
+  if (businessDay.status === "closing") {
+    return businessDay.populate("closingInitiatedBy", "fullName firstName lastName email");
+  }
+
+  businessDay.status = "closing";
+  businessDay.closingInitiatedAt = new Date();
+  businessDay.closingInitiatedBy = userId;
+  await businessDay.save();
+
+  return businessDay.populate("closingInitiatedBy", "fullName firstName lastName email");
+};
+
+export const abortBusinessDayClose = async (businessDayId, userId, userRole) => {
+  const businessDay = await BusinessDay.findById(businessDayId);
+  if (!businessDay) throw new ApiError(404, "Business Day not found");
+  if (businessDay.status !== "closing") {
+    throw new ApiError(400, "Business Day is not currently in closing state");
+  }
+
+  businessDay.status = "open";
+  businessDay.closingInitiatedAt = null;
+  businessDay.closingInitiatedBy = null;
+  await businessDay.save();
+
   return businessDay;
 };

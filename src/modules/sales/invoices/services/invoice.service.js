@@ -1270,22 +1270,42 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
   let resolvedBusinessDayId = null;
 
   if (resolvedBranchId) {
-    // 1. Concurrently fetch open Business Day and candidate Shift
-    const [openBusinessDay, candidateShift] = await Promise.all([
+    // 1. Concurrently fetch active Business Day and candidate Shift
+    const [activeBusinessDay, candidateShift] = await Promise.all([
       BusinessDay.findOne({
         branchId: resolvedBranchId,
-        status: "open",
+        status: { $in: ["open", "closing"] },
       }),
       saleData.shiftId
         ? Shift.findById(saleData.shiftId)
         : Shift.findOne({
             branchId: resolvedBranchId,
-            status: "open",
+            status: { $in: ["open", "closing"] },
           }),
     ]);
 
-    const isDayClosed = !openBusinessDay;
-    const isShiftClosed = !candidateShift || candidateShift.status !== "open";
+    const isDayClosed = !activeBusinessDay || activeBusinessDay.status === "closed";
+    const isDayClosing = activeBusinessDay && activeBusinessDay.status === "closing";
+    const isShiftClosed = !candidateShift || candidateShift.status === "closed";
+    const isShiftClosing = candidateShift && candidateShift.status === "closing";
+
+    if (isDayClosing) {
+      const err = new ApiError(
+        409,
+        "Cannot create sale bill. Business Day closing has been initiated on another device. Billing is locked."
+      );
+      err.code = "BUSINESS_DAY_CLOSING_IN_PROGRESS";
+      throw err;
+    }
+
+    if (isShiftClosing) {
+      const err = new ApiError(
+        409,
+        "Cannot create sale bill. Shift closing has been initiated on another device. Billing is locked."
+      );
+      err.code = "SHIFT_CLOSING_IN_PROGRESS";
+      throw err;
+    }
 
     if (isDayClosed && isShiftClosed) {
       throw new ApiError(
@@ -1301,7 +1321,7 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
       );
     }
 
-    if (isShiftClosed) {
+    if (isShiftClosed || candidateShift.status !== "open") {
       throw new ApiError(
         400,
         "Cannot create sale bill. The shift is closed. Please open a new shift before billing."
@@ -1312,14 +1332,14 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
       throw new ApiError(400, "Cannot create sale bill. Specified shift does not belong to this branch.");
     }
 
-    if (candidateShift.businessDayId && candidateShift.businessDayId.toString() !== openBusinessDay._id.toString()) {
+    if (candidateShift.businessDayId && candidateShift.businessDayId.toString() !== activeBusinessDay._id.toString()) {
       throw new ApiError(
         400,
         "Cannot create sale bill. Active shift does not belong to the open Business Day."
       );
     }
 
-    resolvedBusinessDayId = openBusinessDay._id;
+    resolvedBusinessDayId = activeBusinessDay._id;
     resolvedShiftId = candidateShift._id;
   }
 

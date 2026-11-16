@@ -44,9 +44,19 @@ export const createCustomer = asyncHandler(async (req, res) => {
 });
 
 export const getCustomers = asyncHandler(async (req, res) => {
+  const rawCompanyId =
+    req.query.companyId !== undefined
+      ? req.query.companyId
+      : (req.headers["x-company-id"] || req.companyId || null);
+
+  const companyId =
+    rawCompanyId && rawCompanyId !== "all" && rawCompanyId !== "undefined" && rawCompanyId !== "null"
+      ? rawCompanyId
+      : null;
+
   const result = await customerService.getCustomers(
     req.workspaceId,
-    req.companyId,
+    companyId,
     req.query
   );
 

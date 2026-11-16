@@ -1,4 +1,4 @@
-﻿import mongoose from "mongoose";
+import mongoose from "mongoose";
 import CashTransaction from "../models/cashTransaction.model.js";
 import SalesInvoice from "../../../../../sales/invoices/models/invoice.model.js";
 import User from "../../../../../core/users/models/user.model.js";
@@ -9,6 +9,7 @@ const POPULATE_FIELDS = [
   { path: "createdBy", select: "name email" },
   { path: "postedBy", select: "name email" },
   { path: "cancelledBy", select: "name email" },
+  { path: "branchId", select: "name branchCode" },
 ];
 
 const attachInvoiceDetails = async (cashTransactions, companyId) => {
@@ -131,7 +132,7 @@ const getCashTransactions = async (
     isDeleted: false,
   };
 
-  if (filters.branchId) query.branchId = filters.branchId;
+  if (filters.branchId && filters.branchId !== "all") query.branchId = filters.branchId;
   if (filters.partition && filters.partition !== "all") query.cashPartition = filters.partition;
   if (filters.cashPartition && filters.cashPartition !== "all") query.cashPartition = filters.cashPartition;
   if (filters.transactionType && filters.transactionType !== "all") query.transactionType = filters.transactionType;

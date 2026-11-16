@@ -101,7 +101,7 @@ export const cashExchangeIdParamSchema = Joi.object({
 
 export const getCashExchangesQuerySchema = Joi.object({
   search: Joi.string().trim().allow("").optional(),
-  branchId: objectId.optional(),
+  branchId: Joi.string().trim().allow("all", "", null).optional(),
   shiftId: objectId.optional(),
   startDate: Joi.date().optional(),
   endDate: Joi.date().optional(),

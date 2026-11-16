@@ -15,6 +15,8 @@ import {
   cancelBusinessDay as cancelBusinessDayService,
   getOpenBusinessDay as getOpenBusinessDayService,
   getSuggestedBusinessDate as getSuggestedBusinessDateService,
+  initiateBusinessDayClose as initiateBusinessDayCloseService,
+  abortBusinessDayClose as abortBusinessDayCloseService,
   aggregateBusinessDayUpiCollections,
 } from "./businessDay.service.js";
 
@@ -371,7 +373,16 @@ export const openBusinessDay = asyncHandler(async (req, res, next) => {
  * Lists all Business Days with optional filters.
  */
 export const listBusinessDays = asyncHandler(async (req, res, next) => {
-  const branchId = req.headers["x-branch-id"] || req.branchId || req.query.branchId || null;
+  const rawBranchId =
+    req.query.branchId !== undefined
+      ? req.query.branchId
+      : (req.headers["x-branch-id"] || req.branchId || null);
+
+  const branchId =
+    rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+      ? rawBranchId
+      : null;
+
   const { date, status, sort = "desc" } = req.query;
 
   const filter = {
@@ -414,15 +425,24 @@ export const getOpenBusinessDay = asyncHandler(async (req, res, next) => {
     { path: "shifts" },
     { path: "createdBy", select: "fullName name email role" },
     { path: "closedBy", select: "fullName name email role" },
+    { path: "closingInitiatedBy", select: "fullName name email role" },
     { path: "branchId", select: "name branchCode branchName" },
   ]);
 
-  // Also fetch the currently open shift (if any) to include in response
-  const openShift = await Shift.findOne({ businessDayId: businessDay._id, status: "open" });
+  // Also fetch the currently active shift (open or closing) to include in response
+  const activeShift = await Shift.findOne({
+    businessDayId: businessDay._id,
+    status: { $in: ["open", "closing"] },
+  }).populate("openedBy", "fullName firstName lastName email")
+    .populate("closingInitiatedBy", "fullName firstName lastName email");
 
   res.status(200).json({
     success: true,
-    data: { ...businessDay.toObject(), currentOpenShift: openShift || null },
+    data: {
+      ...businessDay.toObject(),
+      currentOpenShift: activeShift || null,
+      currentActiveShift: activeShift || null,
+    },
   });
 });
 
@@ -668,6 +688,44 @@ export const getBusinessDaySummary = asyncHandler(async (req, res, next) => {
   };
 
   res.status(200).json({ success: true, data: summary });
+});
+
+/**
+ * PATCH /operations/business-days/:id/initiate-close
+ * Initiates closing of an open Business Day.
+ */
+export const initiateBusinessDayClose = asyncHandler(async (req, res, next) => {
+  const userId = req.user?._id;
+  const businessDay = await initiateBusinessDayCloseService(req.params.id, userId);
+
+  if (businessDay) {
+    await businessDay.populate([
+      { path: "createdBy", select: "fullName name email role" },
+      { path: "closingInitiatedBy", select: "fullName name email role" },
+      { path: "branchId", select: "name branchCode branchName" },
+    ]);
+  }
+
+  res.status(200).json({ success: true, data: businessDay });
+});
+
+/**
+ * PATCH /operations/business-days/:id/abort-close
+ * Aborts closing of a Business Day, restoring it to 'open'.
+ */
+export const abortBusinessDayClose = asyncHandler(async (req, res, next) => {
+  const userId = req.user?._id;
+  const userRole = req.user?.role;
+  const businessDay = await abortBusinessDayCloseService(req.params.id, userId, userRole);
+
+  if (businessDay) {
+    await businessDay.populate([
+      { path: "createdBy", select: "fullName name email role" },
+      { path: "branchId", select: "name branchCode branchName" },
+    ]);
+  }
+
+  res.status(200).json({ success: true, data: businessDay });
 });
 
 /**

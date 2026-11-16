@@ -83,22 +83,28 @@ const createCashExchange = async (workspaceId, companyId, userId, payload) => {
     const { Shift } = await import(
       "../../../../../operations/shifts/shift.model.js"
     );
-    const openShift = await Shift.findOne({
+    const candidateShift = await Shift.findOne({
       companyId,
       workspaceId,
       branchId,
-      status: "open",
+      status: { $in: ["open", "closing"] },
     })
-      .select("_id")
+      .select("_id status")
       .session(session);
 
-    if (!openShift) {
+    if (!candidateShift || candidateShift.status !== "open") {
+      if (candidateShift && candidateShift.status === "closing") {
+        throw new ApiError(
+          409,
+          "Cannot exchange cash: shift closing is currently in progress on another device.",
+        );
+      }
       throw new ApiError(
         400,
         "Cannot exchange cash: no active open shift found for this branch. Open a shift first.",
       );
     }
-    const shiftId = openShift._id;
+    const shiftId = candidateShift._id;
 
     // 6. PRE-FLIGHT: validate sufficient running denominations for what we give OUT
     await branchCashRepository.validateSufficientRunningDenominations(

@@ -11,7 +11,8 @@ const objectId = Joi.string()
 export const trialBalanceQuerySchema = Joi.object({
   asOfDate: Joi.date().iso().optional(),
   includeZeroBalances: Joi.boolean().default(false).optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── General Ledger ─────────────────────────────────────────────
 export const generalLedgerQuerySchema = Joi.object({
@@ -21,7 +22,8 @@ export const generalLedgerQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(200).default(50).optional(),
   all: Joi.boolean().default(false).optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── Customer Ledger ────────────────────────────────────────────
 export const customerLedgerQuerySchema = Joi.object({
@@ -32,7 +34,8 @@ export const customerLedgerQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(200).default(50).optional(),
   all: Joi.boolean().default(false).optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── Supplier Ledger ────────────────────────────────────────────
 export const supplierLedgerQuerySchema = Joi.object({
@@ -43,7 +46,8 @@ export const supplierLedgerQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(200).default(50).optional(),
   all: Joi.boolean().default(false).optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── Cash Book ──────────────────────────────────────────────────
 export const cashBookQuerySchema = Joi.object({
@@ -53,7 +57,8 @@ export const cashBookQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(200).default(50).optional(),
   all: Joi.boolean().default(false).optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── Bank Book ──────────────────────────────────────────────────
 export const bankBookQuerySchema = Joi.object({
@@ -63,22 +68,26 @@ export const bankBookQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(200).default(50).optional(),
   all: Joi.boolean().default(false).optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── Profit & Loss ──────────────────────────────────────────────
 export const profitLossQuerySchema = Joi.object({
   startDate: Joi.date().iso().optional(),
   endDate: Joi.date().iso().optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── Balance Sheet ──────────────────────────────────────────────
 export const balanceSheetQuerySchema = Joi.object({
   asOfDate: Joi.date().iso().optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);
 
 // ── GST Report ─────────────────────────────────────────────────
 export const gstReportQuerySchema = Joi.object({
   startDate: Joi.date().iso().optional(),
   endDate: Joi.date().iso().optional(),
   type: Joi.string().valid("GSTR1", "GSTR2", "SUMMARY").default("SUMMARY").optional(),
-});
+  companyId: objectId.optional(),
+}).unknown(true);

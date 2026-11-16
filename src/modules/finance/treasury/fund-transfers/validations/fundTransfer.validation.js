@@ -106,6 +106,7 @@ export const fundTransferIdParamSchema = Joi.object({
 });
 
 export const getFundTransfersQuerySchema = Joi.object({
+  companyId: objectId.optional(),
   search: Joi.string().trim().allow("").optional(),
   transferType: Joi.string()
     .valid("BANK_TO_BANK", "CASH_TO_BANK", "BANK_TO_CASH", "CASH_TO_CASH")
@@ -118,4 +119,4 @@ export const getFundTransfersQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(100).default(20).optional(),
   all: Joi.boolean().default(false).optional(),
-});
+}).unknown(true);

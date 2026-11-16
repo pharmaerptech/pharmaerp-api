@@ -11,6 +11,8 @@ import {
   syncShiftController,
   updateShiftStatus,
   cancelShift,
+  initiateShiftClose,
+  abortShiftClose,
 } from "./shift.controller.js";
 
 import authMiddleware from "../../../middlewares/auth.middleware.js";
@@ -35,6 +37,9 @@ router.get("/:id", getShiftById);
 router.put("/:id", updateShift);
 router.patch("/:id/sync", syncShiftController);
 router.patch("/:id/status", updateShiftStatus);
+router.patch("/:id/initiate-close", initiateShiftClose);
+router.patch("/:id/abort-close", abortShiftClose);
+router.post("/:id/abort-close", abortShiftClose);
 router.patch("/:id/cancel", cancelShift);
 
 export default router;

@@ -211,6 +211,13 @@ const companySchema = new mongoose.Schema(
       index: true,
     },
 
+    industry: {
+      type: String,
+      trim: true,
+      maxlength: [100, "Industry cannot exceed 100 characters"],
+      default: null,
+    },
+
     logo: {
       type: IMAGE_SCHEMA,
       default: null,

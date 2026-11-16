@@ -6,11 +6,15 @@ import creditNoteService from "../services/creditNote.service.js";
  * List credit notes with pagination and filters
  */
 export const listCreditNotes = asyncHandler(async (req, res) => {
+  const rawBranchId =
+    req.query.branchId !== undefined
+      ? req.query.branchId
+      : (req.headers["x-branch-id"] || req.branchId || null);
+
   const branchId =
-    req.headers["x-branch-id"] ||
-    req.branchId ||
-    req.query.branchId ||
-    null;
+    rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+      ? rawBranchId
+      : null;
 
   const page = parseInt(req.query.page, 10) || 1;
   const limit = parseInt(req.query.limit, 10) || 20;
@@ -122,11 +126,15 @@ export const cancelCreditNote = asyncHandler(async (req, res) => {
  * Get credit note summary statistics
  */
 export const getCreditNoteSummaryStats = asyncHandler(async (req, res) => {
+  const rawBranchId =
+    req.query.branchId !== undefined
+      ? req.query.branchId
+      : (req.headers["x-branch-id"] || req.branchId || null);
+
   const branchId =
-    req.headers["x-branch-id"] ||
-    req.branchId ||
-    req.query.branchId ||
-    null;
+    rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+      ? rawBranchId
+      : null;
 
   const stats = await creditNoteService.getCreditNoteSummaryStats(
     req.companyId,

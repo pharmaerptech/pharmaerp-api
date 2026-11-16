@@ -91,9 +91,18 @@ const businessDaySchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ["open", "closed", "cancelled"],
+      enum: ["open", "closing", "closed", "cancelled"],
       default: "open",
       index: true,
+    },
+    closingInitiatedAt: {
+      type: Date,
+      default: null,
+    },
+    closingInitiatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
     },
 
     // ── Audit ─────────────────────────────────────────────────────────────────
@@ -247,15 +256,15 @@ const businessDaySchema = new mongoose.Schema(
 // ── Indexes ───────────────────────────────────────────────────────────────────
 
 /**
- * Prevent two OPEN Business Days for the same branch simultaneously.
- * This is a partial unique index — it only applies to records where status === 'open'.
+ * Prevent two ACTIVE (open or closing) Business Days for the same branch simultaneously.
+ * This is a partial unique index — it only applies to records where status is 'open' or 'closing'.
  */
 businessDaySchema.index(
   { branchId: 1, status: 1 },
   {
     unique: true,
-    partialFilterExpression: { status: "open" },
-    name: "unique_open_business_day_per_branch",
+    partialFilterExpression: { status: { $in: ["open", "closing"] } },
+    name: "unique_active_business_day_per_branch",
   }
 );
 

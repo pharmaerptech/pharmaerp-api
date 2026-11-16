@@ -15,9 +15,14 @@ export const createBankAccount = asyncHandler(async (req, res) => {
 });
 
 export const getBankAccounts = asyncHandler(async (req, res) => {
+  const companyId =
+    req.query.companyId && req.query.companyId !== "all"
+      ? req.query.companyId
+      : req.companyId;
+
   const result = await bankAccountService.getBankAccounts(
     req.workspaceId,
-    req.companyId,
+    companyId || null,
     req.query
   );
   return res

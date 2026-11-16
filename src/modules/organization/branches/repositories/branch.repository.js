@@ -70,6 +70,7 @@ const getCompanyBranches = async (companyId, options = {}) => {
     companyId,
     isDeleted: false,
   })
+    .populate("companyId", "name legalName code")
     .sort(options.sort || { createdAt: -1 })
     .select(options.select || "");
 };
@@ -83,6 +84,7 @@ const getWorkspaceBranches = async (workspaceId, options = {}) => {
     workspaceId,
     isDeleted: false,
   })
+    .populate("companyId", "name legalName code")
     .sort(options.sort || { createdAt: -1 })
     .select(options.select || "");
 };
@@ -155,6 +157,22 @@ const countWorkspaceBranches = async (workspaceId) => {
   });
 };
 
+const promoteNextPrimaryBranch = async (companyId, excludeBranchId) => {
+  if (!mongoose.Types.ObjectId.isValid(companyId)) {
+    return null;
+  }
+
+  return Branch.findOneAndUpdate(
+    {
+      companyId,
+      _id: { $ne: excludeBranchId },
+      isDeleted: false,
+    },
+    { $set: { isPrimary: true } },
+    { new: true },
+  );
+};
+
 export default {
   findBranchById,
   findBranchByIdAndCompany,
@@ -172,4 +190,5 @@ export default {
 
   countCompanyBranches,
   countWorkspaceBranches,
+  promoteNextPrimaryBranch,
 };

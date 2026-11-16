@@ -8,6 +8,8 @@ import {
   getBusinessDaySummary,
   closeBusinessDay,
   cancelBusinessDay,
+  initiateBusinessDayClose,
+  abortBusinessDayClose,
 } from "./businessDay.controller.js";
 
 import authMiddleware from "../../../middlewares/auth.middleware.js";
@@ -33,7 +35,10 @@ router.get("/:id/summary", getBusinessDaySummary);          // Full financial su
 router.get("/:id", getBusinessDayById);                     // Get by ID
 
 // ── Business Day action routes ────────────────────────────────────────────────
-router.patch("/:id/close", closeBusinessDay);               // Close the Business Day
-router.patch("/:id/cancel", cancelBusinessDay);             // Cancel the Business Day
+router.patch("/:id/initiate-close", initiateBusinessDayClose);   // Initiate closing of Business Day
+router.patch("/:id/abort-close", abortBusinessDayClose);         // Abort closing of Business Day
+router.post("/:id/abort-close", abortBusinessDayClose);          // Abort closing alias (Beacon/unload fallback)
+router.patch("/:id/close", closeBusinessDay);                   // Close the Business Day
+router.patch("/:id/cancel", cancelBusinessDay);                 // Cancel the Business Day
 
 export default router;

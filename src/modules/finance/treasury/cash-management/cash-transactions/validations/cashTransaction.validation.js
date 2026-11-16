@@ -28,7 +28,7 @@ export const cashTransactionIdParamSchema = Joi.object({
 });
 
 export const getCashTransactionsQuerySchema = Joi.object({
-  branchId: objectId.optional(),
+  branchId: Joi.string().trim().allow("all", "", null).optional(),
   partition: Joi.string().valid("running", "frozen").optional(),
   transactionType: Joi.string().valid(...VALID_TRANSACTION_TYPES).optional(),
   direction: Joi.string().valid(...VALID_DIRECTIONS).optional(),

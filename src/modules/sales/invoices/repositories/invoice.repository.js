@@ -536,6 +536,7 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
     SalesInvoice.find(query)
       .populate("customerId", "name mobile alternateMobile phone contactNumber contact")
       .populate("shiftId", "status shiftNo shiftName shiftNumber openPeriod openedAt closedAt branchId")
+      .populate("branchId", "name branchCode")
       .populate({
         path: "paymentQrId",
         select: "upiId label provider bankAccountId",
@@ -796,6 +797,8 @@ const getAllInvoices = async (companyId, workspaceId, filters = {}, pagination =
 
     return {
       ...inv,
+      branchName: inv.branchId?.name || inv.branchName || null,
+      branchCode: inv.branchId?.branchCode || null,
       customerName: resolvedName,
       customerPhone: resolvedPhone,
       customerId: custObj._id || inv.customerId,

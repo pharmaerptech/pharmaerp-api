@@ -63,6 +63,7 @@ const findSalesReturns = async (query = {}, options = {}) => {
     SalesReturn.find(query)
       .populate("customerId", "name mobile phone customerCode gstNumber")
       .populate("doctorId", "name doctorCode specialty")
+      .populate("branchId", "name branchCode")
       .populate("originalInvoiceId", "invoiceNo grandTotal date")
       .sort(sort)
       .skip(skip)

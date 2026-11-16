@@ -68,6 +68,10 @@ const getPurchaseBills = async (
     query.supplierId = filters.supplierId;
   }
 
+  if (filters.branchId && mongoose.Types.ObjectId.isValid(filters.branchId)) {
+    query.branchId = filters.branchId;
+  }
+
   if (filters.status) {
     query.status = filters.status;
   }
@@ -79,6 +83,7 @@ const getPurchaseBills = async (
   const [bills, total] = await Promise.all([
     PurchaseBill.find(query)
       .populate("supplierId", "businessName contactPerson mobile")
+      .populate("branchId", "name branchCode")
       .sort(sort)
       .skip(skip)
       .limit(Number(limit))

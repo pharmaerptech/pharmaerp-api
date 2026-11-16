@@ -42,10 +42,7 @@ const createDoctor = async (payload, options = {}) => {
 };
 
 const getDoctors = async (workspaceId, companyId, filters = {}, options = {}) => {
-  if (
-    !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
-  ) {
+  if (!mongoose.Types.ObjectId.isValid(workspaceId)) {
     return {
       doctors: [],
       total: 0,
@@ -62,9 +59,12 @@ const getDoctors = async (workspaceId, companyId, filters = {}, options = {}) =>
 
   const query = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
-    companyId: new mongoose.Types.ObjectId(companyId),
     isDeleted: false,
   };
+
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    query.companyId = new mongoose.Types.ObjectId(companyId);
+  }
 
   if (filters.status && filters.status !== "all") {
     query.status = filters.status;
@@ -99,8 +99,17 @@ const getDoctors = async (workspaceId, companyId, filters = {}, options = {}) =>
     else if (typeof options.sort === "object") sort = options.sort;
   }
 
+  const matchCriteria = {
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    isDeleted: false,
+    ...(companyId && mongoose.Types.ObjectId.isValid(companyId)
+      ? { companyId: new mongoose.Types.ObjectId(companyId) }
+      : {}),
+  };
+
   const [doctors, total, statsResult] = await Promise.all([
     Doctor.find(query)
+      .populate("companyId", "name legalName code")
       .populate("branchId", "name")
       .sort(sort)
       .skip(skip)
@@ -110,11 +119,7 @@ const getDoctors = async (workspaceId, companyId, filters = {}, options = {}) =>
     Doctor.countDocuments(query),
     Doctor.aggregate([
       {
-        $match: {
-          workspaceId: new mongoose.Types.ObjectId(workspaceId),
-          companyId: new mongoose.Types.ObjectId(companyId),
-          isDeleted: false,
-        },
+        $match: matchCriteria,
       },
       {
         $group: {

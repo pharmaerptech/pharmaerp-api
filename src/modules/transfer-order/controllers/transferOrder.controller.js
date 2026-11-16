@@ -87,11 +87,15 @@ export const getTransferOrders = asyncHandler(async (req, res) => {
     req.query.companyId ||
     null;
 
+  const rawBranchId =
+    req.query.branchId !== undefined
+      ? req.query.branchId
+      : (req.headers["x-branch-id"] || req.branchId || null);
+
   const branchId =
-    req.headers["x-branch-id"] ||
-    req.branchId ||
-    req.query.branchId ||
-    null;
+    rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+      ? rawBranchId
+      : null;
 
   const result = await transferOrderService.getTransferOrders(
     req.workspaceId,

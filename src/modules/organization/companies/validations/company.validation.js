@@ -127,6 +127,8 @@ export const createCompanySchema = Joi.object({
     .valid(...Object.values(COMPANY_TYPE))
     .optional(),
 
+  industry: Joi.string().trim().max(100).allow(null, "").optional(),
+
   logo: imageSchema.allow(null).optional(),
 
   email: Joi.string()
@@ -180,6 +182,8 @@ export const updateCompanySchema = Joi.object({
   type: Joi.string()
     .valid(...Object.values(COMPANY_TYPE))
     .optional(),
+
+  industry: Joi.string().trim().max(100).allow(null, "").optional(),
 
   logo: imageSchema.allow(null).optional(),
 

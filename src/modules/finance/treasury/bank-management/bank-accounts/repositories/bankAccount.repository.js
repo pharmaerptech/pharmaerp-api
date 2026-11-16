@@ -33,9 +33,12 @@ const createBankAccount = async (payload, options = {}) => {
 const getBankAccounts = async (workspaceId, companyId, filters = {}, options = {}) => {
   const query = {
     workspaceId,
-    companyId,
     isDeleted: false,
   };
+
+  if (companyId) {
+    query.companyId = companyId;
+  }
 
   if (filters.isActive !== undefined) {
     query.isActive = filters.isActive === "true" || filters.isActive === true;
@@ -61,6 +64,7 @@ const getBankAccounts = async (workspaceId, companyId, filters = {}, options = {
 
   if (options.all === true) {
     const bankAccounts = await BankAccount.find(query)
+      .populate("companyId", "name legalName code")
       .populate("bankMasterId", "name logoUrl")
       .populate("ledgerAccountId", "accountName accountCode status openingBalance openingBalanceType")
       .sort(sort)
@@ -74,6 +78,7 @@ const getBankAccounts = async (workspaceId, companyId, filters = {}, options = {
 
   const [bankAccounts, total] = await Promise.all([
     BankAccount.find(query)
+      .populate("companyId", "name legalName code")
       .populate("bankMasterId", "name logoUrl")
       .populate("ledgerAccountId", "accountName accountCode status openingBalance openingBalanceType")
       .sort(sort)

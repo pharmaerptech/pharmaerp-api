@@ -72,6 +72,7 @@ export const chequeIdParamSchema = Joi.object({
 });
 
 export const getChequesQuerySchema = Joi.object({
+  companyId: objectId.optional(),
   chequeType: Joi.string().valid("RECEIVED", "ISSUED").optional(),
   type: Joi.string().valid("RECEIVED", "ISSUED").optional(),
   status: Joi.string()
@@ -85,4 +86,4 @@ export const getChequesQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1).optional(),
   limit: Joi.number().integer().min(1).max(100).default(20).optional(),
   all: Joi.boolean().default(false).optional(),
-});
+}).unknown(true);

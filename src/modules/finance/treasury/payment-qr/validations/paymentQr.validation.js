@@ -63,7 +63,7 @@ export const paymentQrIdParamSchema = Joi.object({
 });
 
 export const getPaymentQrsQuerySchema = Joi.object({
-  branchId: objectId.optional(),
+  branchId: Joi.string().trim().allow("all", "", null).optional(),
   bankAccountId: objectId.optional(),
   provider: Joi.string().valid(...VALID_PROVIDERS).optional(),
   status: Joi.string().valid("ACTIVE", "INACTIVE").optional(),

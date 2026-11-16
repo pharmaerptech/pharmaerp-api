@@ -32,16 +32,18 @@ const getGstLedgerEntries = async (
 ) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { entries: [], total: 0, page: 1, limit: 20 };
   }
 
   const query = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
-    companyId: new mongoose.Types.ObjectId(companyId),
     gstType,
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    query.companyId = new mongoose.Types.ObjectId(companyId);
+  }
 
   if (filters.startDate || filters.endDate) {
     query.voucherDate = {};
@@ -387,16 +389,18 @@ const getGstLedgerEntries = async (
 const getGstr1Summary = async (workspaceId, companyId, filters = {}, options = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { groups: [], totalRow: {}, localSummary: {}, centralSummary: {} };
   }
 
   const query = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
-    companyId: new mongoose.Types.ObjectId(companyId),
     gstType: "GSTR-1",
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    query.companyId = new mongoose.Types.ObjectId(companyId);
+  }
 
   if (filters.startDate || filters.endDate) {
     query.voucherDate = {};
@@ -472,15 +476,17 @@ const getGstr1Summary = async (workspaceId, companyId, filters = {}, options = {
 const getGstr3bSummary = async (workspaceId, companyId, filters = {}, options = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return calculateGstr3bSummary([], []);
   }
 
   const baseQuery = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
-    companyId: new mongoose.Types.ObjectId(companyId),
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    baseQuery.companyId = new mongoose.Types.ObjectId(companyId);
+  }
 
   if (filters.startDate || filters.endDate) {
     baseQuery.voucherDate = {};

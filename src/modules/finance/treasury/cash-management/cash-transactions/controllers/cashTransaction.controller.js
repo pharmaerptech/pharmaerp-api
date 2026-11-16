@@ -3,10 +3,22 @@ import ApiResponse from "../../../../../../utils/ApiResponse.js";
 import cashTransactionService from "../services/cashTransaction.service.js";
 
 export const getCashTransactions = asyncHandler(async (req, res) => {
+  const rawBranchId = req.query.branchId !== undefined
+    ? req.query.branchId
+    : (req.headers["x-branch-id"] || req.branchId || null);
+  const branchId = rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+    ? rawBranchId
+    : null;
+
+  const query = {
+    ...req.query,
+    branchId: branchId || undefined,
+  };
+
   const result = await cashTransactionService.getCashTransactions(
     req.workspaceId,
     req.companyId,
-    req.query,
+    query,
   );
   return res
     .status(200)

@@ -309,7 +309,7 @@ customerSchema.pre("validate", async function () {
   if (this.customerCode === "") {
     this.customerCode = null;
   }
-  // Only auto-generate if customerCode is undefined (not passed at all).
+  // Only auto-generate if customerCode is undefined (not passed at all)
   // If caller explicitly sets null, keep it null so customerCode can be skipped cleanly!
   if (this.customerCode === undefined) {
     this.customerCode = await generateCustomerCode();

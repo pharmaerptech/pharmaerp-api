@@ -14,12 +14,17 @@ import Ledger from "../../ledger/models/ledger.model.js";
 const getTrialBalance = async (workspaceId, companyId, filters = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { rows: [], totalDebit: 0, totalCredit: 0, isBalanced: true };
   }
 
-  const balances = await AccountBalance.find({ workspaceId, companyId })
+  const query = { workspaceId };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    query.companyId = companyId;
+  }
+
+  const balances = await AccountBalance.find(query)
     .populate({
       path: "accountId",
       select: "accountName accountCode accountNature accountCategory isDeleted status",
@@ -73,14 +78,17 @@ const getTrialBalance = async (workspaceId, companyId, filters = {}) => {
 const getGeneralLedger = async (workspaceId, companyId, query = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { entries: [], total: 0, page: 1, limit: 50 };
   }
 
   const { accountId, startDate, endDate, page, limit, all } = query;
 
-  const filter = { workspaceId, companyId };
+  const filter = { workspaceId };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    filter.companyId = companyId;
+  }
 
   if (accountId && mongoose.Types.ObjectId.isValid(accountId)) {
     filter.accountId = accountId;
@@ -132,20 +140,22 @@ const getGeneralLedger = async (workspaceId, companyId, query = {}) => {
 const getCustomerLedger = async (workspaceId, companyId, query = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { entries: [], total: 0, page: 1, limit: 50 };
   }
 
   const { accountId, startDate, endDate, page, limit, all } = query;
 
-  // Find all CUSTOMER accounts in this company
+  // Find all CUSTOMER accounts in this company/workspace
   const accountFilter = {
     workspaceId,
-    companyId,
     accountCategory: "CUSTOMER",
     isDeleted: false,
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    accountFilter.companyId = companyId;
+  }
 
   if (accountId && mongoose.Types.ObjectId.isValid(accountId)) {
     accountFilter._id = accountId;
@@ -158,7 +168,10 @@ const getCustomerLedger = async (workspaceId, companyId, query = {}) => {
     return { entries: [], total: 0, page: 1, limit: 50 };
   }
 
-  const filter = { workspaceId, companyId, accountId: { $in: customerAccountIds } };
+  const filter = { workspaceId, accountId: { $in: customerAccountIds } };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    filter.companyId = companyId;
+  }
 
   if (startDate || endDate) {
     filter.voucherDate = {};
@@ -206,7 +219,7 @@ const getCustomerLedger = async (workspaceId, companyId, query = {}) => {
 const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { entries: [], total: 0, page: 1, limit: 50 };
   }
@@ -215,10 +228,12 @@ const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
 
   const accountFilter = {
     workspaceId,
-    companyId,
     accountCategory: "SUPPLIER",
     isDeleted: false,
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    accountFilter.companyId = companyId;
+  }
 
   if (accountId && mongoose.Types.ObjectId.isValid(accountId)) {
     accountFilter._id = accountId;
@@ -231,7 +246,10 @@ const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
     return { entries: [], total: 0, page: 1, limit: 50 };
   }
 
-  const filter = { workspaceId, companyId, accountId: { $in: supplierAccountIds } };
+  const filter = { workspaceId, accountId: { $in: supplierAccountIds } };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    filter.companyId = companyId;
+  }
 
   if (startDate || endDate) {
     filter.voucherDate = {};
@@ -279,7 +297,7 @@ const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
 const getCashBook = async (workspaceId, companyId, query = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { entries: [], total: 0, page: 1, limit: 50, cashAccounts: [] };
   }
@@ -288,10 +306,12 @@ const getCashBook = async (workspaceId, companyId, query = {}) => {
 
   const accountFilter = {
     workspaceId,
-    companyId,
     accountCategory: "CASH",
     isDeleted: false,
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    accountFilter.companyId = companyId;
+  }
 
   if (accountId && mongoose.Types.ObjectId.isValid(accountId)) {
     accountFilter._id = accountId;
@@ -306,7 +326,10 @@ const getCashBook = async (workspaceId, companyId, query = {}) => {
     return { entries: [], total: 0, page: 1, limit: 50, cashAccounts: [] };
   }
 
-  const filter = { workspaceId, companyId, accountId: { $in: cashAccountIds } };
+  const filter = { workspaceId, accountId: { $in: cashAccountIds } };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    filter.companyId = companyId;
+  }
 
   if (startDate || endDate) {
     filter.voucherDate = {};
@@ -354,7 +377,7 @@ const getCashBook = async (workspaceId, companyId, query = {}) => {
 const getBankBook = async (workspaceId, companyId, query = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { entries: [], total: 0, page: 1, limit: 50, bankAccounts: [] };
   }
@@ -363,10 +386,12 @@ const getBankBook = async (workspaceId, companyId, query = {}) => {
 
   const accountFilter = {
     workspaceId,
-    companyId,
     accountCategory: "BANK",
     isDeleted: false,
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    accountFilter.companyId = companyId;
+  }
 
   if (accountId && mongoose.Types.ObjectId.isValid(accountId)) {
     accountFilter._id = accountId;
@@ -381,7 +406,10 @@ const getBankBook = async (workspaceId, companyId, query = {}) => {
     return { entries: [], total: 0, page: 1, limit: 50, bankAccounts: [] };
   }
 
-  const filter = { workspaceId, companyId, accountId: { $in: bankAccountIds } };
+  const filter = { workspaceId, accountId: { $in: bankAccountIds } };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    filter.companyId = companyId;
+  }
 
   if (startDate || endDate) {
     filter.voucherDate = {};
@@ -430,7 +458,7 @@ const getBankBook = async (workspaceId, companyId, query = {}) => {
 const getProfitLoss = async (workspaceId, companyId, filters = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { income: [], expenses: [], totalIncome: 0, totalExpenses: 0, netProfit: 0 };
   }
@@ -438,12 +466,15 @@ const getProfitLoss = async (workspaceId, companyId, filters = {}) => {
   const { startDate, endDate } = filters;
 
   // Fetch INCOME and EXPENSE accounts
-  const accounts = await Account.find({
+  const accountQuery = {
     workspaceId,
-    companyId,
     accountNature: { $in: ["INCOME", "EXPENSE"] },
     isDeleted: false,
-  })
+  };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    accountQuery.companyId = companyId;
+  }
+  const accounts = await Account.find(accountQuery)
     .select("_id accountName accountCode accountNature accountCategory")
     .lean();
 
@@ -461,14 +492,18 @@ const getProfitLoss = async (workspaceId, companyId, filters = {}) => {
     if (startDate) dateFilter.$gte = new Date(startDate);
     if (endDate) dateFilter.$lte = new Date(endDate);
 
+    const matchQuery = {
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      accountId: { $in: accountIds },
+      ...(Object.keys(dateFilter).length ? { voucherDate: dateFilter } : {}),
+    };
+    if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+      matchQuery.companyId = new mongoose.Types.ObjectId(companyId);
+    }
+
     const aggregation = await Ledger.aggregate([
       {
-        $match: {
-          workspaceId: new mongoose.Types.ObjectId(workspaceId),
-          companyId: new mongoose.Types.ObjectId(companyId),
-          accountId: { $in: accountIds },
-          ...(Object.keys(dateFilter).length ? { voucherDate: dateFilter } : {}),
-        },
+        $match: matchQuery,
       },
       {
         $group: {
@@ -487,11 +522,14 @@ const getProfitLoss = async (workspaceId, companyId, filters = {}) => {
     }
   } else {
     // No date range: use account balances (lifetime totals)
-    const balances = await AccountBalance.find({
+    const balanceQuery = {
       workspaceId,
-      companyId,
       accountId: { $in: accountIds },
-    })
+    };
+    if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+      balanceQuery.companyId = companyId;
+    }
+    const balances = await AccountBalance.find(balanceQuery)
       .select("accountId debitTotal creditTotal")
       .lean();
 
@@ -563,28 +601,34 @@ const getProfitLoss = async (workspaceId, companyId, filters = {}) => {
 const getBalanceSheet = async (workspaceId, companyId, filters = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { assets: [], liabilities: [], equity: [], totalAssets: 0, totalLiabilitiesAndEquity: 0 };
   }
 
   // Fetch ASSET, LIABILITY, EQUITY accounts
-  const accounts = await Account.find({
+  const accountQuery = {
     workspaceId,
-    companyId,
     accountNature: { $in: ["ASSET", "LIABILITY", "EQUITY"] },
     isDeleted: false,
-  })
+  };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    accountQuery.companyId = companyId;
+  }
+  const accounts = await Account.find(accountQuery)
     .select("_id accountName accountCode accountNature accountCategory")
     .lean();
 
   const accountIds = accounts.map((a) => a._id);
 
-  const balances = await AccountBalance.find({
+  const balanceQuery = {
     workspaceId,
-    companyId,
     accountId: { $in: accountIds },
-  })
+  };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    balanceQuery.companyId = companyId;
+  }
+  const balances = await AccountBalance.find(balanceQuery)
     .select("accountId debitTotal creditTotal balance balanceType")
     .lean();
 
@@ -675,7 +719,7 @@ const getBalanceSheet = async (workspaceId, companyId, filters = {}) => {
 const getGstReport = async (workspaceId, companyId, filters = {}) => {
   if (
     !mongoose.Types.ObjectId.isValid(workspaceId) ||
-    !mongoose.Types.ObjectId.isValid(companyId)
+    (companyId && !mongoose.Types.ObjectId.isValid(companyId))
   ) {
     return { outputGst: [], inputGst: [], totalOutputGst: 0, totalInputGst: 0, netGstPayable: 0 };
   }
@@ -683,12 +727,15 @@ const getGstReport = async (workspaceId, companyId, filters = {}) => {
   const { startDate, endDate, type = "SUMMARY" } = filters;
 
   // Find all GST category accounts
-  const gstAccounts = await Account.find({
+  const accountQuery = {
     workspaceId,
-    companyId,
     accountCategory: "GST",
     isDeleted: false,
-  })
+  };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    accountQuery.companyId = companyId;
+  }
+  const gstAccounts = await Account.find(accountQuery)
     .select("_id accountName accountCode accountNature")
     .lean();
 
@@ -704,9 +751,11 @@ const getGstReport = async (workspaceId, companyId, filters = {}) => {
 
   const ledgerFilter = {
     workspaceId,
-    companyId,
     accountId: { $in: gstAccountIds },
   };
+  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+    ledgerFilter.companyId = companyId;
+  }
 
   if (Object.keys(dateFilter).length) {
     ledgerFilter.voucherDate = dateFilter;

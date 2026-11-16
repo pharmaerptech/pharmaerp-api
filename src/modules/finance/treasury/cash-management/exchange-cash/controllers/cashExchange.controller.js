@@ -22,10 +22,22 @@ export const createCashExchange = asyncHandler(async (req, res) => {
 });
 
 export const getCashExchanges = asyncHandler(async (req, res) => {
+  const rawBranchId = req.query.branchId !== undefined
+    ? req.query.branchId
+    : (req.headers["x-branch-id"] || req.branchId || null);
+  const branchId = rawBranchId && rawBranchId !== "all" && rawBranchId !== "undefined" && rawBranchId !== "null"
+    ? rawBranchId
+    : null;
+
+  const query = {
+    ...req.query,
+    branchId: branchId || undefined,
+  };
+
   const result = await cashExchangeService.getCashExchanges(
     req.workspaceId,
     req.companyId,
-    req.query,
+    query,
   );
   return res
     .status(200)

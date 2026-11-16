@@ -67,13 +67,22 @@ const shiftSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["open", "closed", "cancelled"],
+      enum: ["open", "closing", "closed", "cancelled"],
       default: "open",
       index: true,
     },
     openedAt: {
       type: Date,
       default: Date.now,
+    },
+    closingInitiatedAt: {
+      type: Date,
+      default: null,
+    },
+    closingInitiatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
     },
     closedAt: {
       type: Date,
