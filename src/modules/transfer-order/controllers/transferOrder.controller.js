@@ -79,7 +79,7 @@ export const updateTransferOrder = asyncHandler(async (req, res) => {
 });
 
 export const getTransferOrders = asyncHandler(async (req, res) => {
-  const { page, limit, status, sourceBranchId, destinationBranchId } = req.query;
+  const { page, limit, status, sourceBranchId, destinationBranchId, transferType } = req.query;
 
   const companyId =
     req.headers["x-company-id"] ||
@@ -99,7 +99,7 @@ export const getTransferOrders = asyncHandler(async (req, res) => {
 
   const result = await transferOrderService.getTransferOrders(
     req.workspaceId,
-    { status, sourceBranchId, destinationBranchId, companyId, branchId },
+    { status, sourceBranchId, destinationBranchId, transferType, companyId, branchId },
     { page: Number(page) || 1, limit: Number(limit) || 10 },
     companyId,
     branchId

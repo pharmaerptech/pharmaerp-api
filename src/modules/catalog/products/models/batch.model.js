@@ -29,6 +29,19 @@ const batchSchema = new mongoose.Schema(
       trim: true,
     },
 
+    originalBatchNo: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
+    scrapType: {
+      type: String,
+      enum: ["NONE", "EXPIRED", "BROKEN", "SCRAP", "FRESH_RETURN"],
+      default: "NONE",
+      index: true,
+    },
+
     mrp: { type: Number, default: 0 },
     MRP: { type: Number, default: 0 },
     ptr: { type: Number, default: 0 },
@@ -63,6 +76,8 @@ const batchSchema = new mongoose.Schema(
     batchQty: { type: Number, default: 0 },
     totalReservedBatchQty: { type: Number, default: 0 },
     expiredQty: { type: Number, default: 0 },
+    brokenQty: { type: Number, default: 0 },
+    scrapQty: { type: Number, default: 0 },
 
     description: { type: String, trim: true, default: "" },
     freeScheme: { type: String, trim: true, default: "" },
@@ -72,6 +87,42 @@ const batchSchema = new mongoose.Schema(
       ref: "PurchaseBill",
       index: true,
       default: null,
+    },
+
+    // Inter-Branch Provenance & Consignment Tracking
+    isIncoming: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    sourceBranchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Branch",
+      default: null,
+      index: true,
+    },
+    sourceTransferOrderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TransferOrder",
+      default: null,
+      index: true,
+    },
+    sourceTransferOrderNo: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    sourceCompanyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Company",
+      default: null,
+      index: true,
+    },
+    sourceConsignmentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PurchaseReturn",
+      default: null,
+      index: true,
     },
 
     isDeleted: {

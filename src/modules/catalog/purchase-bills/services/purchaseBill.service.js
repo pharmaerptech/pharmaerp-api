@@ -289,6 +289,26 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
     throw new ApiError(400, "Purchase bill has already been ingested (RECEIVED).");
   }
 
+  // Determine effective target branch:
+  // 1. Priority to bill.branchId if recorded on the purchase bill
+  // 2. Caller/header branchId
+  // 3. Fallback to first company active branch if neither was specified
+  let effectiveBranchId = bill.branchId || branchId || null;
+  if (!effectiveBranchId) {
+    try {
+      const activeBranches = await branchRepository.getCompanyBranches(companyId);
+      if (Array.isArray(activeBranches) && activeBranches.length > 0) {
+        effectiveBranchId = activeBranches[0]._id;
+      }
+    } catch (bErr) { }
+  }
+
+  // Ensure bill has branchId persisted if missing
+  if (effectiveBranchId && !bill.branchId) {
+    bill.branchId = effectiveBranchId;
+    await bill.save();
+  }
+
   // Iterate over all items in the purchase bill
   for (const item of bill.items) {
     if (!item.productId) continue;
@@ -298,13 +318,18 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
 
     const formattedExpiry = formatExpiry(item.expiry);
 
-    // 1. Update or Create Batch
-    let batch = await Batch.findOne({
+    // 1. Update or Create Batch strictly scoped to effectiveBranchId
+    const batchFilter = {
       workspaceId,
       product: item.productId,
       batchNo: item.batch,
       expiryDate: formattedExpiry,
-    });
+    };
+    if (effectiveBranchId) {
+      batchFilter.branch_id = effectiveBranchId;
+    }
+
+    let batch = await Batch.findOne(batchFilter);
 
     if (batch) {
       batch.batchQty += totalIngestQty;
@@ -318,11 +343,12 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
       batch.finalRateB = item.finalRateB || batch.finalRateB;
       batch.finalRateC = item.finalRateC || batch.finalRateC;
       batch.schemeDiscountPercent = item.saleScheme || batch.schemeDiscountPercent;
+      batch.purchaseBillId = bill._id;
       await batch.save();
     } else {
       batch = await Batch.create({
         workspaceId,
-        branch_id: branchId || null,
+        branch_id: effectiveBranchId || null,
         product: item.productId,
         batchNo: item.batch,
         expiryDate: formattedExpiry,
@@ -340,11 +366,11 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
       });
     }
 
-    // 2. Update or Create ProductFacility
-    if (branchId) {
+    // 2. Update or Create ProductFacility strictly scoped to effectiveBranchId
+    if (effectiveBranchId) {
       let facility = await ProductFacility.findOne({
         workspaceId,
-        facility_id: branchId,
+        facility_id: effectiveBranchId,
         product_id: item.productId,
       });
 
@@ -356,7 +382,7 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
       } else {
         facility = await ProductFacility.create({
           workspaceId,
-          facility_id: branchId,
+          facility_id: effectiveBranchId,
           product_id: item.productId,
           total_qty_available: totalIngestQty,
           qoh: totalIngestQty,
@@ -487,7 +513,7 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
     const supplierGstin = supplier?.gstNumber || "";
     const isIgst = companyGstin && supplierGstin && companyGstin.substring(0, 2) !== supplierGstin.substring(0, 2);
 
-    let resolvedBranchId = bill.branchId || branchId;
+    let resolvedBranchId = effectiveBranchId;
     if (!resolvedBranchId) {
       resolvedBranchId = (await branchRepository.getDefaultBranch(workspaceId))?._id || null;
     }

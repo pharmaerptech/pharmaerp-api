@@ -209,6 +209,12 @@ const branchSchema = new mongoose.Schema(
       index: true,
     },
 
+    isScrapStore: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
     email: {
       type: String,
       trim: true,

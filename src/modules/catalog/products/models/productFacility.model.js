@@ -50,6 +50,21 @@ const productFacilitySchema = new mongoose.Schema(
       default: 0,
     },
 
+    scrapQty: {
+      type: Number,
+      default: 0,
+    },
+
+    expiredQty: {
+      type: Number,
+      default: 0,
+    },
+
+    brokenQty: {
+      type: Number,
+      default: 0,
+    },
+
     poStatus: {
       type: String,
       enum: ["NONE", "PO_PLACED"],

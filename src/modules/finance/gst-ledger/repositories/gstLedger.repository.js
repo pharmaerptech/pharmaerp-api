@@ -1,7 +1,210 @@
 import mongoose from "mongoose";
 import GstLedger from "../models/gstLedger.model.js";
-import calculateGstr1Summary, { deduceGstrGroup, isCreditNoteEntry } from "../utils/gstr1SummaryCalculator.js";
+import calculateGstr1Summary, { deduceGstrGroup, isCreditNoteEntry, isValidGstin } from "../utils/gstr1SummaryCalculator.js";
 import { calculateGstr3bSummary } from "../utils/gstr3bSummaryCalculator.js";
+
+export const buildDateFilter = (startDate, endDate) => {
+  if (!startDate && !endDate) return null;
+
+  const dateCond = {};
+
+  if (startDate) {
+    const raw = String(startDate).trim();
+    if (raw.includes("T")) {
+      const d = new Date(raw);
+      if (!isNaN(d.getTime())) dateCond.$gte = d;
+    } else {
+      const dLocal = new Date(raw);
+      dLocal.setHours(0, 0, 0, 0);
+      const dUtc = new Date(`${raw}T00:00:00.000Z`);
+      const minTime = Math.min(
+        isNaN(dLocal.getTime()) ? Infinity : dLocal.getTime(),
+        isNaN(dUtc.getTime()) ? Infinity : dUtc.getTime()
+      );
+      if (minTime !== Infinity) dateCond.$gte = new Date(minTime);
+    }
+  }
+
+  if (endDate) {
+    const raw = String(endDate).trim();
+    if (raw.includes("T")) {
+      const d = new Date(raw);
+      if (!isNaN(d.getTime())) dateCond.$lte = d;
+    } else {
+      const dLocal = new Date(raw);
+      dLocal.setHours(23, 59, 59, 999);
+      const dUtc = new Date(`${raw}T23:59:59.999Z`);
+      const maxTime = Math.max(
+        isNaN(dLocal.getTime()) ? -Infinity : dLocal.getTime(),
+        isNaN(dUtc.getTime()) ? -Infinity : dUtc.getTime()
+      );
+      if (maxTime !== -Infinity) dateCond.$lte = new Date(maxTime);
+    }
+  }
+
+  if (dateCond.$gte && dateCond.$lte && dateCond.$gte > dateCond.$lte) {
+    const temp = dateCond.$gte;
+    dateCond.$gte = dateCond.$lte;
+    dateCond.$lte = temp;
+  }
+
+  return Object.keys(dateCond).length > 0 ? dateCond : null;
+};
+
+export const syncMissingSalesReturnsToGstLedger = async (workspaceId, companyId) => {
+  try {
+    const db = mongoose.connection.db;
+    if (!db) return;
+
+    const wId = new mongoose.Types.ObjectId(workspaceId);
+    const cId = new mongoose.Types.ObjectId(companyId);
+
+    // 1. Check salesreturns collection
+    const returns = await db.collection("salesreturns").find({
+      workspaceId: wId,
+      companyId: cId,
+    }).toArray();
+
+    if (returns && returns.length > 0) {
+      const returnVoucherIds = returns.map((r) => r._id);
+      const existingLedgers = await GstLedger.find({
+        workspaceId: wId,
+        companyId: cId,
+        voucherId: { $in: returnVoucherIds },
+      }).lean();
+
+      const existingMap = new Map();
+      existingLedgers.forEach((l) => existingMap.set(l.voucherId.toString(), l));
+
+      for (const ret of returns) {
+        const existing = existingMap.get(ret._id.toString());
+        if (existing) {
+          const updates = {};
+          if (!existing.branchId && ret.branchId) {
+            updates.branchId = ret.branchId;
+          }
+          if (!existing.groupDescription || existing.groupDescription.startsWith("B2")) {
+            updates.groupDescription = deduceGstrGroup({
+              ...existing,
+              voucherNumber: ret.invoiceNo || ret.returnNo,
+              narration: existing.narration || `Sales return memo ${ret.invoiceNo || ret.returnNo}`,
+            });
+          }
+          if (Object.keys(updates).length > 0) {
+            await GstLedger.updateOne({ _id: existing._id }, { $set: updates }).catch(() => {});
+          }
+        } else {
+          const totalGst = Number(ret.tax || 0);
+          const halfGst = totalGst / 2;
+          const grandTotal = Number(ret.grandTotal || ret.returnAmount || 0);
+          const taxableAmt = Number(ret.subtotal || 0) - Number(ret.discount || 0);
+
+          let isReg = false;
+          if (ret.customerId) {
+            const cust = await db.collection("customers").findOne({ _id: ret.customerId });
+            const custGstin = (cust?.gstNumber || cust?.gstin || "").trim().toUpperCase();
+            if (custGstin.length >= 15 && isValidGstin(custGstin)) {
+              isReg = true;
+            }
+          }
+          const groupDescription = isReg ? "Credit Note - Registered" : "Credit Note - Unregistered";
+
+          await GstLedger.create([{
+            workspaceId: ret.workspaceId,
+            companyId: ret.companyId,
+            branchId: ret.branchId || null,
+            partyId: ret.customerId || null,
+            voucherId: ret._id,
+            voucherNumber: ret.invoiceNo || ret.returnNo || `RET-${ret._id.toString().slice(-6)}`,
+            voucherDate: ret.date ? new Date(ret.date) : (ret.createdAt ? new Date(ret.createdAt) : new Date()),
+            gstType: "GSTR-1",
+            groupDescription,
+            taxableAmount: taxableAmt,
+            cgst: halfGst,
+            sgst: halfGst,
+            igst: 0,
+            totalAmount: grandTotal,
+            narration: `Credit Note / Sales Return ${ret.invoiceNo || ret.returnNo || ""}`,
+          }]).catch(() => {});
+        }
+      }
+    }
+
+    // 2. Also check legacy invoices with isReturn: true
+    const legacyReturns = await db.collection("invoices").find({
+      workspaceId: wId,
+      companyId: cId,
+      isReturn: true,
+    }).toArray();
+
+    if (legacyReturns && legacyReturns.length > 0) {
+      const legVoucherIds = legacyReturns.map((inv) => inv._id);
+      const existingLedgers = await GstLedger.find({
+        workspaceId: wId,
+        companyId: cId,
+        voucherId: { $in: legVoucherIds },
+      }).lean();
+
+      const existingMap = new Map();
+      existingLedgers.forEach((l) => existingMap.set(l.voucherId.toString(), l));
+
+      for (const inv of legacyReturns) {
+        const existing = existingMap.get(inv._id.toString());
+        if (existing) {
+          const updates = {};
+          if (!existing.branchId && inv.branchId) {
+            updates.branchId = inv.branchId;
+          }
+          if (!existing.groupDescription || existing.groupDescription.startsWith("B2")) {
+            updates.groupDescription = deduceGstrGroup({
+              ...existing,
+              voucherNumber: inv.invoiceNo,
+              narration: existing.narration || `Sales return memo ${inv.invoiceNo}`,
+            });
+          }
+          if (Object.keys(updates).length > 0) {
+            await GstLedger.updateOne({ _id: existing._id }, { $set: updates }).catch(() => {});
+          }
+        } else {
+          const totalGst = Number(inv.tax || 0);
+          const halfGst = totalGst / 2;
+          const grandTotal = Number(inv.grandTotal || 0);
+          const taxableAmt = Number(inv.subtotal || 0) - Number(inv.discount || 0);
+
+          let isReg = false;
+          if (inv.customerId) {
+            const cust = await db.collection("customers").findOne({ _id: inv.customerId });
+            const custGstin = (cust?.gstNumber || cust?.gstin || "").trim().toUpperCase();
+            if (custGstin.length >= 15 && isValidGstin(custGstin)) {
+              isReg = true;
+            }
+          }
+          const groupDescription = isReg ? "Credit Note - Registered" : "Credit Note - Unregistered";
+
+          await GstLedger.create([{
+            workspaceId: inv.workspaceId,
+            companyId: inv.companyId,
+            branchId: inv.branchId || null,
+            partyId: inv.customerId || null,
+            voucherId: inv._id,
+            voucherNumber: inv.invoiceNo,
+            voucherDate: inv.date ? new Date(inv.date) : (inv.createdAt ? new Date(inv.createdAt) : new Date()),
+            gstType: "GSTR-1",
+            groupDescription,
+            taxableAmount: taxableAmt,
+            cgst: halfGst,
+            sgst: halfGst,
+            igst: 0,
+            totalAmount: grandTotal,
+            narration: `Credit Note / Sales Return ${inv.invoiceNo}`,
+          }]).catch(() => {});
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("syncMissingSalesReturnsToGstLedger error:", err.message);
+  }
+};
 
 const createGstLedgerEntry = async (payload, options = {}) => {
   const [entry] = await GstLedger.create([payload], {
@@ -37,6 +240,10 @@ const getGstLedgerEntries = async (
     return { entries: [], total: 0, page: 1, limit: 20 };
   }
 
+  if (gstType === "GSTR-1") {
+    await syncMissingSalesReturnsToGstLedger(workspaceId, companyId);
+  }
+
   const query = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
     gstType,
@@ -45,14 +252,9 @@ const getGstLedgerEntries = async (
     query.companyId = new mongoose.Types.ObjectId(companyId);
   }
 
-  if (filters.startDate || filters.endDate) {
-    query.voucherDate = {};
-    if (filters.startDate) {
-      query.voucherDate.$gte = new Date(filters.startDate);
-    }
-    if (filters.endDate) {
-      query.voucherDate.$lte = new Date(filters.endDate);
-    }
+  const dateFilter = buildDateFilter(filters.startDate, filters.endDate);
+  if (dateFilter) {
+    query.voucherDate = dateFilter;
   }
 
   // Filter by specific branch (if "all" or omitted, queries company-wide)
@@ -65,19 +267,39 @@ const getGstLedgerEntries = async (
       const db = mongoose.connection.db;
       if (db) {
         if (gstType === "GSTR-1") {
-          const invoices = await db.collection("invoices").find({
-            workspaceId: new mongoose.Types.ObjectId(workspaceId),
-            companyId: new mongoose.Types.ObjectId(companyId),
-            branchId: targetBranchId,
-          }).project({ _id: 1 }).toArray();
-          voucherIdsForBranch = invoices.map((inv) => inv._id);
+          const [invoices, salesReturns] = await Promise.all([
+            db.collection("invoices").find({
+              workspaceId: new mongoose.Types.ObjectId(workspaceId),
+              companyId: new mongoose.Types.ObjectId(companyId),
+              branchId: targetBranchId,
+            }).project({ _id: 1 }).toArray(),
+            db.collection("salesreturns").find({
+              workspaceId: new mongoose.Types.ObjectId(workspaceId),
+              companyId: new mongoose.Types.ObjectId(companyId),
+              branchId: targetBranchId,
+            }).project({ _id: 1 }).toArray(),
+          ]);
+          voucherIdsForBranch = [
+            ...invoices.map((inv) => inv._id),
+            ...salesReturns.map((ret) => ret._id),
+          ];
         } else if (gstType === "GSTR-2") {
-          const purchaseBills = await db.collection("purchasebills").find({
-            workspaceId: new mongoose.Types.ObjectId(workspaceId),
-            companyId: new mongoose.Types.ObjectId(companyId),
-            branchId: targetBranchId,
-          }).project({ _id: 1 }).toArray();
-          voucherIdsForBranch = purchaseBills.map((pb) => pb._id);
+          const [purchaseBills, purchaseReturns] = await Promise.all([
+            db.collection("purchasebills").find({
+              workspaceId: new mongoose.Types.ObjectId(workspaceId),
+              companyId: new mongoose.Types.ObjectId(companyId),
+              branchId: targetBranchId,
+            }).project({ _id: 1 }).toArray(),
+            db.collection("purchasereturns").find({
+              workspaceId: new mongoose.Types.ObjectId(workspaceId),
+              companyId: new mongoose.Types.ObjectId(companyId),
+              branchId: targetBranchId,
+            }).project({ _id: 1 }).toArray(),
+          ]);
+          voucherIdsForBranch = [
+            ...purchaseBills.map((pb) => pb._id),
+            ...purchaseReturns.map((pr) => pr._id),
+          ];
         }
       }
     } catch (e) {
@@ -189,6 +411,12 @@ const getGstLedgerEntries = async (
   if (options.all === true) {
     const entries = await GstLedger.find(query)
       .populate({ path: "branchId", select: "name code", strictPopulate: false })
+      .populate({
+        path: "partyId",
+        model: filters.gstType === "GSTR-2" ? "Supplier" : "Customer",
+        select: "name gstNumber gstin",
+        strictPopulate: false,
+      })
       .sort(sort)
       .session(options.session || null);
     const stats = calculateEntriesStats(entries, entries.length);
@@ -210,6 +438,12 @@ const getGstLedgerEntries = async (
   const [entries, total, aggStats] = await Promise.all([
     GstLedger.find(query)
       .populate({ path: "branchId", select: "name code", strictPopulate: false })
+      .populate({
+        path: "partyId",
+        model: filters.gstType === "GSTR-2" ? "Supplier" : "Customer",
+        select: "name gstNumber gstin",
+        strictPopulate: false,
+      })
       .sort(sort)
       .skip(skip)
       .limit(limit)
@@ -394,6 +628,8 @@ const getGstr1Summary = async (workspaceId, companyId, filters = {}, options = {
     return { groups: [], totalRow: {}, localSummary: {}, centralSummary: {} };
   }
 
+  await syncMissingSalesReturnsToGstLedger(workspaceId, companyId);
+
   const query = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
     gstType: "GSTR-1",
@@ -402,14 +638,9 @@ const getGstr1Summary = async (workspaceId, companyId, filters = {}, options = {
     query.companyId = new mongoose.Types.ObjectId(companyId);
   }
 
-  if (filters.startDate || filters.endDate) {
-    query.voucherDate = {};
-    if (filters.startDate) {
-      query.voucherDate.$gte = new Date(filters.startDate);
-    }
-    if (filters.endDate) {
-      query.voucherDate.$lte = new Date(filters.endDate);
-    }
+  const dateFilter = buildDateFilter(filters.startDate, filters.endDate);
+  if (dateFilter) {
+    query.voucherDate = dateFilter;
   }
 
   if (filters.branchId && filters.branchId !== "all" && mongoose.Types.ObjectId.isValid(filters.branchId)) {
@@ -418,12 +649,22 @@ const getGstr1Summary = async (workspaceId, companyId, filters = {}, options = {
     try {
       const db = mongoose.connection.db;
       if (db) {
-        const invoices = await db.collection("invoices").find({
-          workspaceId: new mongoose.Types.ObjectId(workspaceId),
-          companyId: new mongoose.Types.ObjectId(companyId),
-          branchId: targetBranchId,
-        }).project({ _id: 1 }).toArray();
-        voucherIdsForBranch = invoices.map((inv) => inv._id);
+        const [invoices, salesReturns] = await Promise.all([
+          db.collection("invoices").find({
+            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            companyId: new mongoose.Types.ObjectId(companyId),
+            branchId: targetBranchId,
+          }).project({ _id: 1 }).toArray(),
+          db.collection("salesreturns").find({
+            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            companyId: new mongoose.Types.ObjectId(companyId),
+            branchId: targetBranchId,
+          }).project({ _id: 1 }).toArray(),
+        ]);
+        voucherIdsForBranch = [
+          ...invoices.map((inv) => inv._id),
+          ...salesReturns.map((ret) => ret._id),
+        ];
       }
     } catch (e) {
       console.error("Error looking up vouchers for branch in getGstr1Summary:", e);
@@ -454,7 +695,7 @@ const getGstr1Summary = async (workspaceId, companyId, filters = {}, options = {
   }
 
   const entries = await GstLedger.find(query)
-    .populate({ path: "partyId", select: "name gstNumber" })
+    .populate({ path: "partyId", model: "Customer", select: "name gstNumber gstin", strictPopulate: false })
     .lean();
 
   entries.forEach((entry) => {
@@ -488,14 +729,9 @@ const getGstr3bSummary = async (workspaceId, companyId, filters = {}, options = 
     baseQuery.companyId = new mongoose.Types.ObjectId(companyId);
   }
 
-  if (filters.startDate || filters.endDate) {
-    baseQuery.voucherDate = {};
-    if (filters.startDate) {
-      baseQuery.voucherDate.$gte = new Date(filters.startDate);
-    }
-    if (filters.endDate) {
-      baseQuery.voucherDate.$lte = new Date(filters.endDate);
-    }
+  const dateFilter = buildDateFilter(filters.startDate, filters.endDate);
+  if (dateFilter) {
+    baseQuery.voucherDate = dateFilter;
   }
 
   if (filters.branchId && filters.branchId !== "all" && mongoose.Types.ObjectId.isValid(filters.branchId)) {
@@ -504,12 +740,34 @@ const getGstr3bSummary = async (workspaceId, companyId, filters = {}, options = 
     try {
       const db = mongoose.connection.db;
       if (db) {
-        const invoices = await db.collection("invoices").find({
-          workspaceId: new mongoose.Types.ObjectId(workspaceId),
-          companyId: new mongoose.Types.ObjectId(companyId),
-          branchId: targetBranchId,
-        }).project({ _id: 1 }).toArray();
-        voucherIdsForBranch = invoices.map((inv) => inv._id);
+        const [invoices, salesReturns, purchaseBills, purchaseReturns] = await Promise.all([
+          db.collection("invoices").find({
+            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            companyId: new mongoose.Types.ObjectId(companyId),
+            branchId: targetBranchId,
+          }).project({ _id: 1 }).toArray(),
+          db.collection("salesreturns").find({
+            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            companyId: new mongoose.Types.ObjectId(companyId),
+            branchId: targetBranchId,
+          }).project({ _id: 1 }).toArray(),
+          db.collection("purchasebills").find({
+            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            companyId: new mongoose.Types.ObjectId(companyId),
+            branchId: targetBranchId,
+          }).project({ _id: 1 }).toArray(),
+          db.collection("purchasereturns").find({
+            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            companyId: new mongoose.Types.ObjectId(companyId),
+            branchId: targetBranchId,
+          }).project({ _id: 1 }).toArray(),
+        ]);
+        voucherIdsForBranch = [
+          ...invoices.map((inv) => inv._id),
+          ...salesReturns.map((ret) => ret._id),
+          ...purchaseBills.map((pb) => pb._id),
+          ...purchaseReturns.map((pr) => pr._id),
+        ];
       }
     } catch (e) {
       console.error("Error looking up vouchers for branch in getGstr3bSummary:", e);
@@ -527,10 +785,10 @@ const getGstr3bSummary = async (workspaceId, companyId, filters = {}, options = 
 
   const [gstr1Entries, gstr2Entries] = await Promise.all([
     GstLedger.find({ ...baseQuery, gstType: "GSTR-1" })
-      .populate({ path: "partyId", select: "name gstNumber" })
+      .populate({ path: "partyId", model: "Customer", select: "name gstNumber gstin", strictPopulate: false })
       .lean(),
     GstLedger.find({ ...baseQuery, gstType: "GSTR-2" })
-      .populate({ path: "partyId", select: "name gstNumber" })
+      .populate({ path: "partyId", model: "Supplier", select: "name gstNumber gstin", strictPopulate: false })
       .lean(),
   ]);
 
@@ -543,4 +801,6 @@ export default {
   getGstLedgerEntries,
   getGstr1Summary,
   getGstr3bSummary,
+  buildDateFilter,
+  syncMissingSalesReturnsToGstLedger,
 };

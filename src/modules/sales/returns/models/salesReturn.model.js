@@ -154,6 +154,22 @@ const salesReturnSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    returnMotive: {
+      type: String,
+      enum: ["general", "expired", "broken", "mixed", null],
+      default: "general",
+    },
+    transferOrderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TransferOrder",
+      default: null,
+      index: true,
+    },
+    transferOrderNo: {
+      type: String,
+      default: null,
+      index: true,
+    },
     status: {
       type: String,
       enum: ["Completed", "Draft", "Cancelled"],

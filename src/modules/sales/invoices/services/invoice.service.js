@@ -45,6 +45,126 @@ const isCreditNotePayment = (pType) => {
 };
 
 /**
+ * Format expiry dates cleanly (e.g. 2027-08 -> 08/27, or preserve 08/27)
+ */
+export const formatExpiryDate = (val) => {
+  if (!val || val === "—" || val === "-" || val === "null" || val === "undefined") return "—";
+  const str = String(val).trim();
+  if (!str) return "—";
+  // Already in MM/YY or MM/YYYY format
+  if (/^\d{1,2}\/\d{2,4}$/.test(str)) {
+    const parts = str.split("/");
+    const mm = parts[0].padStart(2, "0");
+    const yy = parts[1].length === 4 ? parts[1].slice(-2) : parts[1];
+    return `${mm}/${yy}`;
+  }
+  // YYYY-MM format like "2027-08"
+  if (/^\d{4}-\d{2}$/.test(str)) {
+    const [yyyy, mm] = str.split("-");
+    return `${mm}/${yyyy.slice(-2)}`;
+  }
+  // ISO Date or parseable Date string
+  const dateObj = new Date(str);
+  if (!isNaN(dateObj.getTime())) {
+    const mm = String(dateObj.getMonth() + 1).padStart(2, "0");
+    const yy = String(dateObj.getFullYear()).slice(-2);
+    return `${mm}/${yy}`;
+  }
+  return str;
+};
+
+/**
+ * Enrich invoice items with batch expiry dates, pack & rack by querying Batch model
+ */
+export const enrichInvoiceItemsWithBatchExpiry = async (invoices, workspaceId) => {
+  if (!Array.isArray(invoices) || invoices.length === 0) return invoices;
+
+  const missingBatchLookups = [];
+  for (const inv of invoices) {
+    for (const item of (inv.items || [])) {
+      const exp = item.expiry || item.expiryDate || item.expDate;
+      const prodId = item.productId || item._id;
+      const bNo = item.batch || item.batchNo;
+      if ((!exp || exp === "—" || exp === "-") && prodId && bNo) {
+        missingBatchLookups.push({
+          product: mongoose.Types.ObjectId.isValid(prodId) ? new mongoose.Types.ObjectId(prodId) : prodId,
+          batchNo: String(bNo).trim(),
+        });
+      }
+    }
+  }
+
+  const batchLookupMap = new Map();
+  if (missingBatchLookups.length > 0 && workspaceId) {
+    try {
+      const validProdIds = Array.from(
+        new Set(
+          missingBatchLookups
+            .filter((b) => mongoose.Types.ObjectId.isValid(b.product))
+            .map((b) => b.product.toString())
+        )
+      ).map((id) => new mongoose.Types.ObjectId(id));
+
+      const batchNumbers = Array.from(new Set(missingBatchLookups.map((b) => b.batchNo)));
+
+      if (validProdIds.length > 0 && batchNumbers.length > 0) {
+        const foundBatches = await Batch.find({
+          workspaceId: new mongoose.Types.ObjectId(workspaceId),
+          product: { $in: validProdIds },
+          batchNo: { $in: batchNumbers },
+          isDeleted: false,
+        })
+          .select("_id product batchNo expiryDate mrp rate pack rack")
+          .lean();
+
+        foundBatches.forEach((b) => {
+          const key = `${b.product.toString()}_${b.batchNo.toString().trim().toUpperCase()}`;
+          batchLookupMap.set(key, b);
+        });
+      }
+    } catch (err) {
+      console.warn("enrichInvoiceItemsWithBatchExpiry: Batch lookup error:", err.message);
+    }
+  }
+
+  for (const inv of invoices) {
+    if (Array.isArray(inv.items)) {
+      inv.items = inv.items.map((item) => {
+        const prodId = item.productId || item._id;
+        const bNo = item.batch || item.batchNo || "";
+        const batchKey = prodId && bNo ? `${prodId.toString()}_${bNo.toString().trim().toUpperCase()}` : null;
+        const batchDoc = batchKey ? batchLookupMap.get(batchKey) : null;
+
+        const rawExpiry = item.expiry || item.expiryDate || item.expDate || batchDoc?.expiryDate || "";
+        const expiryFormatted = formatExpiryDate(rawExpiry);
+
+        return {
+          ...item,
+          id: item.id || item._id || prodId,
+          productId: prodId,
+          name: item.name || item.productName || item.workspaceProduct?.name || "Product",
+          batch: bNo,
+          batchNo: bNo,
+          batchId: item.batchId || batchDoc?._id || null,
+          expiry: expiryFormatted,
+          expiryDate: expiryFormatted,
+          pack: item.pack || batchDoc?.pack || item.workspaceProduct?.pack || "PCS",
+          rack: item.rack || batchDoc?.rack || item.workspaceProduct?.rack || "",
+          rate: Number(item.rate ?? item.price ?? item.rateC ?? item.mrp ?? 0),
+          price: Number(item.price ?? item.rate ?? 0),
+          mrp: Number(item.mrp ?? batchDoc?.mrp ?? 0),
+          disc: Number(item.disc ?? 0),
+          gst: Number(item.gst ?? item.tax ?? 5),
+          tax: Number(item.tax ?? item.gst ?? 5),
+        };
+      });
+    }
+  }
+
+  return invoices;
+};
+
+/**
  * Validates that all cash payments have explicit denomination breakdowns
  * and that received - returned exactly equals the cash amount.
  */
@@ -487,8 +607,8 @@ const postSaleAccounting = async ({
     );
 
     const companyGstin = resolvedCompany?.gstin || "";
-    const customerGstin = customer?.gstNumber || "";
-    const hasCustomerGst = customerGstin && /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(customerGstin.trim().toUpperCase());
+    const customerGstin = (customer?.gstNumber || customer?.gstin || saleData?.customerGstin || "").trim().toUpperCase();
+    const hasCustomerGst = customerGstin.length >= 10;
     const grandTotal = Number(invoice.grandTotal || 0);
     const isIgst = Boolean(
       invoice.isIgst ||
@@ -499,7 +619,7 @@ const postSaleAccounting = async ({
     let groupDescription = "B2C (Small) Invoice";
     if (invoice.isExport || String(invoice.billingMode).toUpperCase() === "EXPORT") {
       groupDescription = "Export Invoices";
-    } else if (hasCustomerGst || String(invoice.billingMode).toUpperCase() === "B2B") {
+    } else if (hasCustomerGst && String(invoice.billingMode).toUpperCase() === "B2B") {
       groupDescription = "B2B";
     } else if (isIgst && grandTotal > 250000) {
       groupDescription = "B2C (Large) Invoice";
@@ -1481,6 +1601,44 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
 
   const isAllCredit = creditPortion >= grandTotal - 0.01 && grandTotal > 0;
 
+  // Enrich items with batch expiry & batchNo before saving to guarantee persistence
+  if (Array.isArray(saleData.items) && saleData.items.length > 0) {
+    for (const it of saleData.items) {
+      const prodId = it.productId || it.product_id || it.id;
+      const bNo = it.batch || it.batchNo;
+      if ((!it.expiry || it.expiry === "—" || it.expiry === "-") && (!it.expiryDate || it.expiryDate === "—" || it.expiryDate === "-") && prodId && bNo) {
+        const bDoc = await Batch.findOne({
+          workspaceId: workspaceId || customer.workspaceId,
+          product: prodId,
+          batchNo: bNo,
+          isDeleted: false,
+        })
+          .select("expiryDate pack rack mrp rate")
+          .session(session);
+        if (bDoc) {
+          it.expiry = formatExpiryDate(bDoc.expiryDate);
+          it.expiryDate = formatExpiryDate(bDoc.expiryDate);
+          if (!it.pack && bDoc.pack) it.pack = bDoc.pack;
+          if (!it.rack && bDoc.rack) it.rack = bDoc.rack;
+        }
+      } else if (it.expiry || it.expiryDate) {
+        const formatted = formatExpiryDate(it.expiry || it.expiryDate);
+        it.expiry = formatted;
+        it.expiryDate = formatted;
+      }
+      if (!it.batch && it.batchNo) it.batch = it.batchNo;
+      if (!it.batchNo && it.batch) it.batchNo = it.batch;
+    }
+  }
+
+  // Enforce B2C invoice creation if customer does not have a valid GST number
+  const resolvedCustomerGstin = (customer?.gstNumber || customer?.gstin || saleData.customerGstin || "").trim().toUpperCase();
+  const customerHasValidGst = resolvedCustomerGstin.length >= 15 && /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(resolvedCustomerGstin);
+  let effectiveBillingMode = saleData.billingMode || "B2C";
+  if (String(effectiveBillingMode).toUpperCase() === "B2B" && !customerHasValidGst) {
+    effectiveBillingMode = "B2C";
+  }
+
   const newSale = {
     workspaceId: workspaceId || customer.workspaceId,
     companyId: companyId || customer.companyId,
@@ -1491,7 +1649,7 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     financialPeriodId,
     shiftId: resolvedShiftId || null,
     businessDayId: resolvedBusinessDayId || null,
-    billingMode: saleData.billingMode || "B2C",
+    billingMode: effectiveBillingMode,
     subtotal: saleData.subtotal || 0,
     discount: saleData.discount || 0,
     tax: saleData.tax || 0,
@@ -1747,7 +1905,13 @@ const updateCustomerSale = async (invoiceId, customerId, saleData, companyId, wo
       existingInvoice.shiftId = saleData.shiftId;
     }
     if (saleData.billingMode) {
-      existingInvoice.billingMode = saleData.billingMode;
+      const updateCustGstin = (customer?.gstNumber || customer?.gstin || saleData.customerGstin || "").trim().toUpperCase();
+      const updateCustHasGst = updateCustGstin.length >= 15 && /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(updateCustGstin);
+      let effectiveMode = saleData.billingMode;
+      if (String(effectiveMode).toUpperCase() === "B2B" && !updateCustHasGst) {
+        effectiveMode = "B2C";
+      }
+      existingInvoice.billingMode = effectiveMode;
     }
     existingInvoice.subtotal = Number(saleData.subtotal !== undefined ? saleData.subtotal : existingInvoice.subtotal);
     existingInvoice.discount = Number(saleData.discount !== undefined ? saleData.discount : existingInvoice.discount);
@@ -1991,16 +2155,24 @@ const getCustomerSales = async (
     { page, limit }
   );
 
+  // Auto-enrich any items missing expiry dates by querying Batches
+  await enrichInvoiceItemsWithBatchExpiry(result.sales, workspaceId);
+
   const enrichedSales = (result.sales || []).map((inv) => {
     const custIdStr = (inv.customerId?._id || inv.customerId)?.toString();
     const memberInfo = familyMemberMap.get(custIdStr);
 
-    // Slim down items array - strip heavy embedded workspaceProduct object
     const items = (inv.items || []).map((item) => ({
       id: item.id || item._id || item.productId,
       productId: item.productId || item._id,
       name: item.name || item.productName || item.workspaceProduct?.name || "Product",
       batch: item.batch || item.batchNo || "",
+      batchNo: item.batchNo || item.batch || "",
+      batchId: item.batchId || null,
+      expiry: item.expiry || item.expiryDate || "—",
+      expiryDate: item.expiryDate || item.expiry || "—",
+      pack: item.pack || "PCS",
+      rack: item.rack || "",
       qty: item.qty || 1,
       returnedQty: Number(item.returnedQty || 0),
       isReturned: Boolean(item.isReturned || (Number(item.returnedQty || 0) >= Number(item.qty || 1))),
@@ -2009,6 +2181,8 @@ const getCustomerSales = async (
       price: Number(item.price ?? item.rate ?? 0),
       mrp: Number(item.mrp ?? 0),
       disc: Number(item.disc ?? 0),
+      gst: Number(item.gst ?? item.tax ?? 5),
+      tax: Number(item.tax ?? item.gst ?? 5),
     }));
 
     return {
@@ -2061,6 +2235,9 @@ const getAllCustomerSales = async (companyId, workspaceId, filters = {}, paginat
     filters,
     pagination
   );
+
+  // Auto-enrich any items missing expiry dates
+  await enrichInvoiceItemsWithBatchExpiry(result.sales, workspaceId);
 
   return {
     data: result.sales,
@@ -2348,7 +2525,8 @@ const getInvoiceById = async (invoiceId, companyId, workspaceId) => {
   if (!invoice) {
     throw new ApiError(404, "Invoice not found");
   }
-  return invoice;
+  const [enriched] = await enrichInvoiceItemsWithBatchExpiry([invoice], workspaceId);
+  return enriched;
 };
 
 export default {

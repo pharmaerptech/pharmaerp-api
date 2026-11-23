@@ -78,7 +78,7 @@ export const getPurchaseBillById = asyncHandler(async (req, res) => {
 });
 
 export const ingestPurchaseBill = asyncHandler(async (req, res) => {
-  let branchId = req.headers["x-branch-id"] || req.body.branchId || null;
+  let branchId = req.headers["x-branch-id"] || req.body.branchId || req.branchId || null;
 
   console.log(`[Controller] Ingesting Purchase Bill ID: ${req.params.billId}`);
 

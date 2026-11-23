@@ -12,6 +12,7 @@ export const BRANCH_TYPE = {
   CLINIC_PHARMACY: "clinic_pharmacy",
   HOSPITAL_PHARMACY: "hospital_pharmacy",
   ONLINE: "online",
+  SCRAP: "scrap",
   OTHER: "other",
 };
 

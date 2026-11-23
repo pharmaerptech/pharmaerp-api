@@ -80,11 +80,17 @@ const getWorkspaceBranches = async (workspaceId, options = {}) => {
     return [];
   }
 
-  return Branch.find({
+  const query = {
     workspaceId,
     isDeleted: false,
-  })
-    .populate("companyId", "name legalName code")
+  };
+
+  if (options.companyId && mongoose.Types.ObjectId.isValid(options.companyId)) {
+    query.companyId = options.companyId;
+  }
+
+  return Branch.find(query)
+    .populate("companyId", "name legalName gstin code")
     .sort(options.sort || { createdAt: -1 })
     .select(options.select || "");
 };

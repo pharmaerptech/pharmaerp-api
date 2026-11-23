@@ -22,12 +22,15 @@ import { Shift } from "../../../operations/shifts/shift.model.js";
 import BusinessDay from "../../../operations/business-days/businessDay.model.js";
 import branchCashRepository from "../../../finance/treasury/cash-management/branch-cash/repositories/branchCash.repository.js";
 import cashTransactionService from "../../../finance/treasury/cash-management/cash-transactions/services/cashTransaction.service.js";
+import Branch from "../../../organization/branches/models/branch.model.js";
 import { decomposeCashAmount } from "../../../parties/customers/services/customerAdvance.service.js";
 
 /**
  * Restock inventory for returned items (increment Batch & ProductFacility quantities)
+ * For general returns: increments sellable stock (batchQty, total_qty_available, qoh, atp).
+ * For scrap/broken/expired returns: increments quarantine scrap bin stock (scrapQty, brokenQty, expiredQty) in the branch.
  */
-const restockReturnInventory = async (items, branchId, workspaceId, session) => {
+const restockReturnInventory = async (items, branchId, workspaceId, session, isScrap = false) => {
   if (!Array.isArray(items) || items.length === 0) return;
 
   const branchObjId =
@@ -41,16 +44,33 @@ const restockReturnInventory = async (items, branchId, workspaceId, session) => 
       : null;
 
   for (const item of items) {
-    const qtyToRestock = Number(item.qty || 0) + Number(item.freeQty || 0);
+    const qtyToRestock = Number(item.qty || item.returnQty || 0) + Number(item.freeQty || 0);
     if (qtyToRestock <= 0) continue;
 
-    // 1. Resolve product ID (handle string, object, or lookup by name in catalog)
+    const itemMotive = (item.motive || "").toLowerCase();
+    const isScrapItem = isScrap || itemMotive === "expired" || itemMotive === "broken";
+
+    // 1. Resolve product ID (handle string, object, composite "<id>-<batch>", or lookup by name)
     let rawProductId =
       item.productId ||
       item.product_id ||
       item.workspaceProductId ||
       (item.workspaceProduct && (item.workspaceProduct._id || item.workspaceProduct.id)) ||
       item.id;
+
+    if (rawProductId && typeof rawProductId === "object") {
+      rawProductId = rawProductId._id || rawProductId.id;
+    }
+
+    if (typeof rawProductId === "string") {
+      rawProductId = rawProductId.trim();
+      if (!mongoose.Types.ObjectId.isValid(rawProductId) && rawProductId.includes("-")) {
+        const candidateId = rawProductId.split("-")[0];
+        if (mongoose.Types.ObjectId.isValid(candidateId)) {
+          rawProductId = candidateId;
+        }
+      }
+    }
 
     let productObjId =
       rawProductId && mongoose.Types.ObjectId.isValid(rawProductId)
@@ -62,13 +82,15 @@ const restockReturnInventory = async (items, branchId, workspaceId, session) => 
       const searchName = (item.name || item.productName || "").trim();
       if (searchName) {
         try {
+          const escaped = searchName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           const foundProduct = await WorkspaceProduct.findOne({
             workspaceId: workspaceObjId,
             $or: [
-              { name: searchName },
-              { displayName: searchName },
-              { workspaceProductCode: searchName },
+              { name: { $regex: new RegExp(`^${escaped}$`, "i") } },
+              { displayName: { $regex: new RegExp(`^${escaped}$`, "i") } },
+              { workspaceProductCode: searchName.toUpperCase() },
             ],
+            isDeleted: false,
           }).session(session);
 
           if (foundProduct) {
@@ -85,14 +107,15 @@ const restockReturnInventory = async (items, branchId, workspaceId, session) => 
       continue;
     }
 
-    // Resolve branch for this specific item if present, else fallback to top-level resolved branch
-    const itemBranchId =
-      item.branchId && mongoose.Types.ObjectId.isValid(item.branchId)
+    // Target branch: the explicitly provided branchId (current store branch) takes strict precedence
+    const targetBranchId =
+      branchObjId ||
+      (item.branchId && mongoose.Types.ObjectId.isValid(item.branchId)
         ? new mongoose.Types.ObjectId(item.branchId)
-        : branchObjId;
+        : null);
 
     // 2. Resolve batch information
-    const rawBatchId =
+    let rawBatchId =
       item.batchId ||
       item.batch_id ||
       (item.batch && typeof item.batch === "object" && (item.batch._id || item.batch.id)) ||
@@ -100,94 +123,196 @@ const restockReturnInventory = async (items, branchId, workspaceId, session) => 
         ? item.batch
         : null);
 
-    const batchNo = (
+    if (rawBatchId && typeof rawBatchId === "object") {
+      rawBatchId = rawBatchId._id || rawBatchId.id;
+    }
+
+    const rawInputBatchNo = (
       item.batchNo ||
       item.batchNumber ||
       (typeof item.batch === "string" ? item.batch : (item.batch && (item.batch.batchNo || item.batch.batch))) ||
       "STANDARD"
     ).trim();
 
+    // Clean base batch number from any existing tag
+    const baseBatchNo =
+      rawInputBatchNo.replace(/\s*\[(EXPIRED|BROKEN|SCRAP)\]/gi, "").trim() || "STANDARD";
+
+    let targetBatchNo = baseBatchNo;
+    let targetScrapType = "NONE";
+
+    if (isScrapItem) {
+      if (itemMotive === "broken") {
+        targetScrapType = "BROKEN";
+        targetBatchNo = `${baseBatchNo} [BROKEN]`;
+      } else {
+        targetScrapType = "EXPIRED";
+        targetBatchNo = `${baseBatchNo} [EXPIRED]`;
+      }
+    }
+
     const expiryDate = (item.expiry || item.expiryDate || "").trim();
 
-    // 3. Update or Create Batch
-    let batch = null;
-
-    // 3a. Search by batch _id if provided and valid
+    // 3. Locate source batch (if any) to obtain master rates/mrp/expiry
+    let sourceBatch = null;
     if (rawBatchId && mongoose.Types.ObjectId.isValid(rawBatchId)) {
-      batch = await Batch.findOne({
-        _id: new mongoose.Types.ObjectId(rawBatchId),
-        ...(workspaceObjId ? { workspaceId: workspaceObjId } : {}),
-      }).session(session);
+      sourceBatch = await Batch.findById(rawBatchId).session(session);
     }
-
-    // 3b. Search by product + branch + batchNo + expiryDate
-    if (!batch && workspaceObjId) {
-      batch = await Batch.findOne({
+    if (!sourceBatch && workspaceObjId) {
+      sourceBatch = await Batch.findOne({
         workspaceId: workspaceObjId,
         product: productObjId,
-        ...(itemBranchId ? { branch_id: itemBranchId } : {}),
-        batchNo,
-        ...(expiryDate ? { expiryDate } : {}),
+        batchNo: { $in: [baseBatchNo, rawInputBatchNo] },
+        isDeleted: false,
       }).session(session);
     }
-
-    // 3c. Search by product + branch + batchNo
-    if (!batch && workspaceObjId) {
-      batch = await Batch.findOne({
+    if (!sourceBatch && workspaceObjId) {
+      sourceBatch = await Batch.findOne({
         workspaceId: workspaceObjId,
         product: productObjId,
-        ...(itemBranchId ? { branch_id: itemBranchId } : {}),
-        batchNo,
-      }).session(session);
-    }
-
-    // 3d. Fallback: Search by product + branch (any active batch)
-    if (!batch && workspaceObjId) {
-      batch = await Batch.findOne({
-        workspaceId: workspaceObjId,
-        product: productObjId,
-        ...(itemBranchId ? { branch_id: itemBranchId } : {}),
         isDeleted: false,
       }).session(session);
     }
 
-    if (batch) {
-      batch.batchQty = (Number(batch.batchQty) || 0) + qtyToRestock;
-      batch.isDeleted = false;
-      await batch.save({ session });
-    } else if (workspaceObjId) {
-      // Create a new batch for this product so branch inventory is restored
+    // 4. Find or Create Batch specifically in targetBranchId
+    let targetBatch = null;
+
+    if (targetBranchId && workspaceObjId) {
+      if (isScrapItem) {
+        // Look specifically for an existing scrap batch of this exact type (BROKEN or EXPIRED) in this branch
+        targetBatch = await Batch.findOne({
+          workspaceId: workspaceObjId,
+          branch_id: targetBranchId,
+          product: productObjId,
+          batchNo: targetBatchNo,
+        }).session(session);
+
+        if (!targetBatch) {
+          targetBatch = await Batch.findOne({
+            workspaceId: workspaceObjId,
+            branch_id: targetBranchId,
+            product: productObjId,
+            originalBatchNo: baseBatchNo,
+            scrapType: targetScrapType,
+          }).session(session);
+        }
+      } else {
+        // Resellable / general return: strictly target sellable shelf batch (scrapType: NONE or null)
+        if (expiryDate) {
+          targetBatch = await Batch.findOne({
+            workspaceId: workspaceObjId,
+            branch_id: targetBranchId,
+            product: productObjId,
+            batchNo: baseBatchNo,
+            expiryDate,
+            scrapType: { $in: ["NONE", null] },
+          }).session(session);
+        }
+
+        if (!targetBatch) {
+          targetBatch = await Batch.findOne({
+            workspaceId: workspaceObjId,
+            branch_id: targetBranchId,
+            product: productObjId,
+            batchNo: baseBatchNo,
+            scrapType: { $in: ["NONE", null] },
+          }).session(session);
+        }
+      }
+    }
+
+    // Case 4c: Global batch (no branch_id) when targetBranchId is not specified
+    if (!targetBatch && !targetBranchId && sourceBatch) {
+      targetBatch = sourceBatch;
+    }
+
+    // 5. Update Existing Batch or Create Brand New Batch in targetBranchId
+    if (targetBatch) {
+      if (isScrapItem) {
+        targetBatch.scrapQty = (Number(targetBatch.scrapQty) || 0) + qtyToRestock;
+        if (targetScrapType === "BROKEN") {
+          targetBatch.brokenQty = (Number(targetBatch.brokenQty) || 0) + qtyToRestock;
+        } else {
+          targetBatch.expiredQty = (Number(targetBatch.expiredQty) || 0) + qtyToRestock;
+        }
+        targetBatch.scrapType = targetScrapType;
+        targetBatch.originalBatchNo = baseBatchNo;
+      } else {
+        targetBatch.batchQty = (Number(targetBatch.batchQty) || 0) + qtyToRestock;
+      }
+      targetBatch.isDeleted = false;
+      if (!targetBatch.expiryDate && (expiryDate || sourceBatch?.expiryDate)) {
+        targetBatch.expiryDate = expiryDate || sourceBatch?.expiryDate || "";
+      }
+      await targetBatch.save({ session });
+    } else if (workspaceObjId && targetBranchId) {
+      // Create a brand new batch document in the branch
+      const resolvedMrp = Number(item.mrp || sourceBatch?.mrp || sourceBatch?.MRP || 0);
+      const resolvedRate = Number(item.rate || item.price || sourceBatch?.rate || 0);
+      const resolvedRateA = Number(item.rateA || sourceBatch?.rateA || sourceBatch?.finalRateA || resolvedRate);
+      const resolvedRateB = Number(item.rateB || item.rateb || sourceBatch?.rateB || sourceBatch?.finalRateB || resolvedRate);
+      const resolvedRateC = Number(item.rateC || sourceBatch?.rateC || sourceBatch?.finalRateC || resolvedRate);
+      const resolvedExpiry = expiryDate || sourceBatch?.expiryDate || "";
+
       try {
-        await Batch.create(
+        const createdBatches = await Batch.create(
           [
             {
               workspaceId: workspaceObjId,
-              branch_id: itemBranchId,
+              branch_id: targetBranchId,
               product: productObjId,
-              batchNo: batchNo || "STANDARD",
-              batchQty: qtyToRestock,
-              mrp: Number(item.mrp || 0),
-              rate: Number(item.rate || item.price || 0),
-              rateA: Number(item.rateA || 0),
-              rateB: Number(item.rateB || item.rateb || 0),
-              rateC: Number(item.rateC || item.rate || item.price || 0),
-              expiryDate: expiryDate || "",
+              batchNo: targetBatchNo,
+              originalBatchNo: baseBatchNo,
+              scrapType: targetScrapType,
+              batchQty: isScrapItem ? 0 : qtyToRestock,
+              scrapQty: isScrapItem ? qtyToRestock : 0,
+              brokenQty: targetScrapType === "BROKEN" ? qtyToRestock : 0,
+              expiredQty: targetScrapType === "EXPIRED" ? qtyToRestock : 0,
+              mrp: resolvedMrp,
+              MRP: resolvedMrp,
+              rate: resolvedRate,
+              ptr: Number(sourceBatch?.ptr || 0),
+              pts: Number(sourceBatch?.pts || 0),
+              rateA: resolvedRateA,
+              rateB: resolvedRateB,
+              rateC: resolvedRateC,
+              finalRateA: resolvedRateA,
+              finalRateB: resolvedRateB,
+              finalRateC: resolvedRateC,
+              expiryDate: resolvedExpiry,
+              pack: item.pack || sourceBatch?.pack || "PCS",
+              rack: item.rack || sourceBatch?.rack || "",
               isDeleted: false,
             },
           ],
           { session }
         );
+        targetBatch = createdBatches[0];
       } catch (err) {
         if (err.code === 11000) {
-          const existingBatch = await Batch.findOne({
-            branch_id: itemBranchId,
+          // If collision occurred, retrieve the existing batch of this exact targetBatchNo and increment it
+          targetBatch = await Batch.findOne({
+            workspaceId: workspaceObjId,
+            branch_id: targetBranchId,
             product: productObjId,
-            batchNo: batchNo || "STANDARD",
+            batchNo: targetBatchNo,
           }).session(session);
-          if (existingBatch) {
-            existingBatch.batchQty = (Number(existingBatch.batchQty) || 0) + qtyToRestock;
-            existingBatch.isDeleted = false;
-            await existingBatch.save({ session });
+
+          if (targetBatch) {
+            if (isScrapItem) {
+              targetBatch.scrapQty = (Number(targetBatch.scrapQty) || 0) + qtyToRestock;
+              if (targetScrapType === "BROKEN") {
+                targetBatch.brokenQty = (Number(targetBatch.brokenQty) || 0) + qtyToRestock;
+              } else {
+                targetBatch.expiredQty = (Number(targetBatch.expiredQty) || 0) + qtyToRestock;
+              }
+              targetBatch.scrapType = targetScrapType;
+              targetBatch.originalBatchNo = baseBatchNo;
+            } else {
+              targetBatch.batchQty = (Number(targetBatch.batchQty) || 0) + qtyToRestock;
+            }
+            targetBatch.isDeleted = false;
+            await targetBatch.save({ session });
           }
         } else {
           console.error("restockReturnInventory: Error creating new batch:", err);
@@ -195,54 +320,68 @@ const restockReturnInventory = async (items, branchId, workspaceId, session) => 
       }
     }
 
-    // 4. Update or Create ProductFacility
-    if (itemBranchId && workspaceObjId) {
-      let facility = await ProductFacility.findOne({
-        workspaceId: workspaceObjId,
-        facility_id: itemBranchId,
-        product_id: productObjId,
-      }).session(session);
-
-      if (facility) {
-        facility.total_qty_available = (Number(facility.total_qty_available) || 0) + qtyToRestock;
-        facility.qoh = (Number(facility.qoh) || 0) + qtyToRestock;
-        facility.atp = (Number(facility.atp) || 0) + qtyToRestock;
-        facility.isDeleted = false;
-        await facility.save({ session });
-      } else {
-        try {
-          await ProductFacility.create(
-            [
-              {
-                workspaceId: workspaceObjId,
-                facility_id: itemBranchId,
-                product_id: productObjId,
+    // 6. Atomically Upsert and Increment ProductFacility in targetBranchId
+    if (targetBranchId && workspaceObjId) {
+      try {
+        if (isScrapItem) {
+          await ProductFacility.findOneAndUpdate(
+            {
+              workspaceId: workspaceObjId,
+              facility_id: targetBranchId,
+              product_id: productObjId,
+            },
+            {
+              $inc: {
+                scrapQty: qtyToRestock,
+                ...(targetScrapType === "BROKEN"
+                  ? { brokenQty: qtyToRestock }
+                  : { expiredQty: qtyToRestock }),
+              },
+              $setOnInsert: {
+                itemCode: item.productCode || item.itemCode || "",
+                total_qty_available: 0,
+                qoh: 0,
+                atp: 0,
+                consumption: 0,
+                poStatus: "NONE",
+                isDeleted: false,
+              },
+            },
+            {
+              upsert: true,
+              new: true,
+              session,
+            }
+          );
+        } else {
+          await ProductFacility.findOneAndUpdate(
+            {
+              workspaceId: workspaceObjId,
+              facility_id: targetBranchId,
+              product_id: productObjId,
+            },
+            {
+              $inc: {
                 total_qty_available: qtyToRestock,
                 qoh: qtyToRestock,
                 atp: qtyToRestock,
+              },
+              $setOnInsert: {
+                itemCode: item.productCode || item.itemCode || "",
+                consumption: 0,
+                poStatus: "NONE",
                 isDeleted: false,
               },
-            ],
-            { session }
-          );
-        } catch (err) {
-          if (err.code === 11000) {
-            const existingFacility = await ProductFacility.findOne({
-              workspaceId: workspaceObjId,
-              facility_id: itemBranchId,
-              product_id: productObjId,
-            }).session(session);
-            if (existingFacility) {
-              existingFacility.total_qty_available = (Number(existingFacility.total_qty_available) || 0) + qtyToRestock;
-              existingFacility.qoh = (Number(existingFacility.qoh) || 0) + qtyToRestock;
-              existingFacility.atp = (Number(existingFacility.atp) || 0) + qtyToRestock;
-              existingFacility.isDeleted = false;
-              await existingFacility.save({ session });
+            },
+            {
+              upsert: true,
+              new: true,
+              session,
             }
-          } else {
-            console.error("restockReturnInventory: Error creating ProductFacility:", err);
-          }
+          );
         }
+      } catch (facErr) {
+        console.error("restockReturnInventory: Error updating ProductFacility:", facErr);
       }
     }
   }
@@ -514,39 +653,75 @@ const recordCustomerReturn = async (
     }
 
     // 5b. Find Original Invoice and Validate Against Double / Over-Return
-    let originalInvoiceDoc = null;
+    // 5b. Find Original Invoices and Validate Against Double / Over-Return
+    const involvedInvoiceIds = new Set();
+    if (resolvedOriginalInvoiceId && mongoose.Types.ObjectId.isValid(resolvedOriginalInvoiceId)) {
+      involvedInvoiceIds.add(resolvedOriginalInvoiceId.toString());
+    }
+    if (Array.isArray(returnData.items)) {
+      for (const it of returnData.items) {
+        if (it.originalInvoiceId && mongoose.Types.ObjectId.isValid(it.originalInvoiceId)) {
+          involvedInvoiceIds.add(it.originalInvoiceId.toString());
+        }
+      }
+    }
+
+    const originalInvoicesMap = new Map();
     const invFindQuery = {
       workspaceId: workspaceId || customer.workspaceId,
       companyId: companyId || customer.companyId,
       isDeleted: false,
     };
 
-    if (resolvedOriginalInvoiceId && mongoose.Types.ObjectId.isValid(resolvedOriginalInvoiceId)) {
-      originalInvoiceDoc = await SalesInvoice.findOne({
+    if (involvedInvoiceIds.size > 0) {
+      const invDocs = await SalesInvoice.find({
         ...invFindQuery,
-        _id: resolvedOriginalInvoiceId,
+        _id: { $in: Array.from(involvedInvoiceIds).map((id) => new mongoose.Types.ObjectId(id)) },
       }).session(session);
+
+      for (const doc of invDocs) {
+        originalInvoicesMap.set(doc._id.toString(), doc);
+        if (doc.invoiceNo) {
+          originalInvoicesMap.set(doc.invoiceNo, doc);
+        }
+      }
     }
 
-    if (!originalInvoiceDoc && resolvedOriginalInvoiceNo) {
-      originalInvoiceDoc = await SalesInvoice.findOne({
+    if (originalInvoicesMap.size === 0 && resolvedOriginalInvoiceNo) {
+      const doc = await SalesInvoice.findOne({
         ...invFindQuery,
         invoiceNo: resolvedOriginalInvoiceNo,
       }).session(session);
+      if (doc) {
+        originalInvoicesMap.set(doc._id.toString(), doc);
+        originalInvoicesMap.set(doc.invoiceNo, doc);
+      }
     }
+
+    let originalInvoiceDoc =
+      (resolvedOriginalInvoiceId && originalInvoicesMap.get(resolvedOriginalInvoiceId.toString())) ||
+      (resolvedOriginalInvoiceNo && originalInvoicesMap.get(resolvedOriginalInvoiceNo)) ||
+      (originalInvoicesMap.size > 0 ? Array.from(originalInvoicesMap.values())[0] : null);
 
     if (originalInvoiceDoc) {
       resolvedOriginalInvoiceId = originalInvoiceDoc._id;
       resolvedOriginalInvoiceNo = originalInvoiceDoc.invoiceNo;
+    }
 
-      // Validate each item to return against original invoice line items
-      if (Array.isArray(originalInvoiceDoc.items) && Array.isArray(returnData.items)) {
-        for (const retItem of returnData.items) {
-          const reqQty = Number(retItem.qty ?? retItem.quantity ?? retItem.returnQty ?? 0);
-          if (reqQty <= 0) continue;
+    // Validate items against their corresponding original bills
+    if (Array.isArray(returnData.items)) {
+      for (const retItem of returnData.items) {
+        const reqQty = Number(retItem.qty ?? retItem.quantity ?? retItem.returnQty ?? 0);
+        if (reqQty <= 0) continue;
 
+        const targetBill =
+          (retItem.originalInvoiceId && originalInvoicesMap.get(retItem.originalInvoiceId.toString())) ||
+          (retItem.originalInvoiceNo && originalInvoicesMap.get(retItem.originalInvoiceNo)) ||
+          originalInvoiceDoc;
+
+        if (targetBill && Array.isArray(targetBill.items)) {
           const matchedItem =
-            originalInvoiceDoc.items.find((origIt) => {
+            targetBill.items.find((origIt) => {
               const matchById =
                 origIt.productId &&
                 retItem.productId &&
@@ -559,7 +734,7 @@ const recordCustomerReturn = async (
                 !origIt.batch || !retItem.batchNo || origIt.batch === retItem.batchNo;
               return (matchById || matchByName) && matchBatch;
             }) ||
-            originalInvoiceDoc.items.find((origIt) => {
+            targetBill.items.find((origIt) => {
               return (
                 (origIt.productId &&
                   retItem.productId &&
@@ -578,7 +753,7 @@ const recordCustomerReturn = async (
             if (availableQty <= 0) {
               throw new ApiError(
                 400,
-                `Cannot return item "${matchedItem.name || retItem.name}". All ${soldQty} units from bill #${originalInvoiceDoc.invoiceNo} have already been returned.`
+                `Cannot return item "${matchedItem.name || retItem.name}". All ${soldQty} units from bill #${targetBill.invoiceNo} have already been returned.`
               );
             }
 
@@ -594,6 +769,13 @@ const recordCustomerReturn = async (
     }
 
     // 6. Build and save Sales Return Document in dedicated collection
+    const customerGstinEarly = (customer?.gstNumber || customer?.gstin || returnData.customerGstin || "").trim().toUpperCase();
+    const customerHasValidGstEarly = customerGstinEarly.length >= 15 && /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(customerGstinEarly);
+    let resolvedReturnBillingMode = returnData.billingMode || "B2C";
+    if (String(resolvedReturnBillingMode).toUpperCase() === "B2B" && !customerHasValidGstEarly) {
+      resolvedReturnBillingMode = "B2C";
+    }
+
     const newReturnBill = {
       workspaceId: workspaceId || customer.workspaceId,
       companyId: companyId || customer.companyId,
@@ -607,7 +789,7 @@ const recordCustomerReturn = async (
       financialPeriodId,
       shiftId: resolvedShiftId || null,
       businessDayId: resolvedBusinessDayId || null,
-      billingMode: returnData.billingMode || "B2C",
+      billingMode: resolvedReturnBillingMode,
       subtotal: returnData.subtotal || 0,
       discount: returnData.discount || 0,
       tax: returnData.tax || 0,
@@ -643,6 +825,7 @@ const recordCustomerReturn = async (
         : `Sales return memo against invoice ${resolvedOriginalInvoiceNo || "original sale"}`,
       isReturn: true,
       returnType,
+      returnMotive: returnData.returnMotive || "general",
       originalInvoiceId: resolvedOriginalInvoiceId,
       originalInvoiceNo: resolvedOriginalInvoiceNo,
       createdBy: user?._id || null,
@@ -652,13 +835,32 @@ const recordCustomerReturn = async (
 
     const savedReturn = await salesReturnRepository.createSalesReturn(newReturnBill, { session });
 
-    // 6b. Update Original Sale Bill with Return IDs & Returned Item Quantities
-    if (originalInvoiceDoc) {
-      if (Array.isArray(originalInvoiceDoc.items)) {
-        originalInvoiceDoc.items = originalInvoiceDoc.items.map((origIt) => {
+    // 6b. Update all involved Original Sale Bills with Return IDs & Returned Item Quantities
+    const distinctBillsToUpdate = Array.from(new Set(Array.from(originalInvoicesMap.values())));
+    for (const billDoc of distinctBillsToUpdate) {
+      const billIdStr = billDoc._id.toString();
+      const billNoStr = billDoc.invoiceNo;
+
+      // Filter return items that belong to this bill
+      const itemsForThisBill = (newReturnBill.items || []).filter((rIt) => {
+        if (rIt.originalInvoiceId) {
+          return rIt.originalInvoiceId.toString() === billIdStr;
+        }
+        if (rIt.originalInvoiceNo) {
+          return rIt.originalInvoiceNo === billNoStr;
+        }
+        return distinctBillsToUpdate.length === 1;
+      });
+
+      if (itemsForThisBill.length === 0) continue;
+
+      let billRefundAmount = 0;
+
+      if (Array.isArray(billDoc.items)) {
+        billDoc.items = billDoc.items.map((origIt) => {
           let updatedReturnedQty = Number(origIt.returnedQty || 0);
           const retItem =
-            (newReturnBill.items || []).find((rIt) => {
+            itemsForThisBill.find((rIt) => {
               const matchById =
                 origIt.productId &&
                 rIt.productId &&
@@ -671,7 +873,7 @@ const recordCustomerReturn = async (
                 !origIt.batch || !rIt.batchNo || origIt.batch === rIt.batchNo;
               return (matchById || matchByName) && matchBatch;
             }) ||
-            (newReturnBill.items || []).find((rIt) => {
+            itemsForThisBill.find((rIt) => {
               return (
                 (origIt.productId &&
                   rIt.productId &&
@@ -685,6 +887,7 @@ const recordCustomerReturn = async (
           if (retItem) {
             const addedQty = Number(retItem.qty ?? retItem.quantity ?? retItem.returnQty ?? 0);
             updatedReturnedQty += addedQty;
+            billRefundAmount += addedQty * Number(retItem.price || retItem.rate || origIt.rate || 0);
           }
 
           const soldQty = Number(origIt.qty || 1);
@@ -704,24 +907,20 @@ const recordCustomerReturn = async (
         });
       }
 
-      originalInvoiceDoc.returnInvoiceIds = originalInvoiceDoc.returnInvoiceIds || [];
-      if (
-        !originalInvoiceDoc.returnInvoiceIds.some(
-          (id) => id.toString() === savedReturn._id.toString()
-        )
-      ) {
-        originalInvoiceDoc.returnInvoiceIds.push(savedReturn._id);
+      billDoc.returnInvoiceIds = billDoc.returnInvoiceIds || [];
+      if (!billDoc.returnInvoiceIds.some((id) => id.toString() === savedReturn._id.toString())) {
+        billDoc.returnInvoiceIds.push(savedReturn._id);
       }
 
-      originalInvoiceDoc.returnInvoices = originalInvoiceDoc.returnInvoices || [];
-      originalInvoiceDoc.returnInvoices.push({
+      billDoc.returnInvoices = billDoc.returnInvoices || [];
+      billDoc.returnInvoices.push({
         returnId: savedReturn._id,
         returnNo: savedReturn.returnNo || savedReturn.invoiceNo,
         date: savedReturn.date || new Date(),
-        returnAmount: savedReturn.grandTotal || grandTotal,
+        returnAmount: billRefundAmount || savedReturn.grandTotal || grandTotal,
         returnType: savedReturn.returnType,
         refundMethod: savedReturn.refundMethod || savedReturn.paymentMethod,
-        items: (newReturnBill.items || []).map((i) => ({
+        items: itemsForThisBill.map((i) => ({
           productId: i.productId,
           batchNo: i.batch || i.batchNo,
           name: i.name,
@@ -731,29 +930,56 @@ const recordCustomerReturn = async (
         })),
       });
 
-      originalInvoiceDoc.totalReturnedAmount =
-        (Number(originalInvoiceDoc.totalReturnedAmount) || 0) + grandTotal;
-      originalInvoiceDoc.isReturned = true;
+      billDoc.totalReturnedAmount =
+        (Number(billDoc.totalReturnedAmount) || 0) + (billRefundAmount || grandTotal);
+      billDoc.isReturned = true;
 
       const isAllFullyReturned =
-        originalInvoiceDoc.items.length > 0 &&
-        originalInvoiceDoc.items.every(
+        billDoc.items.length > 0 &&
+        billDoc.items.every(
           (it) => (Number(it.returnedQty) || 0) >= Number(it.qty || 1)
         );
 
-      originalInvoiceDoc.returnStatus = isAllFullyReturned ? "FULL" : "PARTIAL";
-      originalInvoiceDoc.isFullyReturned = isAllFullyReturned;
+      billDoc.returnStatus = isAllFullyReturned ? "FULL" : "PARTIAL";
+      billDoc.isFullyReturned = isAllFullyReturned;
 
-      originalInvoiceDoc.markModified("items");
-      originalInvoiceDoc.markModified("returnInvoices");
-      originalInvoiceDoc.markModified("returnInvoiceIds");
+      billDoc.markModified("items");
+      billDoc.markModified("returnInvoices");
+      billDoc.markModified("returnInvoiceIds");
 
-      await originalInvoiceDoc.save({ session });
+      await billDoc.save({ session });
     }
 
-    // 7. Increase Inventory (Restock Batch & ProductFacility)
+    // 7. Inventory Restock & Automatic Scrap Transfer Order Handling
     const resolvedWorkspaceId = workspaceId || customer?.workspaceId || savedReturn?.workspaceId;
-    await restockReturnInventory(newReturnBill.items, resolvedBranchId, resolvedWorkspaceId, session);
+    const resolvedCompId = companyId || customer?.companyId || savedReturn?.companyId;
+
+    const generalReturnItems = [];
+    const scrapReturnItems = [];
+
+    for (const item of (newReturnBill.items || [])) {
+      const motive = String(item.motive || returnData.returnMotive || "general").toLowerCase().trim();
+      if (motive === "expired" || motive === "broken" || motive === "damaged") {
+        scrapReturnItems.push({ ...item, motive: motive === "broken" ? "broken" : "expired" });
+      } else {
+        generalReturnItems.push({ ...item, motive: "general" });
+      }
+    }
+
+    // 7a. For General / Resellable items: increase current branch sellable stock
+    if (generalReturnItems.length > 0) {
+      await restockReturnInventory(generalReturnItems, resolvedBranchId, resolvedWorkspaceId, session, false);
+    }
+
+    // 7b. For Expired or Broken items: place directly in current branch's internal Scrap Bin (no transfer order, no separate branch)
+    if (scrapReturnItems.length > 0) {
+      await restockReturnInventory(scrapReturnItems, resolvedBranchId, resolvedWorkspaceId, session, true);
+
+      savedReturn.returnMotive = generalReturnItems.length > 0 ? "mixed" : (scrapReturnItems[0]?.motive || "expired");
+      savedReturn.transferOrderId = null;
+      savedReturn.transferOrderNo = null;
+      await savedReturn.save({ session });
+    }
 
     // 8. Decrease GST: Create GSTR-1 Credit Note Ledger Entry
     // (In GSTR-1 summary calculator, credit notes are placed under creditDebitParent and subtracted from gross GST)
@@ -767,12 +993,8 @@ const recordCustomerReturn = async (
       );
 
       const companyGstin = company?.gstin || "";
-      const customerGstin = customer?.gstNumber || "";
-      const hasCustomerGst =
-        customerGstin &&
-        /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(
-          customerGstin.trim().toUpperCase()
-        );
+      const customerGstin = (customer?.gstNumber || customer?.gstin || returnData.customerGstin || "").trim().toUpperCase();
+      const hasCustomerGst = customerGstin.length >= 15 && /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(customerGstin);
       const isIgst = Boolean(
         returnData.isIgst ||
           (companyGstin &&
@@ -782,7 +1004,7 @@ const recordCustomerReturn = async (
             companyGstin.slice(0, 2) !== customerGstin.slice(0, 2))
       );
 
-      const groupDescription = hasCustomerGst || String(savedReturn.billingMode).toUpperCase() === "B2B"
+      const groupDescription = hasCustomerGst
         ? "Credit Note - Registered"
         : "Credit Note - Unregistered";
 

@@ -16,6 +16,20 @@ const transferOrderItemSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    originalBatchNo: {
+      type: String,
+      default: "",
+    },
+    scrapType: {
+      type: String,
+      enum: ["NONE", "EXPIRED", "BROKEN", "SCRAP", "FRESH_RETURN"],
+      default: "NONE",
+    },
+    sourceBin: {
+      type: String,
+      enum: ["SELLABLE", "SCRAP"],
+      default: "SELLABLE",
+    },
     transferQty: {
       type: Number,
       required: true,
@@ -31,6 +45,12 @@ const transferOrderSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Workspace",
       required: true,
+      index: true,
+    },
+    transferType: {
+      type: String,
+      enum: ["STANDARD", "SCRAP"],
+      default: "STANDARD",
       index: true,
     },
     transferNo: {

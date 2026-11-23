@@ -12,19 +12,29 @@ export const isValidGstin = (gstin) => {
 };
 
 export const deduceGstrGroup = (entry) => {
-  if (entry?.groupDescription && typeof entry.groupDescription === "string" && entry.groupDescription.trim()) {
-    return entry.groupDescription.trim();
-  }
+  const partyGstin = (
+    entry?.partyGstin ||
+    entry?.partyId?.gstNumber ||
+    entry?.partyId?.gstin ||
+    entry?.customerGstin ||
+    entry?.customer?.gstNumber ||
+    entry?.customer?.gstin ||
+    entry?.customerId?.gstNumber ||
+    entry?.customerId?.gstin ||
+    ""
+  ).trim().toUpperCase();
+  const hasValidPartyGstin = isValidGstin(partyGstin);
 
   const gstType = String(entry?.gstType || "").toUpperCase();
   if (gstType === "GSTR-2") {
     return "B2B Supplies";
   }
 
+  const rawGroup = String(entry?.groupDescription || "").trim();
+  const gNorm = rawGroup.toUpperCase();
   const narration = String(entry?.narration || "").toUpperCase();
   const rawDocType = String(entry?.documentType || entry?.voucherType || entry?.type || "").toUpperCase();
-  const partyGstin = (entry?.partyGstin || entry?.partyId?.gstNumber || entry?.customerGstin || "").trim().toUpperCase();
-  const hasValidPartyGstin = isValidGstin(partyGstin);
+  const vNum = String(entry?.voucherNumber || "").toUpperCase();
 
   const taxableAmount = Number(entry?.taxableAmount || 0);
   const cgst = Number(entry?.cgst || 0);
@@ -34,35 +44,88 @@ export const deduceGstrGroup = (entry) => {
   const totalAmount = Number(entry?.totalAmount !== undefined ? entry.totalAmount : (taxableAmount + cgst + sgst + igst + cess));
   const totalTax = cgst + sgst + igst + cess;
 
-  const vNum = String(entry?.voucherNumber || "").toUpperCase();
-
-  if (entry?.isExport || rawDocType.includes("EXPORT") || narration.includes("EXPORT")) {
+  // 1. Export Invoices
+  if (gNorm.includes("EXPORT") || entry?.isExport || rawDocType.includes("EXPORT") || narration.includes("EXPORT")) {
     return "Export Invoices";
   }
-  if (rawDocType.includes("ADVANCE_RECEIVED") || narration.includes("ADVANCE RECEIVED")) {
+
+  // 2. Advance Tax / Adjustments
+  if (gNorm.includes("ADVANCE_RECEIVED") || gNorm.includes("TAX LIABILITY ON ADVANCE") || rawDocType.includes("ADVANCE_RECEIVED") || narration.includes("ADVANCE RECEIVED")) {
     return "Tax Liability on Advance";
   }
-  if (rawDocType.includes("ADVANCE_SETTLED") || narration.includes("ADVANCE SETTLED") || narration.includes("SET-OFF ADVANCE")) {
+  if (gNorm.includes("SET/OFF") || gNorm.includes("SET-OFF") || gNorm.includes("ADVANCE_SETTLED") || rawDocType.includes("ADVANCE_SETTLED") || narration.includes("ADVANCE SETTLED") || narration.includes("SET-OFF ADVANCE")) {
     return "Set/off Tax on Advance of prior period";
   }
-  if (rawDocType.includes("REFUND_VOUCHER") || narration.includes("REFUND FROM ADVANCE") || narration.includes("REFUND VOUCHER")) {
+  if (gNorm.includes("REFUND") || rawDocType.includes("REFUND_VOUCHER") || narration.includes("REFUND FROM ADVANCE") || narration.includes("REFUND VOUCHER")) {
     return "Refund from Advance";
   }
-  if (rawDocType.includes("CREDIT_NOTE") || narration.includes("CREDIT NOTE") || rawDocType.includes("SALE_RETURN") || vNum.startsWith("RET-") || vNum.startsWith("CN-")) {
-    return (hasValidPartyGstin || narration.includes("(B2B)")) ? "Credit Note - Registered" : "Credit Note - Unregistered";
+
+  // 3. Credit Note / Sales Return
+  // Registered if party has valid GSTIN; Unregistered if party has no GSTIN
+  if (
+    gNorm.includes("CREDIT NOTE") ||
+    gNorm.includes("SALE RETURN") ||
+    gNorm.includes("SALE_RETURN") ||
+    gNorm.includes("CDN") ||
+    rawDocType.includes("CREDIT_NOTE") ||
+    rawDocType.includes("SALE_RETURN") ||
+    narration.includes("CREDIT NOTE") ||
+    narration.includes("SALES RETURN") ||
+    vNum.startsWith("RET-") ||
+    vNum.startsWith("CN-")
+  ) {
+    if (gNorm === "CREDIT NOTE - UNREGISTERED" || gNorm.includes("UNREGISTERED")) {
+      return "Credit Note - Unregistered";
+    }
+    if (gNorm === "CREDIT NOTE - REGISTERED" || gNorm.includes("REGISTERED")) {
+      if (entry?.partyGstin === "" || (entry?.partyGstin && !hasValidPartyGstin)) {
+        return "Credit Note - Unregistered";
+      }
+      return "Credit Note - Registered";
+    }
+    if (hasValidPartyGstin) {
+      return "Credit Note - Registered";
+    }
+    if (narration.includes("(B2B)") && entry?.partyGstin === undefined) {
+      return "Credit Note - Registered";
+    }
+    return "Credit Note - Unregistered";
   }
-  if (rawDocType.includes("DEBIT_NOTE") || narration.includes("DEBIT NOTE") || vNum.startsWith("DN-")) {
-    return (hasValidPartyGstin || narration.includes("(B2B)")) ? "Debit Note - Registered" : "Debit Note - Unregistered";
+
+  // 4. Debit Note
+  if (gNorm.includes("DEBIT NOTE") || rawDocType.includes("DEBIT_NOTE") || narration.includes("DEBIT NOTE") || vNum.startsWith("DN-")) {
+    if (gNorm === "DEBIT NOTE - UNREGISTERED" || gNorm.includes("UNREGISTERED")) {
+      return "Debit Note - Unregistered";
+    }
+    if (gNorm === "DEBIT NOTE - REGISTERED" || gNorm.includes("REGISTERED")) {
+      if (entry?.partyGstin === "" || (entry?.partyGstin && !hasValidPartyGstin)) {
+        return "Debit Note - Unregistered";
+      }
+      return "Debit Note - Registered";
+    }
+    if (hasValidPartyGstin) {
+      return "Debit Note - Registered";
+    }
+    if (narration.includes("(B2B)") && entry?.partyGstin === undefined) {
+      return "Debit Note - Registered";
+    }
+    return "Debit Note - Unregistered";
   }
-  if (entry?.isNilRated || entry?.taxRate === 0 || narration.includes("NIL RATED") || (taxableAmount > 0 && totalTax === 0)) {
+
+  // 5. Nil Rated / Exempted
+  if (gNorm === "NIL RATED" || entry?.isNilRated || entry?.taxRate === 0 || narration.includes("NIL RATED") || (taxableAmount > 0 && totalTax === 0)) {
     return "Nil Rated";
   }
-  if (entry?.isExempt || narration.includes("EXEMPT")) {
+  if (gNorm === "EXEMPTED" || entry?.isExempt || narration.includes("EXEMPT")) {
     return "Exempted";
   }
-  if (hasValidPartyGstin || narration.includes("(B2B)") || entry?.billingMode === "B2B") {
+
+  // 6. Registered B2B Outward Supplies (Only if recipient has valid GSTIN)
+  if (hasValidPartyGstin) {
     return "B2B";
   }
+
+  // 7. Unregistered Outward Supplies (B2C Large vs B2C Small)
   if (igst > 0 && totalAmount > 250000) {
     return "B2C (Large) Invoice";
   }
@@ -161,118 +224,55 @@ export const calculateGstr1Summary = (entries = [], options = {}) => {
 
     const isInterState = igst > 0 || (partyGstin && companyStateCode && partyGstin.slice(0, 2) !== companyStateCode);
 
-    // If explicit groupDescription is stored on the GSTR record:
-    if (rawGroup) {
-      const gNorm = rawGroup.toUpperCase();
-      if (gNorm.includes("B2B")) {
-        addValues(b2b, item);
-      } else if (gNorm.includes("B2C (LARGE)") || gNorm.includes("B2CL")) {
-        addValues(b2cl, item);
-      } else if (gNorm.includes("B2C (SMALL)") || gNorm.includes("B2CS")) {
-        addValues(b2cs, item);
-      } else if (gNorm === "NIL RATED" || gNorm.includes("NIL")) {
-        addValues(nilRated, item);
-      } else if (gNorm.includes("EXEMPT")) {
-        addValues(exempted, item);
-      } else if (gNorm.includes("EXPORT")) {
-        addValues(exportInvoices, item);
-      } else if (gNorm.includes("TAX LIABILITY ON ADVANCE") || gNorm.includes("ADVANCE_RECEIVED")) {
-        addValues(taxAdvance, item);
-      } else if (gNorm.includes("SET/OFF") || gNorm.includes("SET-OFF") || gNorm.includes("ADVANCE_SETTLED")) {
-        addValues(setOffAdvance, item);
-      } else if (gNorm.includes("REFUND FROM ADVANCE") || gNorm.includes("REFUND_VOUCHER")) {
-        addValues(cdnRefundAdvance, item);
-      } else if (gNorm.includes("CREDIT NOTE") || gNorm.includes("DEBIT NOTE") || gNorm.includes("CDN")) {
-        if (gNorm.includes("REGISTERED") || hasValidPartyGstin) {
-          addValues(cdnRegistered, item);
-        } else {
-          addValues(cdnUnregistered, item);
-        }
-      } else {
-        // Fallback to B2C Small
-        addValues(b2cs, item);
-      }
+    const group = deduceGstrGroup(entry);
 
-      if (isInterState) {
-        addValues(centralSummary, item);
-      } else {
-        addValues(localSummary, item);
-      }
-      return;
-    }
-
-    // Otherwise, classify based on entry characteristics
-    if (entry.isExport || rawDocType.includes("EXPORT") || narration.includes("EXPORT")) {
-      addValues(exportInvoices, item);
-      centralSummary.count += 1;
-      centralSummary.taxable = round2(centralSummary.taxable + taxableAmount);
-      centralSummary.igst = round2(centralSummary.igst + igst);
-      centralSummary.totalTax = round2(centralSummary.totalTax + igst + cess);
-      centralSummary.invoiceValue = round2(centralSummary.invoiceValue + totalAmount);
-      return;
-    }
-
-    if (rawDocType.includes("ADVANCE_RECEIVED") || narration.includes("ADVANCE RECEIVED")) {
-      addValues(taxAdvance, item);
-      if (isInterState) addValues(centralSummary, item);
-      else addValues(localSummary, item);
-      return;
-    }
-
-    if (rawDocType.includes("ADVANCE_SETTLED") || narration.includes("ADVANCE SETTLED") || narration.includes("SET-OFF ADVANCE")) {
-      addValues(setOffAdvance, item);
-      if (isInterState) addValues(centralSummary, item);
-      else addValues(localSummary, item);
-      return;
-    }
-
-    const isCreditNote = rawDocType.includes("CREDIT_NOTE") || narration.includes("CREDIT NOTE") || rawDocType.includes("SALE_RETURN");
-    const isDebitNote = rawDocType.includes("DEBIT_NOTE") || narration.includes("DEBIT NOTE");
-    const isRefundAdvance = rawDocType.includes("REFUND_VOUCHER") || narration.includes("REFUND FROM ADVANCE");
-
-    if (isCreditNote || isDebitNote || isRefundAdvance) {
-      if (isRefundAdvance) {
-        addValues(cdnRefundAdvance, item);
-      } else if (hasValidPartyGstin) {
-        addValues(cdnRegistered, item);
-      } else {
-        addValues(cdnUnregistered, item);
-      }
-
-      const noteFactor = isDebitNote ? 1 : -1;
-      if (isInterState) addValues(centralSummary, item, noteFactor);
-      else addValues(localSummary, item, noteFactor);
-      return;
-    }
-
-    if (entry.isNilRated || entry.taxRate === 0 || narration.includes("NIL RATED")) {
-      addValues(nilRated, item);
-      if (isInterState) addValues(centralSummary, item);
-      else addValues(localSummary, item);
-      return;
-    }
-
-    if (entry.isExempt || narration.includes("EXEMPT")) {
-      addValues(exempted, item);
-      if (isInterState) addValues(centralSummary, item);
-      else addValues(localSummary, item);
-      return;
-    }
-
-    if (hasValidPartyGstin || entry.billingMode === "B2B") {
+    if (group === "B2B") {
       addValues(b2b, item);
+    } else if (group === "B2C (Large) Invoice") {
+      addValues(b2cl, item);
+    } else if (group === "B2C (Small) Invoice") {
+      addValues(b2cs, item);
+    } else if (group === "Nil Rated") {
+      addValues(nilRated, item);
+    } else if (group === "Exempted") {
+      addValues(exempted, item);
+    } else if (group === "Export Invoices") {
+      addValues(exportInvoices, item);
+    } else if (group === "Tax Liability on Advance") {
+      addValues(taxAdvance, item);
+    } else if (group === "Set/off Tax on Advance of prior period") {
+      addValues(setOffAdvance, item);
+    } else if (group === "Credit Note - Registered") {
+      addValues(cdnRegistered, item);
+    } else if (group === "Credit Note - Unregistered") {
+      addValues(cdnUnregistered, item);
+    } else if (group === "Debit Note - Registered") {
+      addValues(cdnRegistered, item);
+    } else if (group === "Debit Note - Unregistered") {
+      addValues(cdnUnregistered, item);
+    } else if (group === "Refund from Advance") {
+      addValues(cdnRefundAdvance, item);
     } else {
-      if (isInterState && totalAmount > b2cLargeThreshold) {
+      // Fallback
+      if (hasValidPartyGstin) {
+        addValues(b2b, item);
+      } else if (isInterState && totalAmount > b2cLargeThreshold) {
         addValues(b2cl, item);
       } else {
         addValues(b2cs, item);
       }
     }
+
+    // Local vs Central summary factor:
+    // Credit notes and advance set-offs reduce net outward liability
+    const isCredit = group.includes("Credit Note") || isCreditNoteEntry(entry);
+    const isSetOff = group.includes("Set/off");
+    const factor = (isCredit || isSetOff) ? -1 : 1;
 
     if (isInterState) {
-      addValues(centralSummary, item);
+      addValues(centralSummary, item, factor);
     } else {
-      addValues(localSummary, item);
+      addValues(localSummary, item, factor);
     }
   });
 

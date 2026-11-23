@@ -13,7 +13,7 @@ import ApiError from "../../../utils/ApiError.js";
  * e.g., NN-TR-2627-0001
  * Follows the same pattern and reliability as sales invoice numbering.
  */
-const generateBranchTransferNo = async (
+export const generateBranchTransferNo = async (
   workspaceId,
   sourceBranch,
   companyId,
@@ -102,7 +102,13 @@ export const createTransferOrder = async (
   companyId = null,
   branchId = null
 ) => {
-  const { sourceBranchId, destinationBranchId, items, remarks } = data;
+  const {
+    sourceBranchId,
+    destinationBranchId,
+    items,
+    remarks,
+    transferType = "STANDARD",
+  } = data;
 
   if (!items || items.length === 0) {
     throw new ApiError(400, "Items cannot be empty");
@@ -118,6 +124,11 @@ export const createTransferOrder = async (
 
   if (String(sourceBranchId) === String(destinationBranchId)) {
     throw new ApiError(400, "Source and destination branches cannot be the same");
+  }
+
+  // Enforce dispatching strictly from the user's active branch if scoped
+  if (branchId && String(sourceBranchId) !== String(branchId)) {
+    throw new ApiError(403, "Transfer orders can only be dispatched from your current active branch");
   }
 
   // Resolve source branch details to obtain branch initials and companyId
@@ -140,18 +151,9 @@ export const createTransferOrder = async (
       session
     );
 
-    const transferOrder = new TransferOrder({
-      workspaceId,
-      companyId: resolvedCompanyId,
-      branchId: resolvedBranchId,
-      transferNo,
-      sourceBranchId,
-      destinationBranchId,
-      status: "IN_TRANSIT",
-      items,
-      remarks,
-      createdBy: user._id,
-    });
+    const isScrapOrder = transferType === "SCRAP";
+
+    const preparedItems = [];
 
     for (const item of items) {
       const batch = await Batch.findOne({
@@ -164,31 +166,136 @@ export const createTransferOrder = async (
         throw new ApiError(404, `Batch ${item.batchNo} not found in source branch`);
       }
 
-      if (batch.batchQty <= 0) {
-        throw new ApiError(400, `Cannot transfer from empty batch ${item.batchNo}`);
+      const isItemScrap =
+        isScrapOrder ||
+        (item.scrapType && item.scrapType !== "NONE") ||
+        item.isScrap;
+
+      let sourceBin = "SELLABLE";
+      const resolvedScrapType =
+        item.scrapType ||
+        (item.category === "broken"
+          ? "BROKEN"
+          : item.category === "scrap_expired"
+          ? "EXPIRED"
+          : isScrapOrder
+          ? "EXPIRED"
+          : "NONE");
+
+      const originalBatchNo =
+        item.originalBatchNo ||
+        batch.originalBatchNo ||
+        (batch.batchNo
+          ? batch.batchNo.replace(/\s*\[(EXPIRED|BROKEN|SCRAP)\]/gi, "").trim()
+          : item.batchNo);
+
+      if (isItemScrap) {
+        // Check if scrap bin has sufficient stock
+        const availScrap = Number(batch.scrapQty || 0);
+        const availShelf = Number(batch.batchQty || 0);
+
+        if (availScrap >= item.transferQty) {
+          sourceBin = "SCRAP";
+          batch.scrapQty = Math.max(0, availScrap - item.transferQty);
+
+          if (resolvedScrapType === "BROKEN" || Number(batch.brokenQty || 0) > 0) {
+            batch.brokenQty = Math.max(0, Number(batch.brokenQty || 0) - item.transferQty);
+          } else {
+            batch.expiredQty = Math.max(0, Number(batch.expiredQty || 0) - item.transferQty);
+          }
+          await batch.save({ session });
+
+          const sourceFacility = await ProductFacility.findOne({
+            workspaceId,
+            facility_id: sourceBranchId,
+            product_id: item.product,
+          }).session(session);
+
+          if (sourceFacility) {
+            sourceFacility.scrapQty = Math.max(0, Number(sourceFacility.scrapQty || 0) - item.transferQty);
+            await sourceFacility.save({ session });
+          }
+        } else if (availShelf >= item.transferQty) {
+          // Shelf-expired batch being transferred as scrap
+          sourceBin = "SELLABLE";
+          batch.batchQty -= item.transferQty;
+          await batch.save({ session });
+
+          const sourceFacility = await ProductFacility.findOne({
+            workspaceId,
+            facility_id: sourceBranchId,
+            product_id: item.product,
+          }).session(session);
+
+          if (sourceFacility) {
+            sourceFacility.total_qty_available = Math.max(
+              0,
+              Number(sourceFacility.total_qty_available || 0) - item.transferQty
+            );
+            sourceFacility.qoh = Math.max(
+              0,
+              Number(sourceFacility.qoh || 0) - item.transferQty
+            );
+            await sourceFacility.save({ session });
+          }
+        } else {
+          throw new ApiError(
+            400,
+            `Insufficient quantity in batch ${item.batchNo}. Available scrap: ${availScrap}, shelf: ${availShelf}`
+          );
+        }
+      } else {
+        // Standard sellable stock transfer
+        if (batch.batchQty <= 0) {
+          throw new ApiError(400, `Cannot transfer from empty batch ${item.batchNo}`);
+        }
+
+        if (batch.batchQty < item.transferQty) {
+          throw new ApiError(400, `Insufficient quantity in batch ${item.batchNo}`);
+        }
+
+        // Deduct from source batch
+        batch.batchQty -= item.transferQty;
+        await batch.save({ session });
+
+        // Deduct from source product facility
+        const sourceFacility = await ProductFacility.findOne({
+          workspaceId,
+          facility_id: sourceBranchId,
+          product_id: item.product,
+        }).session(session);
+
+        if (sourceFacility) {
+          sourceFacility.total_qty_available -= item.transferQty;
+          sourceFacility.qoh -= item.transferQty;
+          await sourceFacility.save({ session });
+        }
       }
 
-      if (batch.batchQty < item.transferQty) {
-        throw new ApiError(400, `Insufficient quantity in batch ${item.batchNo}`);
-      }
-
-      // Deduct from source batch
-      batch.batchQty -= item.transferQty;
-      await batch.save({ session });
-
-      // Deduct from source product facility
-      const sourceFacility = await ProductFacility.findOne({
-        workspaceId,
-        facility_id: sourceBranchId,
-        product_id: item.product,
-      }).session(session);
-
-      if (sourceFacility) {
-        sourceFacility.total_qty_available -= item.transferQty;
-        sourceFacility.qoh -= item.transferQty;
-        await sourceFacility.save({ session });
-      }
+      preparedItems.push({
+        product: item.product,
+        batch: item.batch,
+        batchNo: item.batchNo,
+        originalBatchNo,
+        scrapType: resolvedScrapType,
+        sourceBin,
+        transferQty: item.transferQty,
+      });
     }
+
+    const transferOrder = new TransferOrder({
+      workspaceId,
+      companyId: resolvedCompanyId,
+      branchId: resolvedBranchId,
+      transferNo,
+      sourceBranchId,
+      destinationBranchId,
+      transferType: isScrapOrder ? "SCRAP" : "STANDARD",
+      status: "IN_TRANSIT",
+      items: preparedItems,
+      remarks,
+      createdBy: user._id,
+    });
 
     await transferOrder.save({ session });
     await session.commitTransaction();
@@ -219,6 +326,8 @@ export const receiveTransferOrder = async (workspaceId, transferOrderId, user) =
       throw new ApiError(400, "Only IN_TRANSIT orders can be received");
     }
 
+    const isScrapOrder = transferOrder.transferType === "SCRAP";
+
     for (const item of transferOrder.items) {
       // Find source batch to copy properties like mrp, rates, etc.
       const sourceBatch = await Batch.findOne({
@@ -229,62 +338,168 @@ export const receiveTransferOrder = async (workspaceId, transferOrderId, user) =
         throw new ApiError(404, `Source batch ${item.batchNo} not found`);
       }
 
-      // Find or create destination batch
-      let destBatch = await Batch.findOne({
-        workspaceId,
-        branch_id: transferOrder.destinationBranchId,
-        product: item.product,
-        batchNo: item.batchNo,
-        expiryDate: sourceBatch.expiryDate, // using expiry as key
-      }).session(session);
+      const isItemScrap =
+        isScrapOrder ||
+        (item.scrapType && item.scrapType !== "NONE") ||
+        item.sourceBin === "SCRAP";
 
-      if (destBatch) {
-        destBatch.batchQty += item.transferQty;
-        await destBatch.save({ session });
+      if (isItemScrap) {
+        // Destination receives this item as quarantined scrap stock
+        const isBroken =
+          item.scrapType === "BROKEN" ||
+          (item.batchNo && item.batchNo.includes("[BROKEN]"));
+        const resolvedScrapType = isBroken ? "BROKEN" : "EXPIRED";
+        const originalBatchNo =
+          item.originalBatchNo ||
+          sourceBatch.originalBatchNo ||
+          (sourceBatch.batchNo
+            ? sourceBatch.batchNo.replace(/\s*\[(EXPIRED|BROKEN|SCRAP)\]/gi, "").trim()
+            : item.batchNo);
+
+        const targetBatchNo = `${originalBatchNo} [${resolvedScrapType}]`;
+
+        let destBatch = await Batch.findOne({
+          workspaceId,
+          branch_id: transferOrder.destinationBranchId,
+          product: item.product,
+          batchNo: targetBatchNo,
+        }).session(session);
+
+        if (destBatch) {
+          destBatch.scrapQty = (destBatch.scrapQty || 0) + item.transferQty;
+          if (resolvedScrapType === "BROKEN") {
+            destBatch.brokenQty = (destBatch.brokenQty || 0) + item.transferQty;
+          } else {
+            destBatch.expiredQty = (destBatch.expiredQty || 0) + item.transferQty;
+          }
+          destBatch.scrapType = resolvedScrapType;
+          destBatch.originalBatchNo = originalBatchNo;
+          destBatch.isIncoming = true;
+          destBatch.sourceBranchId = transferOrder.sourceBranchId;
+          destBatch.sourceTransferOrderId = transferOrder._id;
+          destBatch.sourceTransferOrderNo = transferOrder.transferNo;
+          await destBatch.save({ session });
+        } else {
+          destBatch = new Batch({
+            workspaceId,
+            branch_id: transferOrder.destinationBranchId,
+            product: item.product,
+            batchNo: targetBatchNo,
+            originalBatchNo,
+            scrapType: resolvedScrapType,
+            batchQty: 0, // IMPORTANT: Sellable shelf stock remains 0!
+            scrapQty: item.transferQty,
+            brokenQty: resolvedScrapType === "BROKEN" ? item.transferQty : 0,
+            expiredQty: resolvedScrapType === "EXPIRED" ? item.transferQty : 0,
+            isIncoming: true,
+            sourceBranchId: transferOrder.sourceBranchId,
+            sourceTransferOrderId: transferOrder._id,
+            sourceTransferOrderNo: transferOrder.transferNo,
+            purchaseBillId: sourceBatch.purchaseBillId || null,
+            mrp: sourceBatch.mrp,
+            MRP: sourceBatch.MRP,
+            ptr: sourceBatch.ptr,
+            pts: sourceBatch.pts,
+            rate: sourceBatch.rate,
+            finalRateA: sourceBatch.finalRateA,
+            finalRateB: sourceBatch.finalRateB,
+            finalRateC: sourceBatch.finalRateC,
+            rateA: sourceBatch.rateA,
+            rateB: sourceBatch.rateB,
+            rateC: sourceBatch.rateC,
+            expiryDate: sourceBatch.expiryDate,
+          });
+          await destBatch.save({ session });
+        }
+
+        // Update destination product facility scrap quantity
+        let destFacility = await ProductFacility.findOne({
+          workspaceId,
+          facility_id: transferOrder.destinationBranchId,
+          product_id: item.product,
+        }).session(session);
+
+        if (destFacility) {
+          destFacility.scrapQty = (destFacility.scrapQty || 0) + item.transferQty;
+          await destFacility.save({ session });
+        } else {
+          destFacility = new ProductFacility({
+            workspaceId,
+            facility_id: transferOrder.destinationBranchId,
+            product_id: item.product,
+            total_qty_available: 0,
+            qoh: 0,
+            scrapQty: item.transferQty,
+          });
+          await destFacility.save({ session });
+        }
       } else {
-        // Create new batch for destination
-        destBatch = new Batch({
+        // Standard sellable transfer receipt
+        let destBatch = await Batch.findOne({
           workspaceId,
           branch_id: transferOrder.destinationBranchId,
           product: item.product,
           batchNo: item.batchNo,
-          batchQty: item.transferQty,
-          mrp: sourceBatch.mrp,
-          MRP: sourceBatch.MRP,
-          ptr: sourceBatch.ptr,
-          pts: sourceBatch.pts,
-          rate: sourceBatch.rate,
-          finalRateA: sourceBatch.finalRateA,
-          finalRateB: sourceBatch.finalRateB,
-          finalRateC: sourceBatch.finalRateC,
-          rateA: sourceBatch.rateA,
-          rateB: sourceBatch.rateB,
-          rateC: sourceBatch.rateC,
-          expiryDate: sourceBatch.expiryDate,
-        });
-        await destBatch.save({ session });
-      }
+          expiryDate: sourceBatch.expiryDate, // using expiry as key
+        }).session(session);
 
-      // Update destination product facility
-      let destFacility = await ProductFacility.findOne({
-        workspaceId,
-        facility_id: transferOrder.destinationBranchId,
-        product_id: item.product,
-      }).session(session);
+        if (destBatch) {
+          destBatch.batchQty += item.transferQty;
+          destBatch.isIncoming = true;
+          destBatch.sourceBranchId = transferOrder.sourceBranchId;
+          destBatch.sourceTransferOrderId = transferOrder._id;
+          destBatch.sourceTransferOrderNo = transferOrder.transferNo;
+          await destBatch.save({ session });
+        } else {
+          // Create new batch for destination
+          destBatch = new Batch({
+            workspaceId,
+            branch_id: transferOrder.destinationBranchId,
+            product: item.product,
+            batchNo: item.batchNo,
+            batchQty: item.transferQty,
+            isIncoming: true,
+            sourceBranchId: transferOrder.sourceBranchId,
+            sourceTransferOrderId: transferOrder._id,
+            sourceTransferOrderNo: transferOrder.transferNo,
+            purchaseBillId: sourceBatch.purchaseBillId || null,
+            mrp: sourceBatch.mrp,
+            MRP: sourceBatch.MRP,
+            ptr: sourceBatch.ptr,
+            pts: sourceBatch.pts,
+            rate: sourceBatch.rate,
+            finalRateA: sourceBatch.finalRateA,
+            finalRateB: sourceBatch.finalRateB,
+            finalRateC: sourceBatch.finalRateC,
+            rateA: sourceBatch.rateA,
+            rateB: sourceBatch.rateB,
+            rateC: sourceBatch.rateC,
+            expiryDate: sourceBatch.expiryDate,
+          });
+          await destBatch.save({ session });
+        }
 
-      if (destFacility) {
-        destFacility.total_qty_available += item.transferQty;
-        destFacility.qoh += item.transferQty;
-        await destFacility.save({ session });
-      } else {
-        destFacility = new ProductFacility({
+        // Update destination product facility
+        let destFacility = await ProductFacility.findOne({
           workspaceId,
           facility_id: transferOrder.destinationBranchId,
           product_id: item.product,
-          total_qty_available: item.transferQty,
-          qoh: item.transferQty,
-        });
-        await destFacility.save({ session });
+        }).session(session);
+
+        if (destFacility) {
+          destFacility.total_qty_available += item.transferQty;
+          destFacility.qoh += item.transferQty;
+          await destFacility.save({ session });
+        } else {
+          destFacility = new ProductFacility({
+            workspaceId,
+            facility_id: transferOrder.destinationBranchId,
+            product_id: item.product,
+            total_qty_available: item.transferQty,
+            qoh: item.transferQty,
+          });
+          await destFacility.save({ session });
+        }
       }
     }
 
@@ -338,6 +553,8 @@ export const cancelTransferOrder = async (
       );
     }
 
+    const isScrapOrder = transferOrder.transferType === "SCRAP";
+
     // Restore stock to source branch batches and product facility
     for (const item of transferOrder.items) {
       const sourceBatch = await Batch.findOne({
@@ -346,44 +563,74 @@ export const cancelTransferOrder = async (
         branch_id: transferOrder.sourceBranchId,
       }).session(session);
 
-      if (sourceBatch) {
-        sourceBatch.batchQty += item.transferQty;
-        await sourceBatch.save({ session });
-      } else {
-        // Fallback by product & batchNo in source branch
-        const fallbackBatch = await Batch.findOne({
-          product_id: item.product,
-          batchNo: item.batchNo,
-          branch_id: transferOrder.sourceBranchId,
-          workspaceId,
-        }).session(session);
+      const isItemScrap =
+        isScrapOrder ||
+        (item.scrapType && item.scrapType !== "NONE") ||
+        item.sourceBin === "SCRAP";
 
-        if (fallbackBatch) {
-          fallbackBatch.batchQty += item.transferQty;
-          await fallbackBatch.save({ session });
+      if (isItemScrap && item.sourceBin === "SCRAP") {
+        // Restore to source scrap bin
+        if (sourceBatch) {
+          sourceBatch.scrapQty = (sourceBatch.scrapQty || 0) + item.transferQty;
+          if (item.scrapType === "BROKEN") {
+            sourceBatch.brokenQty = (sourceBatch.brokenQty || 0) + item.transferQty;
+          } else {
+            sourceBatch.expiredQty = (sourceBatch.expiredQty || 0) + item.transferQty;
+          }
+          await sourceBatch.save({ session });
         }
-      }
 
-      // Restore to source product facility
-      let sourceFacility = await ProductFacility.findOne({
-        workspaceId,
-        facility_id: transferOrder.sourceBranchId,
-        product_id: item.product,
-      }).session(session);
-
-      if (sourceFacility) {
-        sourceFacility.total_qty_available += item.transferQty;
-        sourceFacility.qoh += item.transferQty;
-        await sourceFacility.save({ session });
-      } else {
-        sourceFacility = new ProductFacility({
+        let sourceFacility = await ProductFacility.findOne({
           workspaceId,
           facility_id: transferOrder.sourceBranchId,
           product_id: item.product,
-          total_qty_available: item.transferQty,
-          qoh: item.transferQty,
-        });
-        await sourceFacility.save({ session });
+        }).session(session);
+
+        if (sourceFacility) {
+          sourceFacility.scrapQty = (sourceFacility.scrapQty || 0) + item.transferQty;
+          await sourceFacility.save({ session });
+        }
+      } else {
+        // Restore to regular sellable stock (or shelf)
+        if (sourceBatch) {
+          sourceBatch.batchQty += item.transferQty;
+          await sourceBatch.save({ session });
+        } else {
+          // Fallback by product & batchNo in source branch
+          const fallbackBatch = await Batch.findOne({
+            product_id: item.product,
+            batchNo: item.batchNo,
+            branch_id: transferOrder.sourceBranchId,
+            workspaceId,
+          }).session(session);
+
+          if (fallbackBatch) {
+            fallbackBatch.batchQty += item.transferQty;
+            await fallbackBatch.save({ session });
+          }
+        }
+
+        // Restore to source product facility
+        let sourceFacility = await ProductFacility.findOne({
+          workspaceId,
+          facility_id: transferOrder.sourceBranchId,
+          product_id: item.product,
+        }).session(session);
+
+        if (sourceFacility) {
+          sourceFacility.total_qty_available += item.transferQty;
+          sourceFacility.qoh += item.transferQty;
+          await sourceFacility.save({ session });
+        } else {
+          sourceFacility = new ProductFacility({
+            workspaceId,
+            facility_id: transferOrder.sourceBranchId,
+            product_id: item.product,
+            total_qty_available: item.transferQty,
+            qoh: item.transferQty,
+          });
+          await sourceFacility.save({ session });
+        }
       }
     }
 
@@ -574,6 +821,10 @@ export const getTransferOrders = async (
 
   if (filters.destinationBranchId && filters.destinationBranchId !== "all") {
     query.destinationBranchId = filters.destinationBranchId;
+  }
+
+  if (filters.transferType && filters.transferType !== "all") {
+    query.transferType = filters.transferType;
   }
 
   // Branch-specific query: if branchId is provided and neither source nor destination filter was specified

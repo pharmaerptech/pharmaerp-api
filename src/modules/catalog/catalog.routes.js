@@ -10,6 +10,7 @@ import catalogProductFormMasterModule from "./product-form-master/catalogProduct
 import catalogSaltMasterModule from "./salt-master/catalogSaltMaster.module.js";
 import catalogBankMasterModule from "./bank-master/catalogBankMaster.module.js";
 import purchaseBillModule from "./purchase-bills/purchaseBill.module.js";
+import purchaseReturnModule from "./purchase-returns/purchaseReturn.module.js";
 
 const router = Router();
 
@@ -62,5 +63,10 @@ router.use(catalogBankMasterModule.path, catalogBankMasterModule.router);
 // /catalog/purchase-bills
 // ---------------------
 router.use(purchaseBillModule.path, purchaseBillModule.router);
+
+// ---------------------
+// /catalog/purchase-returns
+// ---------------------
+router.use(purchaseReturnModule.path, purchaseReturnModule.router);
 
 export default router;

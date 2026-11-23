@@ -17,6 +17,8 @@ import {
   importWorkspaceProducts,
   importWorkspaceProductsGst,
   getProductFacilityBatchesByQueryV2,
+  moveBatchesToScrapBin,
+  addExpiredBrokenStock,
 } from "../controllers/workspaceProduct.controller.js";
 
 import {
@@ -160,6 +162,22 @@ router.delete(
 router.post(
   "/workspace-product/batches/query",
   getProductFacilityBatchesByQueryV2,
+);
+
+// ---------------------
+// POST /catalog/products/workspace-product/batches/move-to-scrap-bin
+// ---------------------
+router.post(
+  "/workspace-product/batches/move-to-scrap-bin",
+  moveBatchesToScrapBin,
+);
+
+// ---------------------
+// POST /catalog/products/workspace-product/stock-adjustments/expired-broken
+// ---------------------
+router.post(
+  "/workspace-product/stock-adjustments/expired-broken",
+  addExpiredBrokenStock,
 );
 
 export default router;

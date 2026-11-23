@@ -39,6 +39,11 @@ export const getWorkspaceBranches = asyncHandler(async (req, res) => {
   const branches = await branchService.getWorkspaceBranches(
     req.workspaceId,
     req.user._id,
+    {
+      companyId: req.query.companyId,
+      includeAll: req.query.includeAll === "true" || req.query.forShipping === "true",
+      forShipping: req.query.forShipping === "true",
+    }
   );
 
   return res
