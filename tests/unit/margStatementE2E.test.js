@@ -349,7 +349,15 @@ describe("Task 9: Verification on User's Exact Marg ERP Sales Statement Sample",
     const actualFilePath =
       "/Users/atharvasharma/.gemini/antigravity/brain/b43ff509-5611-444e-a76a-ec6ebf6fef4f/.user_uploaded/media_1792253966565_be882c07.xlsx";
 
-    if (!fs.existsSync(actualFilePath)) {
+    let fileExists = false;
+    try {
+      fs.accessSync(actualFilePath, fs.constants.R_OK);
+      fileExists = true;
+    } catch {
+      fileExists = false;
+    }
+
+    if (!fileExists) {
       console.log("Uploaded file not found, skipping full-file integration test");
       return;
     }
