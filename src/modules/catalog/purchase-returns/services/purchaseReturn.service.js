@@ -15,7 +15,13 @@ import branchRepository from "../../../organization/branches/repositories/branch
 import gstLedgerRepository from "../../../finance/gst-ledger/repositories/gstLedger.repository.js";
 import financialPeriodRepository from "../../../finance/financial-periods/repositories/financialPeriod.repository.js";
 import journalVoucherService from "../../../finance/journal-vouchers/services/journalVoucher.service.js";
+import journalPostingService from "../../../finance/journal-vouchers/services/journalPosting.service.js";
+import JournalVoucher from "../../../finance/journal-vouchers/models/journalVoucher.model.js";
+import Ledger from "../../../finance/ledger/models/ledger.model.js";
+import { ensureSupplierLedgerAccount } from "../../../parties/suppliers/services/supplier.service.js";
 import Account from "../../../finance/chart-of-accounts/models/account.model.js";
+import CreditNote from "../../../sales/credit-notes/models/creditNote.model.js";
+import { CREDIT_NOTE_SOURCE, CREDIT_NOTE_STATUS } from "../../../sales/credit-notes/constants/creditNote.constant.js";
 import { VOUCHER_TYPE } from "../../../finance/journal-vouchers/constants/voucherType.constant.js";
 import { VOUCHER_STATUS } from "../../../finance/journal-vouchers/constants/voucherStatus.constant.js";
 import {
@@ -863,6 +869,79 @@ const getEligibleBatchesForReturn = async (
 };
 
 /**
+ * Materialize or sync with CreditNote collection so it appears on /sales/credit-notes
+ */
+export const syncCreditNoteDocument = async (returnDoc, creditNoteNoToSet) => {
+  if (!returnDoc || !creditNoteNoToSet) return null;
+  const supp = returnDoc.supplierId || {};
+  const workspaceId = returnDoc.workspaceId?._id || returnDoc.workspaceId;
+  const companyId = returnDoc.companyId?._id || returnDoc.companyId;
+  const branchId = returnDoc.branchId?._id || returnDoc.branchId || null;
+  const supplierId = supp._id || returnDoc.supplierId?._id || returnDoc.supplierId || returnDoc.shippingDetails?.destinationSupplierId?._id || returnDoc.shippingDetails?.destinationSupplierId || null;
+
+  return CreditNote.findOneAndUpdate(
+    {
+      workspaceId,
+      companyId,
+      sourceReturnId: returnDoc._id,
+      source: CREDIT_NOTE_SOURCE.PURCHASE_RETURN,
+    },
+    {
+      $set: {
+        workspaceId,
+        companyId,
+        branchId,
+        creditNoteNo: creditNoteNoToSet,
+        partyType: "SUPPLIER",
+        customerId: null,
+        supplierId,
+        supplierName: supp.businessName || supp.name || "Supplier",
+        supplierPhone: supp.mobile || supp.phone || null,
+        supplierGst: supp.gstNumber || null,
+        billingMode: "B2B",
+        source: CREDIT_NOTE_SOURCE.PURCHASE_RETURN,
+        sourceReturnModel: "PurchaseReturn",
+        sourceReturnId: returnDoc._id,
+        sourceReturnNo: returnDoc.debitNoteNo || returnDoc.returnNo,
+        subtotal: returnDoc.taxableSubtotal || 0,
+        discount: 0,
+        tax: returnDoc.totalGst || 0,
+        cgst: 0,
+        sgst: 0,
+        igst: 0,
+        roundOff: returnDoc.roundOff || 0,
+        totalAmount: returnDoc.grandTotal || 0,
+        redeemedAmount: 0,
+        balanceAmount: returnDoc.grandTotal || 0,
+        status: CREDIT_NOTE_STATUS.ACTIVE,
+        issueDate: returnDoc.creditNoteDate || returnDoc.returnDate || new Date(),
+        items: (returnDoc.items || []).map((it) => ({
+          productId: it.productId,
+          productName: it.productName,
+          pack: it.pack,
+          batchNo: it.batchNo,
+          batchNumber: it.batchNo,
+          batch: it.batchNo,
+          expiry: it.expiry || "",
+          expiryDate: it.expiry || "",
+          qty: it.returnQty,
+          quantity: it.returnQty,
+          rate: it.rate,
+          unitPrice: it.rate,
+          taxableAmount: it.taxableAmount,
+          gstPct: it.gstPct,
+          gstRate: it.gstPct,
+          totalAmount: it.totalAmount,
+          total: it.totalAmount,
+        })),
+        notes: `Purchase Return Credit Note for #${returnDoc.debitNoteNo || returnDoc.returnNo}`,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+};
+
+/**
  * Create a new Purchase Return & issue Debit Note (Atomic Transaction)
  */
 const createPurchaseReturn = async (
@@ -889,8 +968,7 @@ const createPurchaseReturn = async (
 
   const isInterBranch =
     Boolean(payload.isInterBranch) ||
-    settlementType === SETTLEMENT_TYPE.CREDIT_NOTE ||
-    Boolean(payload.sourceBranchId);
+    Boolean(payload.sourceBranchId && !supplierId);
 
   if (!supplierId && !isInterBranch) {
     throw new ApiError(400, "Supplier is required");
@@ -1066,6 +1144,10 @@ const createPurchaseReturn = async (
   let debitNoteNo = "";
   let creditNoteNo = "";
 
+  if (payload.creditNoteNo || payload.customCreditNoteNo) {
+    creditNoteNo = String(payload.creditNoteNo || payload.customCreditNoteNo).trim();
+  }
+
   if (isCreditNote) {
     const [retNum, cnNum] = await Promise.all([
       purchaseReturnRepository.generateNextReturnNo(
@@ -1073,11 +1155,13 @@ const createPurchaseReturn = async (
         workspaceId,
         branchCode
       ),
-      purchaseReturnRepository.generateNextCreditNoteNo(
-        companyId,
-        workspaceId,
-        branchCode
-      ),
+      creditNoteNo
+        ? Promise.resolve(creditNoteNo)
+        : purchaseReturnRepository.generateNextCreditNoteNo(
+            companyId,
+            workspaceId,
+            branchCode
+          ),
     ]);
     returnNo = retNum;
     creditNoteNo = cnNum;
@@ -1405,43 +1489,40 @@ const createPurchaseReturn = async (
 
   // 7. Post Journal Voucher (Outside transaction to preserve ledger independent isolation)
   try {
-    let cogsAccount =
-      (await Account.findOne({
-        workspaceId,
-        companyId,
-        accountCode: "COGS",
-      })) ||
-      (await Account.findOne({
-        workspaceId,
-        companyId,
-        accountCategory: "PURCHASE",
-      }));
+    const { cogsAccount, taxAccount } = await ensurePurchaseAccounts(workspaceId, companyId, userId);
 
-    let taxAccount =
-      (await Account.findOne({
-        workspaceId,
-        companyId,
-        accountCode: "TAX-PAYABLE",
-      })) ||
-      (await Account.findOne({
-        workspaceId,
-        companyId,
-        accountCategory: "GST",
-      }));
+    let supplierAccountId = null;
+    if (!isInterBranch && supplier) {
+      try {
+        supplierAccountId = await ensureSupplierLedgerAccount(
+          supplier,
+          companyId,
+          workspaceId,
+          userId
+        );
+      } catch (e) {
+        console.warn("Failed to auto-resolve supplier ledger account on return creation:", e?.message);
+      }
+    }
 
-    if (!isInterBranch && supplier?.ledgerAccountId && cogsAccount) {
+    const refDocNo = creditNoteNo || debitNoteNo || returnNo;
+    const isCN = Boolean(creditNoteNo || isCreditNote);
+
+    if (!isInterBranch && supplierAccountId && cogsAccount) {
       const lines = [
         {
-          accountId: supplier.ledgerAccountId.toString(),
+          accountId: supplierAccountId.toString(),
           debit: grandTotal,
           credit: 0,
-          narration: `Debit Note #${debitNoteNo} to ${supplier.businessName}`,
+          narration: isCN
+            ? `Credit Note #${refDocNo} to ${supplier.businessName || supplier.name || "Supplier"}`
+            : `Debit Note #${refDocNo} to ${supplier.businessName || supplier.name || "Supplier"}`,
         },
         {
           accountId: cogsAccount._id.toString(),
           debit: 0,
           credit: taxableSubtotal,
-          narration: `Purchase Return reversal for #${debitNoteNo}`,
+          narration: `Purchase Return reversal for #${refDocNo}`,
         },
       ];
 
@@ -1450,7 +1531,7 @@ const createPurchaseReturn = async (
           accountId: taxAccount._id.toString(),
           debit: 0,
           credit: totalGst,
-          narration: `ITC Reversal for Debit Note #${debitNoteNo}`,
+          narration: `ITC Reversal for #${refDocNo}`,
         });
       }
 
@@ -1464,24 +1545,46 @@ const createPurchaseReturn = async (
       const jv = await journalVoucherService.createJournalVoucher(
         workspaceId,
         companyId,
-        userId,
+        resolvedUserId,
         {
           lines,
           voucherDate: createdReturn.returnDate,
           voucherType: VOUCHER_TYPE.PURCHASE_RETURN,
-          referenceNumber: debitNoteNo,
-          narration: `Purchase Return / Debit Note: ${debitNoteNo} (${returnNo})`,
+          referenceNumber: refDocNo,
+          narration: isCN
+            ? `Purchase Return Credit Note: ${refDocNo} (${returnNo})`
+            : `Purchase Return / Debit Note: ${refDocNo} (${returnNo})`,
           status: VOUCHER_STATUS.POSTED,
         }
       );
 
       if (jv && jv._id) {
+        try {
+          await journalPostingService.postJournalVoucher(
+            jv._id,
+            companyId,
+            workspaceId,
+            resolvedUserId
+          );
+        } catch (postErr) {
+          console.warn("Failed to post JV immediately upon purchase return creation:", postErr?.message);
+        }
+
         await purchaseReturnRepository.updatePurchaseReturn(
           createdReturn._id,
           companyId,
           workspaceId,
           { journalVoucherId: jv._id }
         );
+      }
+    }
+
+    // Materialize Credit Note collection document if creditNoteNo is present
+    if (creditNoteNo) {
+      try {
+        await syncCreditNoteDocument(createdReturn, creditNoteNo);
+      } catch (cnErr) {
+        console.warn("Failed to sync CreditNote collection on return creation:", cnErr?.message);
       }
     }
   } catch (jvErr) {
@@ -1494,22 +1597,24 @@ const createPurchaseReturn = async (
   // 8. Post GSTR-2 Debit Note Entry in GstLedger
   try {
     const halfGst = totalGst / 2;
+    const refDocNo = creditNoteNo || debitNoteNo || returnNo;
+    const isCN = Boolean(creditNoteNo || isCreditNote);
     await gstLedgerRepository.createGstLedgerEntry({
       workspaceId,
       companyId,
       branchId: resolvedBranchId,
       partyId: supplierId,
       voucherId: createdReturn._id,
-      voucherNumber: debitNoteNo,
+      voucherNumber: refDocNo,
       voucherDate: createdReturn.returnDate,
       gstType: "GSTR-2",
-      groupDescription: "CDNR - Debit Note",
+      groupDescription: isCN ? "CDNR - Credit Note" : "CDNR - Debit Note",
       taxableAmount: -taxableSubtotal,
       cgst: isIgst ? 0 : -halfGst,
       sgst: isIgst ? 0 : -halfGst,
       igst: isIgst ? -totalGst : 0,
       totalAmount: -grandTotal,
-      narration: `Purchase Return Debit Note #${debitNoteNo} to ${supplier.businessName}`,
+      narration: `Purchase Return ${isCN ? "Credit Note #" : "Debit Note #"}${refDocNo} to ${supplier?.businessName || supplier?.name || "Supplier"}`,
     });
   } catch (gstErr) {
     console.error("Failed to log GSTR-2 entry for purchase return:", gstErr);
@@ -1584,6 +1689,7 @@ const getPurchaseReturns = async (
     query.$or = [
       { returnNo: searchRegex },
       { debitNoteNo: searchRegex },
+      { creditNoteNo: searchRegex },
       { reason: searchRegex },
     ];
   }
@@ -1852,6 +1958,7 @@ const dispatchReturnBox = async (
     trackingNo = "",
     boxCount = 1,
     packageNotes = "",
+    creditNoteNo: customCreditNoteNo,
   } = dispatchData;
 
   const isSupplierDispatch = destinationType === "SUPPLIER";
@@ -1882,7 +1989,31 @@ const dispatchReturnBox = async (
     }
   }
 
+  // Generate or assign Credit Note for the supplier upon consignment dispatch
+  let creditNoteNoToSet = returnDoc.creditNoteNo;
+  let creditNoteDateToSet = returnDoc.creditNoteDate;
+
+  if (customCreditNoteNo && String(customCreditNoteNo).trim()) {
+    creditNoteNoToSet = String(customCreditNoteNo).trim();
+    if (!creditNoteDateToSet) creditNoteDateToSet = new Date();
+  } else if (!creditNoteNoToSet) {
+    let branchCode = "BR01";
+    const originBranchId = returnDoc.branchId?._id || returnDoc.branchId;
+    if (originBranchId) {
+      const bDoc = await Branch.findById(originBranchId).select("branchCode").lean();
+      if (bDoc?.branchCode) branchCode = bDoc.branchCode;
+    }
+    creditNoteNoToSet = await purchaseReturnRepository.generateNextCreditNoteNo(
+      companyId,
+      workspaceId,
+      branchCode
+    );
+    creditNoteDateToSet = new Date();
+  }
+
   const shippingUpdate = {
+    creditNoteNo: creditNoteNoToSet,
+    creditNoteDate: creditNoteDateToSet,
     "shippingDetails.destinationType": isSupplierDispatch ? "SUPPLIER" : "COMPANY_BRANCH",
     "shippingDetails.destinationCompanyId": isSupplierDispatch
       ? null
@@ -1919,7 +2050,306 @@ const dispatchReturnBox = async (
     .populate("supplierId", "businessName name gstNumber mobile phone address")
     .lean();
 
+  // Materialize or sync with CreditNote collection so it appears on /sales/credit-notes
+  try {
+    await syncCreditNoteDocument(updated, creditNoteNoToSet);
+  } catch (cnSyncErr) {
+    console.error("Failed to sync CreditNote document on dispatch:", cnSyncErr);
+  }
+
+  // Ensure Supplier Ledger is updated and synchronized with Credit Note
+  try {
+    await syncPurchaseReturnLedger(updated, creditNoteNoToSet, userId);
+  } catch (ledgerSyncErr) {
+    console.error("Failed to sync supplier ledger on return dispatch:", ledgerSyncErr);
+  }
+
   return updated;
+};
+
+/**
+ * Ensure COGS/Purchase account and Tax/GST account exist with valid AccountGroup
+ */
+export const ensurePurchaseAccounts = async (workspaceId, companyId, userId = null) => {
+  const Account = mongoose.model("Account");
+  const AccountGroup = mongoose.model("AccountGroup");
+
+  let cogsAccount =
+    (await Account.findOne({
+      workspaceId,
+      companyId,
+      accountCode: "COGS",
+    })) ||
+    (await Account.findOne({
+      workspaceId,
+      companyId,
+      accountCategory: "PURCHASE",
+    })) ||
+    (await Account.findOne({
+      workspaceId,
+      companyId,
+      accountNature: "EXPENSE",
+    }));
+
+  if (!cogsAccount) {
+    let expenseGroup =
+      (await AccountGroup.findOne({
+        workspaceId,
+        companyId,
+        groupCode: { $in: ["COGS_GROUP", "OPERATING_EXPENSES", "DIRECT_EXPENSES"] },
+      })) ||
+      (await AccountGroup.findOne({
+        workspaceId,
+        companyId,
+        nature: "EXPENSE",
+      }));
+
+    if (!expenseGroup) {
+      expenseGroup = await AccountGroup.create({
+        workspaceId,
+        companyId,
+        groupName: "Direct Expenses",
+        groupCode: "DIRECT_EXPENSES",
+        nature: "EXPENSE",
+        isSystemGroup: true,
+        createdBy: userId,
+      });
+    }
+
+    cogsAccount = await Account.create({
+      workspaceId,
+      companyId,
+      accountCode: "PURCHASE",
+      accountName: "Purchase Account",
+      accountGroupId: expenseGroup._id,
+      accountNature: "EXPENSE",
+      accountCategory: "PURCHASE",
+      status: "active",
+      isSystemAccount: true,
+      createdBy: userId,
+    });
+  }
+
+  let taxAccount =
+    (await Account.findOne({
+      workspaceId,
+      companyId,
+      accountCode: "TAX-PAYABLE",
+    })) ||
+    (await Account.findOne({
+      workspaceId,
+      companyId,
+      accountCategory: "GST",
+    })) ||
+    (await Account.findOne({
+      workspaceId,
+      companyId,
+      $or: [{ accountName: /GST/i }, { accountName: /Tax/i }],
+    }));
+
+  if (!taxAccount) {
+    let dutiesGroup =
+      (await AccountGroup.findOne({
+        workspaceId,
+        companyId,
+        groupCode: { $in: ["DUTIES_AND_TAXES", "CURRENT_LIABILITIES"] },
+      })) ||
+      (await AccountGroup.findOne({
+        workspaceId,
+        companyId,
+        $or: [
+          { groupName: /Duties/i },
+          { groupName: /Tax/i },
+          { nature: "LIABILITY" },
+          { nature: "ASSET" },
+        ],
+      }));
+
+    if (!dutiesGroup) {
+      dutiesGroup = await AccountGroup.create({
+        workspaceId,
+        companyId,
+        groupName: "Duties & Taxes",
+        groupCode: "DUTIES_AND_TAXES",
+        nature: "LIABILITY",
+        isSystemGroup: true,
+        createdBy: userId,
+      });
+    }
+
+    taxAccount = await Account.create({
+      workspaceId,
+      companyId,
+      accountCode: "GST-INPUT",
+      accountName: "Input GST Tax Account",
+      accountGroupId: dutiesGroup._id,
+      accountNature: "ASSET",
+      accountCategory: "GST",
+      status: "active",
+      isSystemAccount: true,
+      createdBy: userId,
+    });
+  }
+
+  return { cogsAccount, taxAccount };
+};
+
+/**
+ * Synchronize or create Journal Voucher and General Ledger entries for a Purchase Return on Dispatch/Confirmation
+ */
+export const syncPurchaseReturnLedger = async (
+  returnDoc,
+  creditNoteNo = null,
+  userId = null
+) => {
+  if (!returnDoc) return null;
+  const workspaceId = returnDoc.workspaceId?._id || returnDoc.workspaceId;
+  const companyId = returnDoc.companyId?._id || returnDoc.companyId;
+  const resolvedUserId = userId?._id || userId || returnDoc.createdBy?._id || returnDoc.createdBy || null;
+  const rawSupplierId = returnDoc.supplierId?._id || returnDoc.supplierId || returnDoc.shippingDetails?.destinationSupplierId?._id || returnDoc.shippingDetails?.destinationSupplierId;
+  const hasSupplier = Boolean(rawSupplierId);
+  const isInterBranch = Boolean(returnDoc.isInterBranch && !hasSupplier);
+  if (isInterBranch) return null;
+
+  const grandTotal = returnDoc.grandTotal || 0;
+  const taxableSubtotal = returnDoc.taxableSubtotal || 0;
+  const totalGst = returnDoc.totalGst || 0;
+  const debitNoteNo = returnDoc.debitNoteNo || returnDoc.returnNo;
+  const activeCreditNoteNo = creditNoteNo || returnDoc.creditNoteNo || debitNoteNo;
+
+  // 1. If a Journal Voucher already exists, verify its ledger entries
+  if (returnDoc.journalVoucherId) {
+    try {
+      const existingLedgerCount = await Ledger.countDocuments({ voucherId: returnDoc.journalVoucherId });
+      const updatedNarration = `Purchase Return Credit Note: ${activeCreditNoteNo} (DN: ${debitNoteNo})`;
+      await JournalVoucher.findByIdAndUpdate(returnDoc.journalVoucherId, {
+        $set: {
+          referenceNumber: activeCreditNoteNo,
+          narration: updatedNarration,
+          status: VOUCHER_STATUS.POSTED,
+        },
+      });
+
+      if (existingLedgerCount > 0) {
+        await Ledger.updateMany(
+          { voucherId: returnDoc.journalVoucherId },
+          {
+            $set: {
+              narration: updatedNarration,
+            },
+          }
+        );
+        return returnDoc.journalVoucherId;
+      } else {
+        // Journal Voucher was in draft or had no ledger entries; post it now!
+        await journalPostingService.postJournalVoucher(
+          returnDoc.journalVoucherId,
+          companyId,
+          workspaceId,
+          resolvedUserId
+        );
+        return returnDoc.journalVoucherId;
+      }
+    } catch (err) {
+      console.warn("Failed to update/post existing JV for purchase return, proceeding to recreate:", err?.message);
+    }
+  }
+
+  // 2. If no Journal Voucher exists yet, create and post one now
+  try {
+    let supplier = null;
+    if (rawSupplierId) {
+      supplier = await Supplier.findById(rawSupplierId);
+    }
+
+    if (!supplier) return null;
+
+    const supplierAccountId = await ensureSupplierLedgerAccount(
+      supplier,
+      companyId,
+      workspaceId,
+      resolvedUserId
+    );
+
+    const { cogsAccount, taxAccount } = await ensurePurchaseAccounts(
+      workspaceId,
+      companyId,
+      resolvedUserId
+    );
+
+    if (supplierAccountId && cogsAccount) {
+      const narrationText = `Debit Note #${debitNoteNo} / Credit Note #${activeCreditNoteNo} to ${supplier.businessName || supplier.name || "Supplier"}`;
+      const lines = [
+        {
+          accountId: supplierAccountId.toString(),
+          debit: grandTotal,
+          credit: 0,
+          narration: narrationText,
+        },
+        {
+          accountId: cogsAccount._id.toString(),
+          debit: 0,
+          credit: taxableSubtotal,
+          narration: `Purchase Return reversal for CN #${activeCreditNoteNo} (DN #${debitNoteNo})`,
+        },
+      ];
+
+      if (taxAccount && totalGst > 0) {
+        lines.push({
+          accountId: taxAccount._id.toString(),
+          debit: 0,
+          credit: totalGst,
+          narration: `ITC Reversal for CN #${activeCreditNoteNo} (DN #${debitNoteNo})`,
+        });
+      }
+
+      // Small rounding adjustment
+      const totDebit = lines.reduce((acc, l) => acc + l.debit, 0);
+      const totCredit = lines.reduce((acc, l) => acc + l.credit, 0);
+      if (Math.abs(totDebit - totCredit) > 0.0001) {
+        lines[1].credit += totDebit - totCredit;
+      }
+
+      const jv = await journalVoucherService.createJournalVoucher(
+        workspaceId,
+        companyId,
+        resolvedUserId,
+        {
+          lines,
+          voucherDate: returnDoc.creditNoteDate || returnDoc.returnDate || new Date(),
+          voucherType: VOUCHER_TYPE.PURCHASE_RETURN,
+          referenceNumber: activeCreditNoteNo,
+          narration: `Purchase Return Credit Note: ${activeCreditNoteNo} (DN: ${debitNoteNo})`,
+          status: VOUCHER_STATUS.POSTED,
+        }
+      );
+
+      if (jv && jv._id) {
+        try {
+          await journalPostingService.postJournalVoucher(
+            jv._id,
+            companyId,
+            workspaceId,
+            resolvedUserId
+          );
+        } catch (postErr) {
+          console.warn("Failed to post JV immediately upon purchase return dispatch:", postErr?.message);
+        }
+
+        await PurchaseReturn.findByIdAndUpdate(returnDoc._id, {
+          $set: {
+            journalVoucherId: jv._id,
+            creditNoteNo: activeCreditNoteNo,
+          },
+        });
+        return jv._id;
+      }
+    }
+  } catch (jvErr) {
+    console.error("Failed to post journal voucher on dispatch for purchase return:", jvErr);
+  }
+
+  return null;
 };
 
 /**
@@ -2582,12 +3012,14 @@ const ingestFreshStockToStore = async (
 };
 
 const purchaseReturnService = {
+  ensurePurchaseAccounts,
   getEligibleBatchesForReturn,
   createPurchaseReturn,
   getPurchaseReturns,
   getPurchaseReturnById,
   cancelPurchaseReturn,
   dispatchReturnBox,
+  syncPurchaseReturnLedger,
   receiveReturnBox,
   ingestFreshStockToStore,
   materializeConsignmentBatches,

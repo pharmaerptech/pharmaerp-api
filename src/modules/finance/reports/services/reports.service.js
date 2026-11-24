@@ -3,6 +3,27 @@ import AccountBalance from "../../account-balances/models/accountBalance.model.j
 import Account from "../../chart-of-accounts/models/account.model.js";
 import Ledger from "../../ledger/models/ledger.model.js";
 
+/**
+ * Robust date-range builder that sets full day boundaries (00:00:00.000 to 23:59:59.999 UTC)
+ */
+export const buildDateRangeFilter = (startDate, endDate) => {
+  if (!startDate && !endDate) return null;
+  const dateFilter = {};
+  if (startDate) {
+    const s = new Date(startDate);
+    if (!String(startDate).includes("T")) {
+      s.setUTCHours(0, 0, 0, 0);
+    }
+    dateFilter.$gte = s;
+  }
+  if (endDate) {
+    const e = new Date(endDate);
+    e.setUTCHours(23, 59, 59, 999);
+    dateFilter.$lte = e;
+  }
+  return dateFilter;
+};
+
 // ────────────────────────────────────────────────────────────────
 // TRIAL BALANCE
 // ────────────────────────────────────────────────────────────────
@@ -94,10 +115,9 @@ const getGeneralLedger = async (workspaceId, companyId, query = {}) => {
     filter.accountId = accountId;
   }
 
-  if (startDate || endDate) {
-    filter.voucherDate = {};
-    if (startDate) filter.voucherDate.$gte = new Date(startDate);
-    if (endDate) filter.voucherDate.$lte = new Date(endDate);
+  const dateRange = buildDateRangeFilter(startDate, endDate);
+  if (dateRange) {
+    filter.voucherDate = dateRange;
   }
 
   const sort = { voucherDate: 1, createdAt: 1 };
@@ -173,10 +193,9 @@ const getCustomerLedger = async (workspaceId, companyId, query = {}) => {
     filter.companyId = companyId;
   }
 
-  if (startDate || endDate) {
-    filter.voucherDate = {};
-    if (startDate) filter.voucherDate.$gte = new Date(startDate);
-    if (endDate) filter.voucherDate.$lte = new Date(endDate);
+  const dateRange = buildDateRangeFilter(startDate, endDate);
+  if (dateRange) {
+    filter.voucherDate = dateRange;
   }
 
   const sort = { voucherDate: 1, createdAt: 1 };
@@ -224,26 +243,99 @@ const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
     return { entries: [], total: 0, page: 1, limit: 50 };
   }
 
-  const { accountId, startDate, endDate, page, limit, all } = query;
+  const { accountId, supplierId, startDate, endDate, page, limit, all } = query;
 
-  const accountFilter = {
-    workspaceId,
-    accountCategory: "SUPPLIER",
-    isDeleted: false,
-  };
-  if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
-    accountFilter.companyId = companyId;
+  let targetAccountId = accountId;
+  let openingBalance = 0;
+  let openingBalanceType = "CR";
+
+  if (!targetAccountId && supplierId && mongoose.Types.ObjectId.isValid(supplierId)) {
+    try {
+      const Supplier = mongoose.model("Supplier");
+      const supplier = await Supplier.findById(supplierId);
+      if (supplier) {
+        openingBalance = Number(supplier.openingBalance) || 0;
+        openingBalanceType = (supplier.openingBalanceType || "cr").toUpperCase();
+
+        if (!supplier.ledgerAccountId) {
+          const { ensureSupplierLedgerAccount } = await import(
+            "../../../parties/suppliers/services/supplier.service.js"
+          );
+          await ensureSupplierLedgerAccount(supplier, companyId, workspaceId);
+        }
+        if (supplier.ledgerAccountId) {
+          targetAccountId = supplier.ledgerAccountId;
+        }
+
+        // Self-healing: Check for any dispatched purchase returns missing ledger entries
+        try {
+          const PurchaseReturn = mongoose.model("PurchaseReturn");
+          const unsyncedReturns = await PurchaseReturn.find({
+            workspaceId: new mongoose.Types.ObjectId(workspaceId),
+            ...(companyId ? { companyId: new mongoose.Types.ObjectId(companyId) } : {}),
+            $or: [
+              { supplierId: supplier._id },
+              { "shippingDetails.destinationSupplierId": supplier._id },
+            ],
+            "shippingDetails.transitStatus": { $in: ["IN_TRANSIT", "DELIVERED", "DISPATCHED"] },
+            $or: [
+              { journalVoucherId: null },
+              { journalVoucherId: { $exists: false } },
+            ],
+          }).lean();
+
+          if (unsyncedReturns.length > 0) {
+            const { syncPurchaseReturnLedger } = await import(
+              "../../../catalog/purchase-returns/services/purchaseReturn.service.js"
+            );
+            for (const ret of unsyncedReturns) {
+              await syncPurchaseReturnLedger(ret, ret.creditNoteNo);
+            }
+          }
+        } catch (healErr) {
+          console.warn("Self-healing supplier ledger sync in report warning:", healErr?.message);
+        }
+      }
+    } catch (sErr) {
+      console.warn("Failed to resolve supplier ledger account in report:", sErr?.message);
+    }
+  } else if (targetAccountId && mongoose.Types.ObjectId.isValid(targetAccountId)) {
+    try {
+      const Supplier = mongoose.model("Supplier");
+      const supplier = await Supplier.findOne({ ledgerAccountId: targetAccountId }).lean();
+      if (supplier) {
+        openingBalance = Number(supplier.openingBalance) || 0;
+        openingBalanceType = (supplier.openingBalanceType || "cr").toUpperCase();
+      }
+    } catch {}
   }
 
-  if (accountId && mongoose.Types.ObjectId.isValid(accountId)) {
-    accountFilter._id = accountId;
+  let supplierAccountIds = [];
+  if (targetAccountId && mongoose.Types.ObjectId.isValid(targetAccountId)) {
+    supplierAccountIds = [new mongoose.Types.ObjectId(targetAccountId)];
+  } else {
+    const accountFilter = {
+      workspaceId,
+      accountCategory: "SUPPLIER",
+      isDeleted: false,
+    };
+    if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+      accountFilter.companyId = companyId;
+    }
+    const supplierAccounts = await Account.find(accountFilter).select("_id").lean();
+    supplierAccountIds = supplierAccounts.map((a) => a._id);
   }
-
-  const supplierAccounts = await Account.find(accountFilter).select("_id").lean();
-  const supplierAccountIds = supplierAccounts.map((a) => a._id);
 
   if (supplierAccountIds.length === 0) {
-    return { entries: [], total: 0, page: 1, limit: 50 };
+    return {
+      entries: [],
+      total: 0,
+      page: 1,
+      limit: 50,
+      openingBalance,
+      openingBalanceType,
+      totals: { debit: 0, credit: 0, closingBalance: openingBalance, closingBalanceType: openingBalanceType },
+    };
   }
 
   const filter = { workspaceId, accountId: { $in: supplierAccountIds } };
@@ -251,11 +343,58 @@ const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
     filter.companyId = companyId;
   }
 
-  if (startDate || endDate) {
-    filter.voucherDate = {};
-    if (startDate) filter.voucherDate.$gte = new Date(startDate);
-    if (endDate) filter.voucherDate.$lte = new Date(endDate);
+  const dateRange = buildDateRangeFilter(startDate, endDate);
+  if (dateRange) {
+    filter.voucherDate = dateRange;
   }
+
+  // Calculate totals across all matching ledger lines
+  let totalDebit = 0;
+  let totalCredit = 0;
+  try {
+    const aggMatch = {
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      accountId: {
+        $in: supplierAccountIds.map((id) =>
+          id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(id)
+        ),
+      },
+    };
+    if (companyId && mongoose.Types.ObjectId.isValid(companyId)) {
+      aggMatch.companyId = new mongoose.Types.ObjectId(companyId);
+    }
+    if (filter.voucherDate) {
+      aggMatch.voucherDate = filter.voucherDate;
+    }
+
+    const totalAgg = await Ledger.aggregate([
+      { $match: aggMatch },
+      {
+        $group: {
+          _id: null,
+          totalDebit: { $sum: "$debit" },
+          totalCredit: { $sum: "$credit" },
+        },
+      },
+    ]);
+    totalDebit = totalAgg[0]?.totalDebit || 0;
+    totalCredit = totalAgg[0]?.totalCredit || 0;
+  } catch (aggErr) {
+    console.warn("Failed to aggregate supplier ledger totals:", aggErr?.message);
+  }
+
+  const isCr = openingBalanceType === "CR";
+  const effectiveDebit = totalDebit + (!isCr ? openingBalance : 0);
+  const effectiveCredit = totalCredit + (isCr ? openingBalance : 0);
+  const closingBalance = Math.abs(effectiveCredit - effectiveDebit);
+  const closingBalanceType = effectiveCredit >= effectiveDebit ? "CR" : "DR";
+
+  const totals = {
+    debit: totalDebit,
+    credit: totalCredit,
+    closingBalance,
+    closingBalanceType,
+  };
 
   const sort = { voucherDate: 1, createdAt: 1 };
 
@@ -265,7 +404,13 @@ const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
       .populate("voucherId", "voucherType referenceNumber narration status")
       .sort(sort)
       .lean();
-    return { entries, total: entries.length };
+    return {
+      entries,
+      total: entries.length,
+      openingBalance,
+      openingBalanceType,
+      totals,
+    };
   }
 
   const pg = Math.max(1, parseInt(page) || 1);
@@ -283,7 +428,15 @@ const getSupplierLedger = async (workspaceId, companyId, query = {}) => {
     Ledger.countDocuments(filter),
   ]);
 
-  return { entries, total, page: pg, limit: lim };
+  return {
+    entries,
+    total,
+    page: pg,
+    limit: lim,
+    openingBalance,
+    openingBalanceType,
+    totals,
+  };
 };
 
 // ────────────────────────────────────────────────────────────────
@@ -331,10 +484,9 @@ const getCashBook = async (workspaceId, companyId, query = {}) => {
     filter.companyId = companyId;
   }
 
-  if (startDate || endDate) {
-    filter.voucherDate = {};
-    if (startDate) filter.voucherDate.$gte = new Date(startDate);
-    if (endDate) filter.voucherDate.$lte = new Date(endDate);
+  const dateRange = buildDateRangeFilter(startDate, endDate);
+  if (dateRange) {
+    filter.voucherDate = dateRange;
   }
 
   const sort = { voucherDate: 1, createdAt: 1 };
@@ -411,10 +563,9 @@ const getBankBook = async (workspaceId, companyId, query = {}) => {
     filter.companyId = companyId;
   }
 
-  if (startDate || endDate) {
-    filter.voucherDate = {};
-    if (startDate) filter.voucherDate.$gte = new Date(startDate);
-    if (endDate) filter.voucherDate.$lte = new Date(endDate);
+  const dateRange = buildDateRangeFilter(startDate, endDate);
+  if (dateRange) {
+    filter.voucherDate = dateRange;
   }
 
   const sort = { voucherDate: 1, createdAt: 1 };
@@ -488,9 +639,7 @@ const getProfitLoss = async (workspaceId, companyId, filters = {}) => {
 
   if (startDate || endDate) {
     // Date-range mode: aggregate from Ledger
-    const dateFilter = {};
-    if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) dateFilter.$lte = new Date(endDate);
+    const dateFilter = buildDateRangeFilter(startDate, endDate) || {};
 
     const matchQuery = {
       workspaceId: new mongoose.Types.ObjectId(workspaceId),
@@ -745,9 +894,7 @@ const getGstReport = async (workspaceId, companyId, filters = {}) => {
 
   const gstAccountIds = gstAccounts.map((a) => a._id);
 
-  const dateFilter = {};
-  if (startDate) dateFilter.$gte = new Date(startDate);
-  if (endDate) dateFilter.$lte = new Date(endDate);
+  const dateFilter = buildDateRangeFilter(startDate, endDate);
 
   const ledgerFilter = {
     workspaceId,
@@ -757,7 +904,7 @@ const getGstReport = async (workspaceId, companyId, filters = {}) => {
     ledgerFilter.companyId = companyId;
   }
 
-  if (Object.keys(dateFilter).length) {
+  if (dateFilter) {
     ledgerFilter.voucherDate = dateFilter;
   }
 

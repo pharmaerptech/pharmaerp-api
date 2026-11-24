@@ -87,10 +87,16 @@ const creditNoteSchema = new mongoose.Schema(
       trim: true,
       index: true,
     },
+    partyType: {
+      type: String,
+      enum: ["CUSTOMER", "SUPPLIER"],
+      default: "CUSTOMER",
+      index: true,
+    },
     customerId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Customer",
-      required: [true, "Customer ID is required"],
+      default: null,
       index: true,
     },
     customerName: {
@@ -108,6 +114,27 @@ const creditNoteSchema = new mongoose.Schema(
       default: null,
       trim: true,
     },
+    supplierId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Supplier",
+      default: null,
+      index: true,
+    },
+    supplierName: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    supplierPhone: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    supplierGst: {
+      type: String,
+      default: null,
+      trim: true,
+    },
     billingMode: {
       type: String,
       enum: ["B2C", "B2B"],
@@ -120,9 +147,14 @@ const creditNoteSchema = new mongoose.Schema(
       default: CREDIT_NOTE_SOURCE.SALES_RETURN,
       index: true,
     },
+    sourceReturnModel: {
+      type: String,
+      enum: ["SalesReturn", "PurchaseReturn"],
+      default: "SalesReturn",
+    },
     sourceReturnId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "SalesReturn",
+      refPath: "sourceReturnModel",
       default: null,
       index: true,
     },
@@ -285,6 +317,8 @@ creditNoteSchema.pre("save", function () {
 creditNoteSchema.index({ workspaceId: 1, creditNoteNo: 1 }, { unique: true });
 creditNoteSchema.index({ workspaceId: 1, companyId: 1, branchId: 1, issueDate: -1 });
 creditNoteSchema.index({ workspaceId: 1, customerId: 1, status: 1 });
+creditNoteSchema.index({ workspaceId: 1, supplierId: 1, status: 1 });
+creditNoteSchema.index({ workspaceId: 1, partyType: 1 });
 creditNoteSchema.index({ workspaceId: 1, sourceReturnId: 1 });
 
 const CreditNote =

@@ -126,9 +126,10 @@ const findCreditNoteById = async (idOrNo, companyId, workspaceId, session = null
 
   const queryBuilder = CreditNote.findOne(query)
     .populate("customerId", "name mobile phone customerCode gstNumber billingAddress advanceBalance creditNoteBalance")
+    .populate("supplierId", "businessName name contactPerson mobile phone gstNumber address")
     .populate("branchId", "name branchCode branchInitials")
     .populate("shiftId", "shiftNo shiftNumber status openedAt")
-    .populate("sourceReturnId", "returnNo invoiceNo grandTotal date")
+    .populate("sourceReturnId", "returnNo invoiceNo grandTotal date debitNoteNo")
     .populate("originalInvoiceId", "invoiceNo grandTotal date billingMode")
     .populate("redemptions.invoiceId", "invoiceNo grandTotal date")
     .populate("createdBy", "name email");
@@ -152,8 +153,9 @@ const findCreditNotes = async (query = {}, options = {}) => {
   const [creditNotes, total] = await Promise.all([
     CreditNote.find(query)
       .populate("customerId", "name mobile phone customerCode gstNumber")
+      .populate("supplierId", "businessName name contactPerson mobile phone gstNumber")
       .populate("branchId", "name branchCode")
-      .populate("sourceReturnId", "returnNo invoiceNo grandTotal")
+      .populate("sourceReturnId", "returnNo invoiceNo grandTotal debitNoteNo")
       .sort(sort)
       .skip(skip)
       .limit(limit)

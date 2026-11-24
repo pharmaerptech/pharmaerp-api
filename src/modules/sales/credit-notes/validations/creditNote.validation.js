@@ -36,7 +36,9 @@ export const queryCreditNotesSchema = Joi.object({
 });
 
 export const createManualCreditNoteSchema = Joi.object({
-  customerId: objectId.required(),
+  partyType: Joi.string().valid("CUSTOMER", "SUPPLIER").default("CUSTOMER"),
+  customerId: objectId.allow(null).optional(),
+  supplierId: objectId.allow(null).optional(),
   branchId: objectId.allow(null).optional(),
   totalAmount: Joi.number().positive().required(),
   subtotal: Joi.number().min(0).optional(),
@@ -48,7 +50,7 @@ export const createManualCreditNoteSchema = Joi.object({
   billingMode: Joi.string().valid("B2C", "B2B").default("B2C"),
   notes: Joi.string().trim().max(1000).allow(null, "").optional(),
   expiryDays: Joi.number().integer().min(1).max(3650).optional(),
-});
+}).or("customerId", "supplierId");
 
 export const cancelCreditNoteSchema = Joi.object({
   reason: Joi.string().trim().min(3).max(500).required(),

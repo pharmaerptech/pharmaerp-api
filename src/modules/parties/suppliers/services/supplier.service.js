@@ -7,6 +7,7 @@ import { SUPPLIER_STATUS } from "../constants/supplier.constant.js";
 import ledgerService from "../../../finance/ledger/services/ledger.service.js";
 import ledgerRepository from "../../../finance/ledger/repositories/ledger.repository.js";
 import purchaseBillRepository from "../../../catalog/purchase-bills/repositories/purchaseBill.repository.js";
+import Ledger from "../../../finance/ledger/models/ledger.model.js";
 import * as xlsx from "xlsx";
 import { previewOutstandingImport, confirmOutstandingImport } from "./supplierOutstandingImport.service.js";
 
@@ -128,6 +129,201 @@ const createSupplier = async (workspaceId, companyId, userId, payload) => {
   return supplier.toSafeObject();
 };
 
+export const ensureSupplierLedgerAccount = async (
+  supplier,
+  companyId,
+  workspaceId,
+  userId = null
+) => {
+  const AccountGroup = mongoose.model("AccountGroup");
+  const Account = mongoose.model("Account");
+
+  if (supplier.ledgerAccountId) {
+    const existing = await Account.findOne({
+      _id: supplier.ledgerAccountId,
+      companyId,
+      workspaceId,
+      isDeleted: false,
+    });
+    if (existing) {
+      return supplier.ledgerAccountId;
+    }
+  }
+
+  const sId = supplier._id ? supplier._id.toString() : String(Date.now());
+  const accCode = supplier.supplierCode
+    ? `SUP-${supplier.supplierCode}`
+    : `SUP-${sId.slice(-6)}`;
+  const accountName = `${supplier.businessName || supplier.name || "Supplier"} - Supplier`;
+
+  let account = await Account.findOne({
+    workspaceId,
+    companyId,
+    $or: [{ accountCode: accCode }, { accountName: accountName }],
+  });
+
+  if (!account) {
+    let creditorsGroup =
+      (await AccountGroup.findOne({
+        workspaceId,
+        companyId,
+        groupCode: "SUNDRY_CREDITORS",
+      })) ||
+      (await AccountGroup.findOne({
+        workspaceId,
+        companyId,
+        groupName: "Sundry Creditors",
+      }));
+    if (!creditorsGroup) {
+      let currentLiabilities =
+        (await AccountGroup.findOne({
+          workspaceId,
+          companyId,
+          groupCode: "CURRENT_LIABILITIES",
+        })) ||
+        (await AccountGroup.findOne({
+          workspaceId,
+          companyId,
+          groupName: /Current Liabilit/i,
+        }));
+      if (!currentLiabilities) {
+        currentLiabilities = await AccountGroup.create({
+          workspaceId,
+          companyId,
+          groupName: "Current Liabilities",
+          groupCode: "CURRENT_LIABILITIES",
+          nature: "LIABILITY",
+          isSystemGroup: true,
+          createdBy: userId,
+        });
+      }
+
+      creditorsGroup = await AccountGroup.create({
+        workspaceId,
+        companyId,
+        groupName: "Sundry Creditors",
+        groupCode: "SUNDRY_CREDITORS",
+        parentGroupId: currentLiabilities._id,
+        nature: "LIABILITY",
+        status: "active",
+        isSystemGroup: true,
+        createdBy: userId,
+      });
+    }
+
+    account = await Account.create({
+      workspaceId,
+      companyId,
+      accountCode: accCode,
+      accountName: accountName,
+      accountGroupId: creditorsGroup?._id,
+      accountNature: "LIABILITY",
+      accountCategory: "SUPPLIER",
+      openingBalance: supplier.openingBalance || 0,
+      openingBalanceType: supplier.openingBalanceType || "cr",
+      status: "active",
+      isSystemAccount: false,
+      createdBy: userId,
+    });
+  }
+
+  supplier.ledgerAccountId = account._id;
+  if (typeof supplier.save === "function") {
+    await supplier.save();
+  } else if (supplierRepository && supplier._id) {
+    await supplierRepository.saveSupplier(supplier);
+  }
+
+  return account._id;
+};
+
+export const computeSupplierOutstanding = async (
+  supplier,
+  companyId,
+  workspaceId
+) => {
+  const accountId = supplier.ledgerAccountId;
+  if (!accountId) {
+    return {
+      outstandingAmount: Number(supplier.openingBalance || 0),
+      balanceType: supplier.openingBalanceType || "cr",
+    };
+  }
+
+  // Self-heal: Check if any dispatched purchase returns for this supplier are missing ledger sync
+  try {
+    const PurchaseReturn = mongoose.model("PurchaseReturn");
+    const unsyncedReturns = await PurchaseReturn.find({
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      companyId: new mongoose.Types.ObjectId(companyId),
+      $or: [
+        { supplierId: supplier._id },
+        { "shippingDetails.destinationSupplierId": supplier._id },
+      ],
+      "shippingDetails.transitStatus": { $in: ["IN_TRANSIT", "DELIVERED", "DISPATCHED"] },
+      $or: [
+        { journalVoucherId: null },
+        { journalVoucherId: { $exists: false } },
+      ],
+    }).lean();
+
+    if (unsyncedReturns.length > 0) {
+      const { syncPurchaseReturnLedger } = await import(
+        "../../../catalog/purchase-returns/services/purchaseReturn.service.js"
+      );
+      for (const ret of unsyncedReturns) {
+        await syncPurchaseReturnLedger(ret, ret.creditNoteNo);
+      }
+    }
+  } catch (healErr) {
+    console.warn("Self-healing supplier ledger sync in outstanding computation warning:", healErr?.message);
+  }
+
+  const aggregate = await Ledger.aggregate([
+    {
+      $match: {
+        accountId: new mongoose.Types.ObjectId(accountId),
+        companyId: new mongoose.Types.ObjectId(companyId),
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        totalDebit: { $sum: "$debit" },
+        totalCredit: { $sum: "$credit" },
+      },
+    },
+  ]);
+
+  const transDebit = aggregate[0]?.totalDebit || 0;
+  const transCredit = aggregate[0]?.totalCredit || 0;
+
+  const opDebit =
+    supplier.openingBalanceType === "dr" ? Number(supplier.openingBalance) || 0 : 0;
+  const opCredit =
+    supplier.openingBalanceType === "cr" ? Number(supplier.openingBalance) || 0 : 0;
+
+  const totalDebit = transDebit + opDebit;
+  const totalCredit = transCredit + opCredit;
+
+  let amt = 0;
+  let type = "cr";
+
+  if (totalCredit >= totalDebit) {
+    amt = totalCredit - totalDebit;
+    type = "cr";
+  } else {
+    amt = totalDebit - totalCredit;
+    type = "dr";
+  }
+
+  return {
+    outstandingAmount: amt,
+    balanceType: type,
+  };
+};
+
 const getSuppliers = async (workspaceId, companyId, query = {}) => {
   const { page, limit, sort, ...filters } = query;
   const [result, stats] = await Promise.all([
@@ -148,14 +344,14 @@ const getSuppliers = async (workspaceId, companyId, query = {}) => {
     result.suppliers.map(async (s) => {
       const obj = s.toSafeObject();
       try {
-        const outstanding = await getSupplierOutstanding(s._id, companyId, workspaceId);
+        const outstanding = await computeSupplierOutstanding(s, companyId, workspaceId);
         return {
           ...obj,
           outstandingAmount: outstanding.outstandingAmount,
           balanceType: outstanding.balanceType
         };
       } catch (err) {
-        return { ...obj, outstandingAmount: 0, balanceType: "cr" };
+        return { ...obj, outstandingAmount: s.openingBalance || 0, balanceType: s.openingBalanceType || "cr" };
       }
     })
   );
@@ -180,7 +376,25 @@ const getSupplierById = async (supplierId, companyId, workspaceId) => {
     throw new ApiError(404, "Supplier not found");
   }
 
-  return supplier.toSafeObject();
+  if (!supplier.ledgerAccountId) {
+    try {
+      await ensureSupplierLedgerAccount(supplier, companyId, workspaceId);
+    } catch (e) {
+      console.warn("Failed to auto-resolve supplier ledger account:", e?.message);
+    }
+  }
+
+  const safe = supplier.toSafeObject();
+  try {
+    const outstanding = await computeSupplierOutstanding(supplier, companyId, workspaceId);
+    safe.outstandingAmount = outstanding.outstandingAmount;
+    safe.balanceType = outstanding.balanceType;
+  } catch (err) {
+    safe.outstandingAmount = supplier.openingBalance || 0;
+    safe.balanceType = supplier.openingBalanceType || "cr";
+  }
+
+  return safe;
 };
 
 const updateSupplier = async (
@@ -273,7 +487,23 @@ const deleteSupplier = async (supplierId, companyId, workspaceId, userId) => {
 
 const getSupplierLedger = async (supplierId, companyId, workspaceId, query = {}) => {
   console.log("Fetching ledger for supplier:", supplierId);
-  const supplier = await getSupplierById(supplierId, companyId, workspaceId);
+  const supplier = await supplierRepository.findSupplierByIdCompanyAndWorkspace(
+    supplierId,
+    companyId,
+    workspaceId,
+  );
+
+  if (!supplier) {
+    throw new ApiError(404, "Supplier not found");
+  }
+
+  if (!supplier.ledgerAccountId) {
+    try {
+      await ensureSupplierLedgerAccount(supplier, companyId, workspaceId);
+    } catch (e) {
+      console.warn("Failed to auto-resolve supplier ledger account:", e?.message);
+    }
+  }
 
   if (!supplier.ledgerAccountId) {
     console.log("Supplier has no ledgerAccountId!", supplierId);
@@ -288,62 +518,38 @@ const getSupplierLedger = async (supplierId, companyId, workspaceId, query = {})
   });
 
   console.log("Ledger data fetched successfully, total entries:", ledgerData?.total);
-  return ledgerData;
+  return {
+    ...ledgerData,
+    supplier: {
+      _id: supplier._id,
+      businessName: supplier.businessName || supplier.name,
+      openingBalance: supplier.openingBalance || 0,
+      openingBalanceType: supplier.openingBalanceType || "cr",
+      ledgerAccountId: supplier.ledgerAccountId,
+    },
+  };
 };
 
-import Ledger from "../../../finance/ledger/models/ledger.model.js";
-
 const getSupplierOutstanding = async (supplierId, companyId, workspaceId) => {
-  const supplier = await getSupplierById(supplierId, companyId, workspaceId);
+  const supplier = await supplierRepository.findSupplierByIdCompanyAndWorkspace(
+    supplierId,
+    companyId,
+    workspaceId,
+  );
+
+  if (!supplier) {
+    throw new ApiError(404, "Supplier not found");
+  }
 
   if (!supplier.ledgerAccountId) {
-    return {
-      outstandingAmount: supplier.openingBalance || 0,
-      balanceType: supplier.openingBalanceType || "cr",
-    };
+    try {
+      await ensureSupplierLedgerAccount(supplier, companyId, workspaceId);
+    } catch (e) {
+      console.warn("Failed to auto-resolve supplier ledger account:", e?.message);
+    }
   }
 
-  const aggregate = await Ledger.aggregate([
-    {
-      $match: {
-        accountId: supplier.ledgerAccountId,
-        companyId: new mongoose.Types.ObjectId(companyId),
-        workspaceId: new mongoose.Types.ObjectId(workspaceId),
-      },
-    },
-    {
-      $group: {
-        _id: null,
-        totalDebit: { $sum: "$debit" },
-        totalCredit: { $sum: "$credit" },
-      },
-    },
-  ]);
-
-  const transDebit = aggregate[0]?.totalDebit || 0;
-  const transCredit = aggregate[0]?.totalCredit || 0;
-
-  const opDebit = supplier.openingBalanceType === "dr" ? (supplier.openingBalance || 0) : 0;
-  const opCredit = supplier.openingBalanceType === "cr" ? (supplier.openingBalance || 0) : 0;
-
-  const totalDebit = transDebit + opDebit;
-  const totalCredit = transCredit + opCredit;
-
-  let amt = 0;
-  let type = "cr";
-
-  if (totalCredit >= totalDebit) {
-    amt = totalCredit - totalDebit;
-    type = "cr";
-  } else {
-    amt = totalDebit - totalCredit;
-    type = "dr";
-  }
-
-  return {
-    outstandingAmount: amt,
-    balanceType: type,
-  };
+  return computeSupplierOutstanding(supplier, companyId, workspaceId);
 };
 
 const getSupplierPurchases = async (supplierId, companyId, workspaceId, query = {}) => {
@@ -712,6 +918,8 @@ export default {
   deleteSupplier,
   getSupplierLedger,
   getSupplierOutstanding,
+  computeSupplierOutstanding,
+  ensureSupplierLedgerAccount,
   getSupplierPurchases,
   getSupplierPayments,
   previewImport,

@@ -19,7 +19,7 @@ export const issueCreditNote = async (data, options = {}) => {
     financialPeriodId = null,
     shiftId = null,
     businessDayId = null,
-    customerId,
+    customerId: rawCustomerId,
     customerName = null,
     customerPhone = null,
     customerGst = null,
@@ -65,6 +65,14 @@ export const issueCreditNote = async (data, options = {}) => {
     expiryDate = exp;
   }
 
+  const isSupplier = data.partyType === "SUPPLIER" || Boolean(data.supplierId);
+  const partyType = isSupplier ? "SUPPLIER" : "CUSTOMER";
+  const customerId = isSupplier ? null : (data.customerId || null);
+  const supplierId = isSupplier ? (data.supplierId || null) : null;
+  const supplierName = isSupplier ? (data.supplierName || null) : null;
+  const supplierPhone = isSupplier ? (data.supplierPhone || null) : null;
+  const supplierGst = isSupplier ? (data.supplierGst || null) : null;
+
   // Create Credit Note
   const creditNotePayload = {
     workspaceId,
@@ -74,10 +82,15 @@ export const issueCreditNote = async (data, options = {}) => {
     shiftId,
     businessDayId,
     creditNoteNo,
+    partyType,
     customerId,
-    customerName,
-    customerPhone,
-    customerGst,
+    customerName: isSupplier ? null : customerName,
+    customerPhone: isSupplier ? null : customerPhone,
+    customerGst: isSupplier ? null : customerGst,
+    supplierId,
+    supplierName,
+    supplierPhone,
+    supplierGst,
     billingMode,
     source,
     sourceReturnId,
@@ -106,12 +119,116 @@ export const issueCreditNote = async (data, options = {}) => {
 
   const [createdNote] = await CreditNote.create([creditNotePayload], { session });
 
-  // Atomically increment customer's creditNoteBalance
-  await Customer.findByIdAndUpdate(
-    customerId,
-    { $inc: { creditNoteBalance: finalTotal } },
-    { session }
-  );
+  if (isSupplier && supplierId) {
+    try {
+      const resolvedCompanyId = companyId?._id || companyId;
+      const resolvedWorkspaceId = workspaceId?._id || workspaceId;
+      const resolvedUserId = user?._id || user || null;
+      const resolvedSupplierId = supplierId?._id || supplierId;
+
+      const Supplier = mongoose.model("Supplier");
+      const supplier = await Supplier.findById(resolvedSupplierId);
+      if (supplier) {
+        const { ensureSupplierLedgerAccount } = await import(
+          "../../../parties/suppliers/services/supplier.service.js"
+        );
+        const supplierAccountId = await ensureSupplierLedgerAccount(
+          supplier,
+          resolvedCompanyId,
+          resolvedWorkspaceId,
+          resolvedUserId
+        );
+
+        const { ensurePurchaseAccounts } = await import(
+          "../../../catalog/purchase-returns/services/purchaseReturn.service.js"
+        );
+        const { cogsAccount: purchaseAccount, taxAccount } = await ensurePurchaseAccounts(
+          resolvedWorkspaceId,
+          resolvedCompanyId,
+          resolvedUserId
+        );
+
+        if (supplierAccountId && purchaseAccount) {
+          const lines = [
+            {
+              accountId: supplierAccountId.toString(),
+              debit: finalTotal,
+              credit: 0,
+              narration: `Credit Note #${creditNoteNo} to ${supplier.businessName || supplier.name || "Supplier"}`,
+            },
+            {
+              accountId: purchaseAccount._id.toString(),
+              debit: 0,
+              credit: Number(subtotal) || finalTotal,
+              narration: `Credit Note reversal #${creditNoteNo}`,
+            },
+          ];
+
+          if (taxAccount && Number(tax) > 0) {
+            lines.push({
+              accountId: taxAccount._id.toString(),
+              debit: 0,
+              credit: Number(tax),
+              narration: `ITC Reversal for Credit Note #${creditNoteNo}`,
+            });
+          }
+
+          const totDebit = lines.reduce((acc, l) => acc + l.debit, 0);
+          const totCredit = lines.reduce((acc, l) => acc + l.credit, 0);
+          if (Math.abs(totDebit - totCredit) > 0.0001) {
+            lines[1].credit += totDebit - totCredit;
+          }
+
+          const { default: journalVoucherService } = await import(
+            "../../../finance/journal-vouchers/services/journalVoucher.service.js"
+          );
+          const { VOUCHER_TYPE } = await import(
+            "../../../finance/journal-vouchers/constants/voucherType.constant.js"
+          );
+          const { VOUCHER_STATUS } = await import(
+            "../../../finance/journal-vouchers/constants/voucherStatus.constant.js"
+          );
+
+          const createdJV = await journalVoucherService.createJournalVoucher(
+            resolvedWorkspaceId,
+            resolvedCompanyId,
+            resolvedUserId,
+            {
+              lines,
+              voucherDate: new Date(),
+              voucherType: VOUCHER_TYPE.PURCHASE_RETURN,
+              referenceNumber: creditNoteNo,
+              narration: `Credit Note #${creditNoteNo} to ${supplier.businessName || supplier.name || "Supplier"}`,
+              status: VOUCHER_STATUS.POSTED,
+            },
+            session ? { session } : {}
+          );
+
+          if (createdJV?._id) {
+            const { default: journalPostingService } = await import(
+              "../../../finance/journal-vouchers/services/journalPosting.service.js"
+            );
+            await journalPostingService.postJournalVoucher(
+              createdJV._id,
+              resolvedCompanyId,
+              resolvedWorkspaceId,
+              resolvedUserId,
+              session ? { session } : {}
+            );
+          }
+        }
+      }
+    } catch (suppJvErr) {
+      console.error("Failed to post journal voucher for supplier credit note:", suppJvErr);
+    }
+  } else if (customerId) {
+    // Atomically increment customer's creditNoteBalance
+    await Customer.findByIdAndUpdate(
+      customerId,
+      { $inc: { creditNoteBalance: finalTotal } },
+      { session }
+    );
+  }
 
   return createdNote;
 };
@@ -413,7 +530,91 @@ export const cancelCreditNote = async (
  * Get all credit notes with filters
  */
 export const getCreditNotes = async (query = {}, options = {}) => {
-  const { workspaceId, companyId, branchId, customerId, status, search, startDate, endDate, billingMode } = query;
+  const { workspaceId, companyId, branchId, customerId, status, search, startDate, endDate, billingMode, partyType } = query;
+
+  // Self-heal: ensure confirmed/dispatched PurchaseReturns with creditNoteNo exist in CreditNote collection
+  try {
+    const PurchaseReturnModel = mongoose.models.PurchaseReturn;
+    if (PurchaseReturnModel && workspaceId && companyId) {
+      const prsToSync = await PurchaseReturnModel.find({
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        companyId: new mongoose.Types.ObjectId(companyId),
+        creditNoteNo: { $exists: true, $ne: "" },
+        status: { $ne: "CANCELLED" },
+        isDeleted: false,
+      })
+        .populate("supplierId", "businessName name contactPerson mobile phone gstNumber")
+        .lean();
+
+      for (const pr of prsToSync) {
+        const supp = pr.supplierId || {};
+        await CreditNote.findOneAndUpdate(
+          {
+            workspaceId: pr.workspaceId,
+            companyId: pr.companyId,
+            sourceReturnId: pr._id,
+            source: CREDIT_NOTE_SOURCE.PURCHASE_RETURN,
+          },
+          {
+            $set: {
+              workspaceId: pr.workspaceId,
+              companyId: pr.companyId,
+              branchId: pr.branchId,
+              creditNoteNo: pr.creditNoteNo,
+              partyType: "SUPPLIER",
+              customerId: null,
+              supplierId: supp._id || pr.supplierId || null,
+              supplierName: supp.businessName || supp.name || "Supplier",
+              supplierPhone: supp.mobile || supp.phone || null,
+              supplierGst: supp.gstNumber || null,
+              billingMode: "B2B",
+              source: CREDIT_NOTE_SOURCE.PURCHASE_RETURN,
+              sourceReturnModel: "PurchaseReturn",
+              sourceReturnId: pr._id,
+              sourceReturnNo: pr.debitNoteNo || pr.returnNo,
+              subtotal: pr.taxableSubtotal || 0,
+              discount: 0,
+              tax: pr.totalGst || 0,
+              cgst: 0,
+              sgst: 0,
+              igst: 0,
+              roundOff: pr.roundOff || 0,
+              totalAmount: pr.grandTotal || 0,
+              balanceAmount: pr.grandTotal || 0,
+              status: CREDIT_NOTE_STATUS.ACTIVE,
+              issueDate: pr.creditNoteDate || pr.shippingDetails?.dispatchedAt || pr.returnDate || new Date(),
+              items: (pr.items || []).map((it) => ({
+                productId: it.productId,
+                productName: it.productName,
+                pack: it.pack,
+                batchNo: it.batchNo,
+                batchNumber: it.batchNo,
+                batch: it.batchNo,
+                expiry: it.expiry || "",
+                expiryDate: it.expiry || "",
+                qty: it.returnQty,
+                quantity: it.returnQty,
+                rate: it.rate,
+                unitPrice: it.rate,
+                taxableAmount: it.taxableAmount,
+                gstPct: it.gstPct,
+                gstRate: it.gstPct,
+                totalAmount: it.totalAmount,
+                total: it.totalAmount,
+              })),
+              notes: `Purchase Return Credit Note for #${pr.debitNoteNo || pr.returnNo}`,
+            },
+            $setOnInsert: {
+              redeemedAmount: 0,
+            },
+          },
+          { upsert: true }
+        );
+      }
+    }
+  } catch (syncErr) {
+    console.error("Self-healing sync for PurchaseReturn credit notes failed:", syncErr);
+  }
 
   const mongoQuery = {
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
@@ -427,6 +628,10 @@ export const getCreditNotes = async (query = {}, options = {}) => {
 
   if (customerId) {
     mongoQuery.customerId = new mongoose.Types.ObjectId(customerId);
+  }
+
+  if (partyType && partyType !== "ALL") {
+    mongoQuery.partyType = partyType;
   }
 
   if (status && status !== "ALL") {
@@ -457,6 +662,8 @@ export const getCreditNotes = async (query = {}, options = {}) => {
       { creditNoteNo: { $regex: term, $options: "i" } },
       { customerName: { $regex: term, $options: "i" } },
       { customerPhone: { $regex: term, $options: "i" } },
+      { supplierName: { $regex: term, $options: "i" } },
+      { supplierPhone: { $regex: term, $options: "i" } },
       { sourceReturnNo: { $regex: term, $options: "i" } },
       { originalInvoiceNo: { $regex: term, $options: "i" } },
     ];
@@ -516,7 +723,42 @@ export const getCreditNoteById = async (idOrNo, companyId, workspaceId) => {
   if (!cn) {
     throw new ApiError(404, "Credit Note not found");
   }
-  return cn;
+
+  // Convert to plain object if needed
+  const cnObj = cn.toObject ? cn.toObject() : cn;
+
+  // Enrich items with batch & expiry from source PurchaseReturn if missing
+  if (cnObj.source === CREDIT_NOTE_SOURCE.PURCHASE_RETURN && cnObj.sourceReturnId) {
+    try {
+      const PurchaseReturnModel = mongoose.models.PurchaseReturn;
+      if (PurchaseReturnModel) {
+        const prId = cnObj.sourceReturnId._id || cnObj.sourceReturnId;
+        const pr = await PurchaseReturnModel.findById(prId).lean();
+        if (pr && Array.isArray(pr.items) && pr.items.length > 0) {
+          const prItemsMap = new Map();
+          pr.items.forEach((item) => {
+            prItemsMap.set(String(item.productId), item);
+          });
+
+          cnObj.items = (cnObj.items || []).map((it, idx) => {
+            const matchedPrItem = prItemsMap.get(String(it.productId)) || pr.items[idx] || pr.items[0];
+            return {
+              ...it,
+              batchNo: it.batchNo || matchedPrItem?.batchNo || "",
+              batchNumber: it.batchNumber || it.batchNo || matchedPrItem?.batchNo || "",
+              batch: it.batch || it.batchNo || matchedPrItem?.batchNo || "",
+              expiry: it.expiry || matchedPrItem?.expiry || "",
+              expiryDate: it.expiryDate || it.expiry || matchedPrItem?.expiry || "",
+            };
+          });
+        }
+      }
+    } catch (enrichErr) {
+      console.warn("Could not enrich credit note items from PurchaseReturn:", enrichErr);
+    }
+  }
+
+  return cnObj;
 };
 
 /**

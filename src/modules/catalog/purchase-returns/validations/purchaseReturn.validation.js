@@ -120,5 +120,6 @@ export const dispatchReturnBoxSchema = Joi.object({
   trackingNo: Joi.string().trim().allow("").max(120).optional(),
   boxCount: Joi.number().integer().min(1).max(99).default(1),
   packageNotes: Joi.string().trim().allow("").max(500).optional(),
+  creditNoteNo: Joi.string().trim().allow("").max(100).optional(),
 });
 

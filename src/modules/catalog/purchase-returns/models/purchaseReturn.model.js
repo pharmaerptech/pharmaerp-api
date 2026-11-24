@@ -138,6 +138,7 @@ const purchaseReturnSchema = new mongoose.Schema(
     returnNo: { type: String, required: true, trim: true },
     debitNoteNo: { type: String, trim: true, default: "" },
     creditNoteNo: { type: String, trim: true, default: "" },
+    creditNoteDate: { type: Date, default: null, index: true },
     returnDate: { type: Date, default: Date.now, index: true },
 
     returnMotive: {
