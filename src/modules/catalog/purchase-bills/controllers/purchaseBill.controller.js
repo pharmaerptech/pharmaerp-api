@@ -1,8 +1,15 @@
+import fs from "fs";
 import asyncHandler from "../../../../utils/asyncHandler.js";
 import ApiResponse from "../../../../utils/ApiResponse.js";
 import ApiError from "../../../../utils/ApiError.js";
 import purchaseBillService from "../services/purchaseBill.service.js";
 import purchaseBillLegacyImportService from "../services/purchaseBillLegacyImport.service.js";
+import {
+  extractTextFromPdfBuffer,
+  parsePurchaseBillText,
+  enrichParsedBillWithCatalog,
+  SAMPLE_INVOICE_TEXTS,
+} from "../helpers/purchaseBillParser.helper.js";
 
 export const createPurchaseBill = asyncHandler(async (req, res) => {
   const payload = { ...req.body };
@@ -154,3 +161,75 @@ export const importLegacyBills = asyncHandler(async (req, res) => {
     .status(200)
     .json(new ApiResponse(200, "Legacy bills imported successfully", result));
 });
+
+export const getIncomingConsignments = asyncHandler(async (req, res) => {
+  const result = await purchaseBillService.getIncomingConsignments(
+    req.workspaceId,
+    req.companyId,
+    req.query
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, "Incoming consignments fetched successfully", result));
+});
+
+export const acceptIncomingConsignment = asyncHandler(async (req, res) => {
+  const branchId = req.body.branchId || req.headers["x-branch-id"] || req.branchId || null;
+
+  const result = await purchaseBillService.acceptIncomingConsignment(
+    req.params.invoiceId,
+    req.workspaceId,
+    req.companyId,
+    branchId,
+    req.user._id,
+    req.body
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, "Incoming consignment accepted as purchase bill successfully", result));
+});
+
+export const parsePurchaseBillImport = asyncHandler(async (req, res) => {
+  let rawText = "";
+
+  if (req.file) {
+    try {
+      const buffer = await fs.promises.readFile(req.file.path);
+      const isPdf =
+        req.file.mimetype === "application/pdf" ||
+        (req.file.originalname && req.file.originalname.toLowerCase().endsWith(".pdf"));
+      if (isPdf) {
+        rawText = await extractTextFromPdfBuffer(buffer);
+      } else {
+        rawText = buffer.toString("utf8");
+      }
+    } finally {
+      await fs.promises.unlink(req.file.path).catch(() => {});
+    }
+  } else if (req.body?.sampleKey && SAMPLE_INVOICE_TEXTS[req.body.sampleKey]) {
+    rawText = SAMPLE_INVOICE_TEXTS[req.body.sampleKey];
+  } else if (req.body?.rawText) {
+    rawText = req.body.rawText;
+  }
+
+  if (!rawText || !rawText.trim()) {
+    throw new ApiError(
+      400,
+      "Please provide a purchase bill PDF file, sampleKey ('galaxy-pharma' | 'agam-medical' | 'basant-medical'), or rawText"
+    );
+  }
+
+  const parsed = parsePurchaseBillText(rawText);
+  const enriched = await enrichParsedBillWithCatalog(
+    req.workspaceId,
+    req.companyId,
+    parsed
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, "Purchase bill parsed successfully", enriched));
+});
+

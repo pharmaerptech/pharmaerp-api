@@ -263,6 +263,42 @@ const invoiceSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    isInterCompany: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    destinationCompanyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Company",
+      default: null,
+      index: true,
+    },
+    inwardStatus: {
+      type: String,
+      enum: ["NONE", "PENDING", "ACCEPTED"],
+      default: "NONE",
+      index: true,
+    },
+    inwardPurchaseBillId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PurchaseBill",
+      default: null,
+      index: true,
+    },
+    inwardPurchaseBillNo: {
+      type: String,
+      default: null,
+    },
+    inwardAcceptedAt: {
+      type: Date,
+      default: null,
+    },
+    inwardAcceptedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
   },
   {
     timestamps: true,
@@ -275,6 +311,7 @@ invoiceSchema.index({ workspaceId: 1, migrationId: 1, customerId: 1 });
 invoiceSchema.index({ companyId: 1, paymentQrId: 1, date: -1 });
 // Per-UPI analytics: split-payment UPI sub-items
 invoiceSchema.index({ companyId: 1, "payments.paymentQrId": 1, date: -1 });
+invoiceSchema.index({ workspaceId: 1, destinationCompanyId: 1, inwardStatus: 1, date: -1 });
 
 const SalesInvoice = mongoose.model("SalesInvoice", invoiceSchema);
 

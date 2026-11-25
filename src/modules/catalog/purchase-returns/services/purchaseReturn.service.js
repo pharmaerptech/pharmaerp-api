@@ -8,6 +8,7 @@ import Batch from "../../products/models/batch.model.js";
 import ProductFacility from "../../products/models/productFacility.model.js";
 import WorkspaceProduct from "../../products/models/workspaceProduct.model.js";
 import Supplier from "../../../parties/suppliers/models/supplier.model.js";
+import Customer from "../../../parties/customers/models/customer.model.js";
 import Company from "../../../organization/companies/models/company.model.js";
 import Branch from "../../../organization/branches/models/branch.model.js";
 import SalesInvoice from "../../../sales/invoices/models/invoice.model.js";
@@ -54,6 +55,112 @@ const stripBatchTags = (batchNo) =>
   String(batchNo || "")
     .replace(/\s*\[(EXPIRED|BROKEN|SCRAP|IN|INCOMING|FRESH_RETURN)\]/gi, "")
     .trim();
+
+/**
+ * Dynamically resolves whether a chosen Supplier corresponds to an active Company
+ * within the same workspace (an inter-company supplier relationship).
+ *
+ * Checks:
+ * 1. Normalized GSTIN matching (supplier.gstNumber === company.gstin/gstNumber)
+ * 2. Exact or normalized business name / legal name matching
+ * 3. Returns { company, branch } if matched, or null if external vendor
+ */
+export const resolveInterCompanyDestination = async ({
+  workspaceId,
+  currentCompanyId,
+  supplier,
+  supplierId = null,
+}) => {
+  if (!workspaceId || !currentCompanyId) return null;
+  const currentCompanyObjId = new mongoose.Types.ObjectId(currentCompanyId);
+  const workspaceObjId = new mongoose.Types.ObjectId(workspaceId);
+
+  let targetSupplier = supplier;
+  if (!targetSupplier && supplierId && mongoose.Types.ObjectId.isValid(supplierId)) {
+    targetSupplier = await Supplier.findOne({
+      _id: supplierId,
+      workspaceId: workspaceObjId,
+      isDeleted: false,
+    }).lean();
+  }
+
+  if (!targetSupplier) return null;
+
+  const workspaceCompanies = await Company.find({
+    workspaceId: workspaceObjId,
+    _id: { $ne: currentCompanyObjId },
+    isDeleted: false,
+  })
+    .select("_id name legalName gstin gstNumber code address phone")
+    .lean();
+
+  if (!workspaceCompanies || workspaceCompanies.length === 0) return null;
+
+  const suppGst = (targetSupplier.gstNumber || "").trim().toUpperCase();
+  const suppName = (
+    targetSupplier.businessName ||
+    targetSupplier.name ||
+    ""
+  ).trim().toLowerCase();
+
+  const normalizeName = (s) =>
+    String(s || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
+
+  const suppNorm = normalizeName(suppName);
+
+  let matchedCompany = null;
+  for (const comp of workspaceCompanies) {
+    const compGst = (comp.gstin || comp.gstNumber || "").trim().toUpperCase();
+    if (suppGst && compGst && suppGst === compGst) {
+      matchedCompany = comp;
+      break;
+    }
+
+    const compName = (comp.name || "").trim().toLowerCase();
+    const compLegal = (comp.legalName || "").trim().toLowerCase();
+    if (suppName) {
+      if (compName && suppName === compName) {
+        matchedCompany = comp;
+        break;
+      }
+      if (compLegal && suppName === compLegal) {
+        matchedCompany = comp;
+        break;
+      }
+      const cNorm = normalizeName(compName);
+      const cLegalNorm = normalizeName(compLegal);
+      if (suppNorm && (suppNorm === cNorm || suppNorm === cLegalNorm)) {
+        matchedCompany = comp;
+        break;
+      }
+    }
+  }
+
+  if (!matchedCompany) return null;
+
+  let matchedBranch = null;
+  try {
+    const branches = await Branch.find({
+      workspaceId: workspaceObjId,
+      companyId: matchedCompany._id,
+      isDeleted: false,
+    })
+      .select("_id name branchCode isDefault address phone")
+      .lean();
+
+    matchedBranch =
+      branches.find((b) => b.isDefault) || branches[0] || null;
+  } catch {
+    // non-blocking
+  }
+
+  return {
+    company: matchedCompany,
+    branch: matchedBranch,
+  };
+};
 
 /**
  * Resolve the original PurchaseBill belonging to `destCompanyId` (e.g. Agam's purchase from Aristo)
@@ -1026,6 +1133,19 @@ const createPurchaseReturn = async (
     supplierGstin &&
     companyGstin.substring(0, 2) !== supplierGstin.substring(0, 2);
 
+  // 2b. Auto-detect Inter-Company Supplier Relationship
+  let interCompanyDest = null;
+  if (supplierId && supplier) {
+    interCompanyDest = await resolveInterCompanyDestination({
+      workspaceId,
+      currentCompanyId: companyId,
+      supplier,
+      supplierId,
+    });
+  }
+
+  const isInterCompany = Boolean(payload.isInterCompany) || Boolean(interCompanyDest);
+
   // 3. Process line items & calculate taxes
   let taxableSubtotal = 0;
   let totalGst = 0;
@@ -1180,6 +1300,20 @@ const createPurchaseReturn = async (
     ]);
     returnNo = retNum;
     debitNoteNo = dnNum;
+
+    // For inter-company purchase return, pre-generate Credit Note number for destination company
+    if (isInterCompany && !creditNoteNo && interCompanyDest?.company?._id) {
+      try {
+        const destBranchCode = interCompanyDest.branch?.branchCode || "BR01";
+        creditNoteNo = await purchaseReturnRepository.generateNextCreditNoteNo(
+          interCompanyDest.company._id,
+          workspaceId,
+          destBranchCode
+        );
+      } catch (cnErr) {
+        creditNoteNo = `CN-${returnNo}`;
+      }
+    }
   }
 
   // 5. Determine Financial Period
@@ -1435,9 +1569,11 @@ const createPurchaseReturn = async (
       sourceBranchId: payload.sourceBranchId || null,
       sourceTransferOrderId: payload.sourceTransferOrderId || null,
       isInterBranch,
+      isInterCompany,
       returnNo,
       debitNoteNo,
       creditNoteNo,
+      creditNoteDate: creditNoteNo ? (returnDate ? new Date(returnDate) : new Date()) : null,
       returnDate: returnDate ? new Date(returnDate) : new Date(),
       returnMotive,
       settlementType,
@@ -1457,6 +1593,24 @@ const createPurchaseReturn = async (
       reason,
       remarks,
       createdBy: userId,
+      shippingDetails: {
+        destinationType: isInterCompany ? "COMPANY_BRANCH" : (payload.shippingDetails?.destinationType || "COMPANY_BRANCH"),
+        destinationCompanyId: isInterCompany
+          ? (interCompanyDest?.company?._id || payload.shippingDetails?.destinationCompanyId || null)
+          : (payload.shippingDetails?.destinationCompanyId || null),
+        destinationBranchId: isInterCompany
+          ? (payload.shippingDetails?.destinationBranchId || interCompanyDest?.branch?._id || null)
+          : (payload.shippingDetails?.destinationBranchId || null),
+        destinationSupplierId: isInterCompany ? null : (payload.shippingDetails?.destinationSupplierId || null),
+        courierName: payload.shippingDetails?.courierName || "",
+        trackingNo: payload.shippingDetails?.trackingNo || "",
+        boxCount: payload.shippingDetails?.boxCount || 1,
+        packageNotes: payload.shippingDetails?.packageNotes || "",
+        transitStatus: isInterCompany ? "IN_TRANSIT" : (payload.shippingDetails?.transitStatus || "NOT_DISPATCHED"),
+        dispatchedAt: isInterCompany ? new Date() : (payload.shippingDetails?.dispatchedAt || null),
+        dispatchedBy: isInterCompany ? userId : (payload.shippingDetails?.dispatchedBy || null),
+        ...(payload.shippingDetails || {}),
+      },
     };
 
     createdReturn = await purchaseReturnRepository.createPurchaseReturn(
@@ -1636,9 +1790,13 @@ const getPurchaseReturns = async (
   let query;
 
   if (filters.direction === "incoming") {
-    // Queries purchase return boxes routed to the active destination facility or company
+    // Queries intra-company purchase return boxes routed between branches of the active company.
+    // Inter-company returns (from other companies) are excluded here because from the recipient supplier's perspective,
+    // they are classified under Sales Returns.
     query = {
       workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      companyId: new mongoose.Types.ObjectId(companyId),
+      isInterCompany: { $ne: true },
       isDeleted: false,
       "shippingDetails.transitStatus": { $in: ["IN_TRANSIT", "RECEIVED"] },
     };
@@ -2011,9 +2169,14 @@ const dispatchReturnBox = async (
     creditNoteDateToSet = new Date();
   }
 
+  const isDestDifferentCompany =
+    destinationCompanyId &&
+    String(destinationCompanyId) !== String(returnDoc.companyId?._id || returnDoc.companyId);
+
   const shippingUpdate = {
     creditNoteNo: creditNoteNoToSet,
     creditNoteDate: creditNoteDateToSet,
+    ...(isDestDifferentCompany || returnDoc.isInterCompany ? { isInterCompany: true } : {}),
     "shippingDetails.destinationType": isSupplierDispatch ? "SUPPLIER" : "COMPANY_BRANCH",
     "shippingDetails.destinationCompanyId": isSupplierDispatch
       ? null
@@ -2350,6 +2513,233 @@ export const syncPurchaseReturnLedger = async (
   }
 
   return null;
+};
+
+/**
+ * Synchronize or create Journal Voucher and General Ledger entries for an incoming Inter-Company Return
+ * from the destination (seller) company's perspective (Customer Sales Return Credit Note).
+ */
+export const syncInterCompanyDestinationLedger = async (returnDoc, userId = null) => {
+  if (!returnDoc) return null;
+  const workspaceId = returnDoc.workspaceId?._id || returnDoc.workspaceId;
+  const destCompanyId =
+    returnDoc.shippingDetails?.destinationCompanyId?._id ||
+    returnDoc.shippingDetails?.destinationCompanyId;
+  const originCompanyId = returnDoc.companyId?._id || returnDoc.companyId;
+
+  if (!destCompanyId || !originCompanyId || String(destCompanyId) === String(originCompanyId)) {
+    return null;
+  }
+
+  const grandTotal = returnDoc.grandTotal || 0;
+  const taxableSubtotal = returnDoc.taxableSubtotal || 0;
+  const totalGst = returnDoc.totalGst || 0;
+  const refDocNo = returnDoc.creditNoteNo || returnDoc.debitNoteNo || returnDoc.returnNo;
+
+  try {
+    const AccountGroup = mongoose.model("AccountGroup");
+
+    // 1. Resolve Origin Company (Buyer that returned the goods)
+    const originCompany = await Company.findById(originCompanyId)
+      .select("name legalName gstin gstNumber code address")
+      .lean();
+
+    // 2. Resolve or create Customer in Destination Company
+    const originGst = (originCompany?.gstin || originCompany?.gstNumber || "").trim().toUpperCase();
+    const originName = (originCompany?.name || originCompany?.legalName || "").trim();
+
+    let customer = null;
+    if (originGst || originName) {
+      customer = await Customer.findOne({
+        workspaceId,
+        companyId: destCompanyId,
+        isDeleted: false,
+        $or: [
+          ...(originGst ? [{ gstNumber: originGst }] : []),
+          ...(originName ? [{ name: { $regex: new RegExp(`^${escapeRegex(originName)}$`, "i") } }] : []),
+        ],
+      });
+    }
+
+    if (!customer && originName) {
+      customer = await Customer.create({
+        workspaceId,
+        companyId: destCompanyId,
+        name: originName,
+        customerType: "wholesale",
+        gstNumber: originGst || null,
+        status: "Active",
+      });
+    }
+
+    // 3. Resolve Customer Ledger Account in Destination Company
+    let customerAccountId = customer?.ledgerAccountId || null;
+    if (!customerAccountId && customer) {
+      let debtorsGroup =
+        (await AccountGroup.findOne({
+          workspaceId,
+          companyId: destCompanyId,
+          groupCode: "SUNDRY_DEBTORS",
+        })) ||
+        (await AccountGroup.findOne({
+          workspaceId,
+          companyId: destCompanyId,
+          groupName: /Debtors/i,
+        }));
+
+      if (!debtorsGroup) {
+        debtorsGroup = await AccountGroup.create({
+          workspaceId,
+          companyId: destCompanyId,
+          groupName: "Sundry Debtors",
+          groupCode: "SUNDRY_DEBTORS",
+          nature: "ASSET",
+          isSystemGroup: true,
+        });
+      }
+
+      const acc = await Account.create({
+        workspaceId,
+        companyId: destCompanyId,
+        accountName: customer.name || originName,
+        accountCode: `CUST-${(customer.customerCode || originCompany?.code || "IC").slice(0, 10)}`,
+        accountGroupId: debtorsGroup._id,
+        accountNature: "ASSET",
+        accountCategory: "CUSTOMER",
+        status: "active",
+      });
+      customerAccountId = acc._id;
+      customer.ledgerAccountId = acc._id;
+      await customer.save();
+    }
+
+    // 4. Resolve Sales Return Revenue Account & Tax Account in Destination Company
+    let revenueAccount =
+      (await Account.findOne({
+        workspaceId,
+        companyId: destCompanyId,
+        accountCode: "SALES-RETURNS",
+      })) ||
+      (await Account.findOne({
+        workspaceId,
+        companyId: destCompanyId,
+        accountCode: "SALES-ACCOUNT",
+      })) ||
+      (await Account.findOne({
+        workspaceId,
+        companyId: destCompanyId,
+        accountCategory: "SALES",
+      }));
+
+    if (!revenueAccount) {
+      let salesGroup =
+        (await AccountGroup.findOne({
+          workspaceId,
+          companyId: destCompanyId,
+          groupCode: "SALES_ACCOUNTS",
+        })) ||
+        (await AccountGroup.findOne({
+          workspaceId,
+          companyId: destCompanyId,
+          groupName: /Sales/i,
+        }));
+
+      if (!salesGroup) {
+        salesGroup = await AccountGroup.create({
+          workspaceId,
+          companyId: destCompanyId,
+          groupName: "Sales Accounts",
+          groupCode: "SALES_ACCOUNTS",
+          nature: "INCOME",
+          isSystemGroup: true,
+        });
+      }
+
+      revenueAccount = await Account.create({
+        workspaceId,
+        companyId: destCompanyId,
+        accountName: "Sales Return Account",
+        accountCode: "SALES-RETURNS",
+        accountGroupId: salesGroup._id,
+        accountNature: "INCOME",
+        accountCategory: "SALES",
+        status: "active",
+      });
+    }
+
+    let taxAccount =
+      (await Account.findOne({
+        workspaceId,
+        companyId: destCompanyId,
+        accountCode: "TAX-PAYABLE",
+      })) ||
+      (await Account.findOne({
+        workspaceId,
+        companyId: destCompanyId,
+        accountCategory: "GST",
+      }));
+
+    if (customerAccountId && revenueAccount) {
+      const lines = [
+        {
+          accountId: customerAccountId.toString(),
+          debit: 0,
+          credit: grandTotal,
+          narration: `Sales Return Credit Note #${refDocNo} from ${originName}`,
+        },
+        {
+          accountId: revenueAccount._id.toString(),
+          debit: taxableSubtotal,
+          credit: 0,
+          narration: `Revenue deduction on return #${refDocNo}`,
+        },
+      ];
+
+      if (taxAccount && totalGst > 0) {
+        lines.push({
+          accountId: taxAccount._id.toString(),
+          debit: totalGst,
+          credit: 0,
+          narration: `Output GST Reversal for #${refDocNo}`,
+        });
+      }
+
+      const totDebit = lines.reduce((acc, l) => acc + l.debit, 0);
+      const totCredit = lines.reduce((acc, l) => acc + l.credit, 0);
+      if (Math.abs(totDebit - totCredit) > 0.0001) {
+        lines[1].debit += totCredit - totDebit;
+      }
+
+      const jv = await journalVoucherService.createJournalVoucher(
+        workspaceId,
+        destCompanyId,
+        userId || returnDoc.createdBy,
+        {
+          lines,
+          voucherDate: returnDoc.creditNoteDate || returnDoc.returnDate || new Date(),
+          voucherType: VOUCHER_TYPE.SALES_RETURN || "CREDIT_NOTE",
+          referenceNumber: refDocNo,
+          narration: `Inter-Company Sales Return Credit Note #${refDocNo} from ${originName}`,
+          status: VOUCHER_STATUS.POSTED,
+        }
+      );
+
+      if (jv && jv._id) {
+        try {
+          await journalPostingService.postJournalVoucher(
+            jv._id,
+            destCompanyId,
+            workspaceId,
+            userId || returnDoc.createdBy
+          );
+        } catch {
+          // non-blocking
+        }
+      }
+    }
+  } catch (jvErr) {
+    console.warn("Failed to post destination company JV for inter-company sales return:", jvErr?.message);
+  }
 };
 
 /**
@@ -2761,6 +3151,11 @@ const receiveReturnBox = async (
 
     await session.commitTransaction();
     session.endSession();
+
+    if (returnDoc.isInterCompany || returnDoc.shippingDetails?.destinationCompanyId) {
+      syncInterCompanyDestinationLedger(returnDoc, userId).catch(() => {});
+    }
+
     return updated;
   } catch (err) {
     await session.abortTransaction();
@@ -3025,6 +3420,8 @@ const purchaseReturnService = {
   materializeConsignmentBatches,
   resolveOriginalPurchaseBillForDestination,
   resolveSubSupplierFromPurchaseBill,
+  resolveInterCompanyDestination,
+  syncInterCompanyDestinationLedger,
 };
 
 export default purchaseReturnService;

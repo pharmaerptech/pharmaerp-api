@@ -63,6 +63,7 @@ export const createPurchaseReturnSchema = Joi.object({
   sourceBranchId: objectId.allow(null, "").optional(),
   sourceTransferOrderId: objectId.allow(null, "").optional(),
   isInterBranch: Joi.boolean().optional(),
+  isInterCompany: Joi.boolean().optional(),
   returnDate: Joi.date().iso().allow(null, "").optional(),
   returnMotive: Joi.string()
     .valid(...Object.values(RETURN_MOTIVE))

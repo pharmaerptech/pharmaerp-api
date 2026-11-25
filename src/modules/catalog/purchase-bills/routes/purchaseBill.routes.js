@@ -16,6 +16,9 @@ import {
   payPurchaseBill,
   bulkPayPurchaseBills,
   importLegacyBills,
+  getIncomingConsignments,
+  acceptIncomingConsignment,
+  parsePurchaseBillImport,
 } from "../controllers/purchaseBill.controller.js";
 import multer from "multer";
 
@@ -53,6 +56,13 @@ router.get(
   validate(getPurchaseBillsQuerySchema, "query"),
   getPurchaseBills
 );
+
+// Incoming inter-company consignments (before /:billId)
+router.get("/incoming-consignments", getIncomingConsignments);
+router.post("/incoming-consignments/:invoiceId/accept", acceptIncomingConsignment);
+
+// Parse purchase bill import (PDF, raw text, or sample invoice)
+router.post("/parse-import", upload.single("file"), parsePurchaseBillImport);
 
 // Get purchase bill by id
 router.get(

@@ -1241,6 +1241,60 @@ const postSaleAccounting = async ({
   }
 };
 
+/**
+ * Dynamically resolves whether a B2B Customer represents an active Company
+ * within the same workspace (an inter-company sales relationship).
+ * Checks:
+ * 1. Normalized GSTIN matching (customer.gstNumber === company.gstin/gstNumber)
+ * 2. Exact or normalized business name / legal name matching
+ */
+export const resolveInterCompanyBuyerCompany = async ({ workspaceId, currentCompanyId, customer }) => {
+  if (!workspaceId || !currentCompanyId || !customer) return null;
+  const currentCompanyObjId = new mongoose.Types.ObjectId(currentCompanyId);
+  const workspaceObjId = new mongoose.Types.ObjectId(workspaceId);
+
+  const workspaceCompanies = await Company.find({
+    workspaceId: workspaceObjId,
+    _id: { $ne: currentCompanyObjId },
+    isDeleted: false,
+  })
+    .select("_id name legalName gstin gstNumber code address phone")
+    .lean();
+
+  if (!workspaceCompanies || workspaceCompanies.length === 0) return null;
+
+  const custGst = (customer.gstNumber || customer.gstin || "").trim().toUpperCase();
+  const custName = (customer.businessName || customer.name || customer.displayName || "").trim().toLowerCase();
+
+  const normalizeName = (s) =>
+    String(s || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
+
+  const custNorm = normalizeName(custName);
+
+  for (const comp of workspaceCompanies) {
+    const compGst = (comp.gstin || comp.gstNumber || "").trim().toUpperCase();
+    if (custGst && compGst && custGst === compGst) {
+      return comp;
+    }
+
+    const compName = (comp.name || "").trim().toLowerCase();
+    const compLegal = (comp.legalName || "").trim().toLowerCase();
+    if (custName) {
+      if (compName && custName === compName) return comp;
+      if (compLegal && custName === compLegal) return comp;
+      const cNorm = normalizeName(compName);
+      const cLegalNorm = normalizeName(compLegal);
+      if (custNorm && (custNorm === cNorm || custNorm === cLegalNorm)) {
+        return comp;
+      }
+    }
+  }
+
+  return null;
+};
+
 const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, user = null, existingSession = null) => {
   // Enforce strict payment total exact match with bill grand total
   validatePaymentSplitIntegrity(saleData);
@@ -1639,6 +1693,26 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     effectiveBillingMode = "B2C";
   }
 
+  // Detect inter-company counterparty (e.g. Pahuch buying from Agam)
+  let isInterCompanySale = false;
+  let destinationCompanyId = null;
+  let inwardStatus = "NONE";
+
+  try {
+    const destComp = await resolveInterCompanyBuyerCompany({
+      workspaceId,
+      currentCompanyId: companyId,
+      customer,
+    });
+    if (destComp) {
+      isInterCompanySale = true;
+      destinationCompanyId = destComp._id;
+      inwardStatus = "PENDING";
+    }
+  } catch (icErr) {
+    console.warn("[Inter-Company Sale] Resolution warning:", icErr?.message);
+  }
+
   const newSale = {
     workspaceId: workspaceId || customer.workspaceId,
     companyId: companyId || customer.companyId,
@@ -1650,6 +1724,9 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     shiftId: resolvedShiftId || null,
     businessDayId: resolvedBusinessDayId || null,
     billingMode: effectiveBillingMode,
+    isInterCompany: isInterCompanySale,
+    destinationCompanyId,
+    inwardStatus,
     subtotal: saleData.subtotal || 0,
     discount: saleData.discount || 0,
     tax: saleData.tax || 0,
@@ -2274,6 +2351,13 @@ const cancelCustomerSale = async (
       throw new ApiError(400, "Invoice is already cancelled");
     }
 
+    if (invoice.isInterCompany && invoice.inwardStatus === "ACCEPTED") {
+      throw new ApiError(
+        400,
+        "Cannot cancel this inter-company sale bill. It has already been accepted as a purchase bill by the destination company. Please process a Purchase Return instead."
+      );
+    }
+
     // Calculate net cash portion paid on this bill
     let invoiceCashAmount = 0;
     const paymentsList = Array.isArray(invoice.payments) ? invoice.payments : [];
@@ -2418,6 +2502,9 @@ const cancelCustomerSale = async (
 
     // 6. Update invoice status & cancellation audit fields
     invoice.status = "Cancelled";
+    if (invoice.isInterCompany && invoice.inwardStatus === "PENDING") {
+      invoice.inwardStatus = "CANCELLED";
+    }
     invoice.cancelledAt = new Date();
     invoice.cancelledBy = user?._id || user?.id || null;
     if (cancelReason) invoice.cancelReason = cancelReason;

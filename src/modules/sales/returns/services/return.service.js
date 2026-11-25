@@ -24,6 +24,7 @@ import branchCashRepository from "../../../finance/treasury/cash-management/bran
 import cashTransactionService from "../../../finance/treasury/cash-management/cash-transactions/services/cashTransaction.service.js";
 import Branch from "../../../organization/branches/models/branch.model.js";
 import { decomposeCashAmount } from "../../../parties/customers/services/customerAdvance.service.js";
+import PurchaseReturn from "../../../catalog/purchase-returns/models/purchaseReturn.model.js";
 
 /**
  * Restock inventory for returned items (increment Batch & ProductFacility quantities)
@@ -1282,6 +1283,167 @@ const getNextReturnNumber = async (companyId, workspaceId, { branchId, date }) =
   return { nextReturnNumber, nextReturnNo: nextReturnNumber };
 };
 
+const escapeRegex = (str) =>
+  String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Project an incoming Inter-Company PurchaseReturn into the standard SalesReturn shape.
+ * Represents the return transaction from the recipient company's perspective (Customer Sales Return).
+ */
+export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspaceId) => {
+  if (!pr) return null;
+
+  // 1. Resolve Origin Company (Buyer that initiated the return)
+  let originCompany = pr.companyId;
+  if (!originCompany?.name && mongoose.Types.ObjectId.isValid(pr.companyId)) {
+    originCompany = await Company.findById(pr.companyId)
+      .select("name legalName gstin gstNumber code address phone")
+      .lean();
+  }
+
+  // 2. Resolve Customer in current company representing Origin Company
+  let customer = null;
+  const originGst = (originCompany?.gstin || originCompany?.gstNumber || "").trim().toUpperCase();
+  const originName = (originCompany?.name || originCompany?.legalName || "").trim();
+
+  if (originGst || originName) {
+    try {
+      customer = await Customer.findOne({
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        companyId: new mongoose.Types.ObjectId(companyId),
+        isDeleted: false,
+        $or: [
+          ...(originGst ? [{ gstNumber: originGst }] : []),
+          ...(originName ? [{ name: { $regex: new RegExp(`^${escapeRegex(originName)}$`, "i") } }] : []),
+        ],
+      })
+        .select("_id name mobile phone customerCode gstNumber billingAddress advanceBalance creditLimit")
+        .lean();
+    } catch {
+      // non-blocking
+    }
+  }
+
+  if (!customer) {
+    customer = {
+      _id: originCompany?._id || pr.companyId?._id || pr.companyId,
+      name: originName || "Inter-Company Customer",
+      customerCode: originCompany?.code || "INTER-CO",
+      gstNumber: originGst || "",
+      mobile: originCompany?.phone?.mobile || "—",
+      phone: originCompany?.phone?.mobile || "—",
+      billingAddress: originCompany?.address || {},
+    };
+  }
+
+  // 3. Resolve Original Sale Bill in current company
+  let originalInvoiceNo = "—";
+  let originalInvoiceId = null;
+
+  const candidateInvoiceNos = new Set();
+  (pr.items || []).forEach((it) => {
+    if (it.purchaseBillNo) candidateInvoiceNos.add(it.purchaseBillNo.trim());
+  });
+
+  if (candidateInvoiceNos.size > 0) {
+    try {
+      const invRegexes = Array.from(candidateInvoiceNos).map(
+        (n) => new RegExp(`^${escapeRegex(n)}$`, "i")
+      );
+      const saleBill = await SalesInvoice.findOne({
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        companyId: new mongoose.Types.ObjectId(companyId),
+        invoiceNo: { $in: invRegexes },
+        isDeleted: { $ne: true },
+      })
+        .select("_id invoiceNo grandTotal date items customerId")
+        .lean();
+
+      if (saleBill) {
+        originalInvoiceNo = saleBill.invoiceNo;
+        originalInvoiceId = saleBill._id;
+      } else {
+        originalInvoiceNo = Array.from(candidateInvoiceNos)[0];
+      }
+    } catch {
+      originalInvoiceNo = Array.from(candidateInvoiceNos)[0] || "—";
+    }
+  }
+
+  // 4. Map line items to Sales Return format
+  const mappedItems = (pr.items || []).map((it, idx) => ({
+    _id: it._id || `item-${idx}`,
+    productId: it.productId,
+    productName: it.productName || "Product",
+    pack: it.pack || "",
+    batch: it.batchNo,
+    batchNo: it.batchNo,
+    expiry: it.expiry || "",
+    returnQty: it.returnQty,
+    quantity: it.returnQty,
+    rate: it.rate,
+    price: it.rate,
+    discount: it.discountPct || 0,
+    discountPct: it.discountPct || 0,
+    gstRate: it.gstPct || 0,
+    gstPct: it.gstPct || 0,
+    taxableAmount: it.taxableAmount,
+    tax: it.totalGst || 0,
+    totalGst: it.totalGst || 0,
+    total: it.totalAmount,
+    totalAmount: it.totalAmount,
+    sourceBin: it.sourceBin || "SELLABLE",
+    originalInvoiceNo: it.purchaseBillNo || originalInvoiceNo,
+    purchaseBillNo: it.purchaseBillNo || "",
+  }));
+
+  const refNo = pr.creditNoteNo || pr.debitNoteNo || pr.returnNo;
+
+  return {
+    _id: pr._id,
+    returnNo: refNo,
+    invoiceNo: refNo,
+    isReturn: true,
+    isInterCompany: true,
+    isOriginalPurchaseReturn: true,
+    date: pr.creditNoteDate || pr.shippingDetails?.dispatchedAt || pr.returnDate || pr.createdAt,
+    createdAt: pr.createdAt,
+    updatedAt: pr.updatedAt,
+    billingMode: "B2B",
+    subtotal: pr.taxableSubtotal,
+    discount: 0,
+    tax: pr.totalGst,
+    roundOff: pr.roundOff || 0,
+    grandTotal: pr.grandTotal,
+    returnAmount: pr.grandTotal,
+    returnType: "credit_note",
+    paymentMethod: "Credit Note",
+    refundMethod: "Credit Note",
+    creditNoteNo: pr.creditNoteNo || refNo,
+    creditNoteDate: pr.creditNoteDate || pr.returnDate,
+    status: pr.status === "CONFIRMED" ? "Completed" : pr.status,
+    returnMotive: (pr.returnMotive || "sellable").toLowerCase(),
+    reason: pr.reason || pr.remarks || "Inter-Company Return",
+    notes: pr.remarks || "",
+    customerId: customer,
+    customerName: customer.name || originName,
+    customerGst: customer.gstNumber || originGst,
+    originCompany: {
+      _id: originCompany?._id || pr.companyId?._id || pr.companyId,
+      name: originName,
+      legalName: originCompany?.legalName || originName,
+      gstin: originGst,
+      code: originCompany?.code || "",
+    },
+    branchId: pr.shippingDetails?.destinationBranchId || pr.branchId,
+    originalInvoiceNo,
+    originalInvoiceId,
+    items: mappedItems,
+    shippingDetails: pr.shippingDetails || {},
+    ingestionDetails: pr.ingestionDetails || {},
+  };
+};
+
 /**
  * Get all customer returns with filters and pagination
  */
@@ -1638,9 +1800,100 @@ const getAllCustomerReturns = async (companyId, workspaceId, filters = {}, pagin
     };
   });
 
+  // Query incoming Inter-Company Purchase Returns where this company is the receiving supplier (destinationCompanyId)
+  let interCompanySalesReturns = [];
+  try {
+    const isB2COnly = filters.billingMode && String(filters.billingMode).toLowerCase() === "b2c";
+    const isCashOrAdvOnly =
+      filters.returnType &&
+      filters.returnType !== "all" &&
+      !String(filters.returnType).toLowerCase().includes("cred");
+
+    if (!isB2COnly && !isCashOrAdvOnly) {
+      const icFilter = {
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        "shippingDetails.destinationCompanyId": new mongoose.Types.ObjectId(companyId),
+        companyId: { $ne: new mongoose.Types.ObjectId(companyId) },
+        isDeleted: false,
+      };
+
+      if (filters.branchId && mongoose.Types.ObjectId.isValid(filters.branchId)) {
+        icFilter["shippingDetails.destinationBranchId"] = new mongoose.Types.ObjectId(filters.branchId);
+      }
+
+      if (filters.dateFrom || filters.dateTo) {
+        const dateCond = {};
+        if (filters.dateFrom) {
+          const fDate = new Date(filters.dateFrom);
+          if (!Number.isNaN(fDate.getTime())) dateCond.$gte = fDate;
+        }
+        if (filters.dateTo) {
+          let tDate = new Date(filters.dateTo);
+          if (!Number.isNaN(tDate.getTime())) {
+            if (typeof filters.dateTo === "string" && !filters.dateTo.includes("T")) {
+              tDate.setHours(23, 59, 59, 999);
+            }
+            dateCond.$lte = tDate;
+          }
+        }
+        if (dateCond.$gte || dateCond.$lte) {
+          icFilter.$or = [{ returnDate: dateCond }, { createdAt: dateCond }];
+        }
+      }
+
+      if (filters.search && typeof filters.search === "string" && filters.search.trim()) {
+        const rawTerm = filters.search.trim();
+        const escapedTerm = rawTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = { $regex: escapedTerm, $options: "i" };
+        icFilter.$or = [
+          { returnNo: regex },
+          { debitNoteNo: regex },
+          { creditNoteNo: regex },
+          { reason: regex },
+          { remarks: regex },
+          { "items.productName": regex },
+          { "items.batchNo": regex },
+        ];
+      }
+
+      const icDocs = await PurchaseReturn.find(icFilter)
+        .populate("companyId", "name legalName gstin gstNumber code address phone")
+        .populate("branchId", "name branchCode address")
+        .populate("supplierId", "businessName gstNumber")
+        .populate("shippingDetails.destinationCompanyId", "name legalName gstin")
+        .populate("shippingDetails.destinationBranchId", "name branchCode address phone")
+        .lean();
+
+      if (Array.isArray(icDocs) && icDocs.length > 0) {
+        interCompanySalesReturns = await Promise.all(
+          icDocs.map((doc) => projectPurchaseReturnToSalesReturn(doc, companyId, workspaceId))
+        );
+      }
+    }
+  } catch (icErr) {
+    console.warn("[Sales Return] Inter-company sales return aggregation warning:", icErr?.message);
+  }
+
+  const combinedReturns = [...mappedReturns, ...interCompanySalesReturns];
+  combinedReturns.sort((a, b) => {
+    const timeB = new Date(b.date || b.createdAt || 0).getTime();
+    const timeA = new Date(a.date || a.createdAt || 0).getTime();
+    return timeB - timeA;
+  });
+
+  const total = (result.meta?.total || mappedReturns.length) + interCompanySalesReturns.length;
+  const paginatedReturns = interCompanySalesReturns.length > 0
+    ? combinedReturns.slice(0, limit)
+    : combinedReturns;
+
   return {
     ...result,
-    returns: mappedReturns,
+    returns: paginatedReturns,
+    meta: {
+      ...(result.meta || {}),
+      total,
+      totalPages: Math.ceil(total / limit) || 1,
+    },
   };
 };
 
@@ -1676,6 +1929,49 @@ const getReturnById = async (returnId, companyId, workspaceId) => {
       .lean();
   }
 
+  // If still not found, check if it's an incoming Inter-Company PurchaseReturn
+  if (!returnDoc) {
+    try {
+      const isObjectId = mongoose.Types.ObjectId.isValid(returnId);
+      const prQuery = {
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        "shippingDetails.destinationCompanyId": new mongoose.Types.ObjectId(companyId),
+        companyId: { $ne: new mongoose.Types.ObjectId(companyId) },
+        isDeleted: false,
+        ...(isObjectId
+          ? {
+              $or: [
+                { _id: new mongoose.Types.ObjectId(returnId) },
+                { returnNo: returnId },
+                { debitNoteNo: returnId },
+                { creditNoteNo: returnId },
+              ],
+            }
+          : {
+              $or: [
+                { returnNo: returnId },
+                { debitNoteNo: returnId },
+                { creditNoteNo: returnId },
+              ],
+            }),
+      };
+
+      const prDoc = await PurchaseReturn.findOne(prQuery)
+        .populate("companyId", "name legalName gstin gstNumber code address phone")
+        .populate("branchId", "name branchCode address")
+        .populate("supplierId", "businessName gstNumber")
+        .populate("shippingDetails.destinationCompanyId", "name legalName gstin")
+        .populate("shippingDetails.destinationBranchId", "name branchCode address phone")
+        .lean();
+
+      if (prDoc) {
+        returnDoc = await projectPurchaseReturnToSalesReturn(prDoc, companyId, workspaceId);
+      }
+    } catch (icErr) {
+      console.warn("[Sales Return] Inter-company return lookup warning:", icErr?.message);
+    }
+  }
+
   if (!returnDoc) {
     throw new ApiError(404, "Sales return record not found");
   }
@@ -1703,4 +1999,5 @@ export default {
   getNextReturnNumber,
   getAllCustomerReturns,
   getReturnById,
+  projectPurchaseReturnToSalesReturn,
 };

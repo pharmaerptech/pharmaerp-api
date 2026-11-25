@@ -135,6 +135,12 @@ const purchaseReturnSchema = new mongoose.Schema(
       index: true,
     },
 
+    isInterCompany: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
     returnNo: { type: String, required: true, trim: true },
     debitNoteNo: { type: String, trim: true, default: "" },
     creditNoteNo: { type: String, trim: true, default: "" },

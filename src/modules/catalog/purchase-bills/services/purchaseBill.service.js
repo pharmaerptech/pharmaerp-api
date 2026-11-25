@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import ApiError from "../../../../utils/ApiError.js";
 import purchaseBillRepository from "../repositories/purchaseBill.repository.js";
 import gstLedgerRepository from "../../../finance/gst-ledger/repositories/gstLedger.repository.js";
@@ -13,6 +14,7 @@ import journalVoucherService from "../../../finance/journal-vouchers/services/jo
 import Account from "../../../finance/chart-of-accounts/models/account.model.js";
 import { VOUCHER_TYPE } from "../../../finance/journal-vouchers/constants/voucherType.constant.js";
 import { VOUCHER_STATUS } from "../../../finance/journal-vouchers/constants/voucherStatus.constant.js";
+import SalesInvoice from "../../../sales/invoices/models/invoice.model.js";
 
 const formatExpiry = (val) => {
   if (!val) return "";
@@ -35,6 +37,65 @@ const formatExpiry = (val) => {
     return `${mm}/${yy}`;
   }
   return str;
+};
+
+const resolveOrProvisionItems = async (workspaceId, items, userId) => {
+  if (!items || !Array.isArray(items)) return [];
+  const resolved = [];
+
+  for (const item of items) {
+    let resolvedProductId = item.productId || null;
+
+    if (!resolvedProductId && item.name && String(item.name).trim()) {
+      const cleanName = String(item.name).trim();
+      let wsProd = await WorkspaceProduct.findOne({
+        workspaceId,
+        isDeleted: false,
+        name: { $regex: new RegExp(`^${cleanName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") },
+      });
+
+      if (!wsProd) {
+        try {
+          wsProd = await WorkspaceProduct.create({
+            workspaceId,
+            name: cleanName,
+            productType: "medicine",
+            pack: item.pack || "10's",
+            hsn: item.hsn ? String(item.hsn) : "3004",
+            hsnTaxpercent: item.gst !== undefined ? Number(item.gst) : 5,
+            mrp: Number(item.mrp) || 0,
+            pts: Number(item.rate) || 0,
+            ptr: Number(item.rateB || item.rate) || 0,
+            rateA: Number(item.rateA || item.rate) || 0,
+            rateB: Number(item.rateB || item.rate) || 0,
+            rateC: Number(item.rateC || item.rate) || 0,
+            finalRateA: Number(item.rateA || item.rate) || 0,
+            finalRateB: Number(item.rateB || item.rate) || 0,
+            finalRateC: Number(item.rateC || item.rate) || 0,
+            source: "workspace",
+            status: "active",
+            createdBy: userId,
+          });
+        } catch (createErr) {
+          wsProd = await WorkspaceProduct.findOne({
+            workspaceId,
+            isDeleted: false,
+            name: cleanName,
+          });
+        }
+      }
+      if (wsProd) {
+        resolvedProductId = wsProd._id;
+      }
+    }
+
+    resolved.push({
+      ...item,
+      productId: resolvedProductId,
+    });
+  }
+
+  return resolved;
 };
 
 const createPurchaseBill = async (workspaceId, companyId, userId, payload) => {
@@ -142,6 +203,8 @@ const createPurchaseBill = async (workspaceId, companyId, userId, payload) => {
 
   const generatedBillNo = purchaseBillNo || `${invoicePrefix}${sequenceNo.toString().padStart(4, '0')}`;
 
+  const resolvedItems = await resolveOrProvisionItems(workspaceId, items, userId);
+
   const bill = await purchaseBillRepository.createPurchaseBill({
     workspaceId,
     companyId,
@@ -152,7 +215,7 @@ const createPurchaseBill = async (workspaceId, companyId, userId, payload) => {
     invoiceDate: invoiceDate || "",
     financialPeriodId,
     rateBasis: rateBasis || "PTS",
-    items,
+    items: resolvedItems,
     extraDiscountPct: extraDiscountPct || 0,
     extraDiscountAmt: extraDiscountAmt || 0,
     grossTotal: grossTotal || 0,
@@ -166,7 +229,32 @@ const createPurchaseBill = async (workspaceId, companyId, userId, payload) => {
     amountDue: amountDue !== undefined ? amountDue : ((grandTotal || 0) - (amountPaid || 0)),
     status: "CONFIRMED",
     createdBy: userId,
+    isInterCompany: Boolean(payload.isInterCompany || payload.originSaleInvoiceId),
+    originSaleInvoiceId: payload.originSaleInvoiceId || null,
+    originCompanyId: payload.originCompanyId || null,
   });
+
+  if (payload.originSaleInvoiceId) {
+    try {
+      await SalesInvoice.updateOne(
+        {
+          _id: payload.originSaleInvoiceId,
+          inwardStatus: { $ne: "ACCEPTED" },
+        },
+        {
+          $set: {
+            inwardStatus: "ACCEPTED",
+            inwardPurchaseBillId: bill._id,
+            inwardPurchaseBillNo: bill.purchaseBillNo,
+            inwardAcceptedAt: new Date(),
+            inwardAcceptedBy: userId || null,
+          },
+        }
+      );
+    } catch (invErr) {
+      console.error("Error updating origin sale invoice inward status:", invErr);
+    }
+  }
 
   return bill;
 };
@@ -219,6 +307,7 @@ const updatePurchaseBill = async (billId, workspaceId, companyId, userId, payloa
     period = periods.periods && periods.periods[0];
   }
   const financialPeriodId = period ? period._id : null;
+  const resolvedItems = await resolveOrProvisionItems(workspaceId, items, userId);
   const updatedBill = await purchaseBillRepository.updatePurchaseBill(
     billId,
     workspaceId,
@@ -231,7 +320,7 @@ const updatePurchaseBill = async (billId, workspaceId, companyId, userId, payloa
       invoiceDate: invoiceDate || "",
       financialPeriodId,
       rateBasis: rateBasis || "PTS",
-      items,
+      items: resolvedItems,
       extraDiscountPct: extraDiscountPct || 0,
       extraDiscountAmt: extraDiscountAmt || 0,
       grossTotal: grossTotal || 0,
@@ -311,6 +400,42 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
 
   // Iterate over all items in the purchase bill
   for (const item of bill.items) {
+    if (!item.productId && item.name && String(item.name).trim()) {
+      const cleanName = String(item.name).trim();
+      let wsProd = await WorkspaceProduct.findOne({
+        workspaceId,
+        isDeleted: false,
+        name: { $regex: new RegExp(`^${cleanName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") },
+      });
+      if (!wsProd) {
+        try {
+          wsProd = await WorkspaceProduct.create({
+            workspaceId,
+            name: cleanName,
+            productType: "medicine",
+            pack: item.pack || "10's",
+            hsn: item.hsn ? String(item.hsn) : "3004",
+            hsnTaxpercent: item.gst !== undefined ? Number(item.gst) : 5,
+            mrp: Number(item.mrp) || 0,
+            pts: Number(item.rate) || 0,
+            ptr: Number(item.rateB || item.rate) || 0,
+            rateA: Number(item.rateA || item.rate) || 0,
+            rateB: Number(item.rateB || item.rate) || 0,
+            rateC: Number(item.rateC || item.rate) || 0,
+            source: "workspace",
+            status: "active",
+            createdBy: bill.createdBy,
+          });
+        } catch (e) {
+          wsProd = await WorkspaceProduct.findOne({ workspaceId, isDeleted: false, name: cleanName });
+        }
+      }
+      if (wsProd) {
+        item.productId = wsProd._id;
+        await bill.save();
+      }
+    }
+
     if (!item.productId) continue;
 
     const totalIngestQty = (Number(item.qty) || 0) + (Number(item.freeQty) || 0);
@@ -730,6 +855,392 @@ const bulkPayPurchaseBills = async (workspaceId, companyId, userId, payload) => 
   return { success: true, allocated: actualTotalAllocated };
 };
 
+const escapeRegex = (str) => String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Helper to resolve or auto-provision a Supplier record for an origin sister company in the receiving company
+ */
+const resolveOrCreateSupplierForOriginCompany = async (
+  workspaceId,
+  destinationCompanyId,
+  originCompanyId,
+  branchId = null
+) => {
+  if (!originCompanyId) return null;
+  const originCompany = await Company.findById(originCompanyId).lean();
+  if (!originCompany) return null;
+
+  const originGst = (originCompany?.gstin || originCompany?.gstNumber || "").trim().toUpperCase();
+  const originName = (originCompany?.name || originCompany?.legalName || "").trim();
+
+  let supplier = null;
+  if (originGst || originName) {
+    supplier = await Supplier.findOne({
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      companyId: new mongoose.Types.ObjectId(destinationCompanyId),
+      isDeleted: false,
+      $or: [
+        ...(originGst ? [{ gstNumber: originGst }] : []),
+        ...(originName ? [{ businessName: { $regex: new RegExp(`^${escapeRegex(originName)}$`, "i") } }] : []),
+      ],
+    }).lean();
+  }
+
+  if (!supplier) {
+    const nextCode = `SUP-${Date.now().toString().slice(-4)}`;
+    supplier = await Supplier.create({
+      workspaceId,
+      companyId: destinationCompanyId,
+      branchId: branchId || null,
+      supplierCode: nextCode,
+      businessName: originName || "Inter-Company Supplier",
+      gstNumber: originGst || null,
+      panNumber: originGst && originGst.length >= 10 ? originGst.substring(2, 12) : null,
+      contactPerson: originName || "Inter-Company",
+      address: originCompany?.address || {},
+      creditDays: 30,
+      supplierType: "Distributor",
+    });
+  }
+
+  return {
+    _id: supplier._id,
+    id: supplier._id,
+    businessName: supplier.businessName,
+    name: supplier.businessName,
+    gstNumber: supplier.gstNumber || "",
+    mobile: supplier.mobile || "",
+  };
+};
+
+/**
+ * Get paginated list of Incoming Inter-Company Consignments (Sales Invoices billed by sister companies)
+ */
+const getIncomingConsignments = async (workspaceId, companyId, query = {}) => {
+  const page = Math.max(1, parseInt(query.page, 10) || 1);
+  const limit = Math.max(1, parseInt(query.limit, 10) || 20);
+  const skip = (page - 1) * limit;
+
+  const filter = {
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    destinationCompanyId: new mongoose.Types.ObjectId(companyId),
+    companyId: { $ne: new mongoose.Types.ObjectId(companyId) },
+    isDeleted: { $ne: true },
+    status: { $ne: "Cancelled" },
+  };
+
+  if (query.status && query.status !== "all") {
+    if (query.status === "PENDING") {
+      filter.inwardStatus = { $in: ["PENDING", null] };
+    } else if (query.status === "ACCEPTED") {
+      filter.inwardStatus = "ACCEPTED";
+    } else {
+      filter.inwardStatus = query.status;
+    }
+  }
+
+  if (query.search) {
+    const s = String(query.search).trim();
+    const regex = new RegExp(escapeRegex(s), "i");
+    filter.$or = [
+      { invoiceNo: regex },
+      { "items.name": regex },
+      { "items.batch": regex },
+    ];
+  }
+
+  const [invoices, total] = await Promise.all([
+    SalesInvoice.find(filter)
+      .populate("companyId", "name legalName gstin gstNumber code address phone")
+      .populate("branchId", "name branchCode address")
+      .populate("inwardPurchaseBillId", "purchaseBillNo status grandTotal createdAt")
+      .sort({ date: -1, createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(),
+    SalesInvoice.countDocuments(filter),
+  ]);
+
+  const mapped = await Promise.all(
+    (invoices || []).map(async (doc) => {
+      const originCompId = doc.companyId?._id || doc.companyId;
+      let resolvedSupplier = null;
+      try {
+        resolvedSupplier = await resolveOrCreateSupplierForOriginCompany(
+          workspaceId,
+          companyId,
+          originCompId
+        );
+      } catch (sErr) {
+        console.error("Error resolving supplier for consignment:", sErr);
+      }
+
+      const cartItems = (doc.items || []).map((it) => {
+        const qty = Number(it.qty || it.quantity || 0);
+        const freeQty = Number(it.freeQty || 0);
+        const rate = Number(it.rate || it.unitPrice || it.price || 0);
+        const mrp = Number(it.mrp || rate);
+        const gst = Number(it.gst || it.gstRate || it.hsnTaxpercent || 0);
+        const disc = Number(it.disc || it.discount || it.itemDiscount || 0);
+        const amount = Number(it.amount || it.total || qty * rate);
+        const hsn = it.hsn || it.hsnCode || "3004";
+        const pack = it.pack || it.packSize || "";
+        const name = it.name || it.productName || it.displayName || "Medicine";
+        const batch = it.batch || it.batchNo || "";
+        const expiry = it.expiry || it.expDate || it.expiryDate || "";
+
+        return {
+          id: `${it.productId || it._id || Date.now()}-${Math.random()}`,
+          productId: it.productId || it.product_id || it.workspaceProductId || null,
+          name,
+          pack,
+          batch,
+          expiry,
+          qty,
+          freeQty,
+          schPct: Number(it.schPct || 0),
+          disc,
+          cRatePct: Number(it.cRatePct || 0),
+          mrp,
+          hsn,
+          gst,
+          rate,
+          amount,
+          rateA: Number(it.rateA || rate),
+          rateB: Number(it.rateB || rate),
+          rateC: Number(it.rateC || rate),
+          retailerMarginPercent: 20,
+          stockistMarginPercent: 10,
+        };
+      });
+
+      return {
+        _id: doc._id,
+        invoiceNo: doc.invoiceNo,
+        originCompany: {
+          _id: originCompId,
+          name: doc.companyId?.name || "Supplier Company",
+          legalName: doc.companyId?.legalName || "",
+          gstNumber: doc.companyId?.gstin || doc.companyId?.gstNumber || "",
+          address: doc.companyId?.address || {},
+          phone: doc.companyId?.phone || {},
+        },
+        originBranch: {
+          _id: doc.branchId?._id || doc.branchId,
+          name: doc.branchId?.name || "Main Branch",
+          branchCode: doc.branchId?.branchCode || "",
+        },
+        supplier: resolvedSupplier,
+        cartItems,
+        date: doc.date,
+        subtotal: doc.subtotal,
+        discount: doc.discount,
+        tax: doc.tax,
+        grandTotal: doc.grandTotal,
+        itemCount: (doc.items || []).length,
+        items: doc.items || [],
+        inwardStatus: doc.inwardStatus || "PENDING",
+        inwardPurchaseBillId: doc.inwardPurchaseBillId?._id || doc.inwardPurchaseBillId,
+        inwardPurchaseBillNo: doc.inwardPurchaseBillNo || doc.inwardPurchaseBillId?.purchaseBillNo || null,
+        inwardAcceptedAt: doc.inwardAcceptedAt,
+        createdAt: doc.createdAt,
+      };
+    })
+  );
+
+  const pendingCount = await SalesInvoice.countDocuments({
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    destinationCompanyId: new mongoose.Types.ObjectId(companyId),
+    companyId: { $ne: new mongoose.Types.ObjectId(companyId) },
+    isDeleted: { $ne: true },
+    status: { $ne: "Cancelled" },
+    inwardStatus: { $in: ["PENDING", null] },
+  });
+
+  return {
+    data: mapped,
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit) || 1,
+    pendingCount,
+  };
+};
+
+/**
+ * Accept an Incoming Consignment and materialize it into an official Purchase Bill in the receiving company
+ */
+const acceptIncomingConsignment = async (
+  invoiceId,
+  workspaceId,
+  destinationCompanyId,
+  targetBranchId,
+  userId,
+  options = {}
+) => {
+  if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+    throw new ApiError(400, "Invalid invoice ID");
+  }
+
+  const invoice = await SalesInvoice.findOne({
+    _id: invoiceId,
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    destinationCompanyId: new mongoose.Types.ObjectId(destinationCompanyId),
+    isDeleted: { $ne: true },
+  });
+
+  if (!invoice) {
+    throw new ApiError(404, "Incoming consignment record not found");
+  }
+
+  if (invoice.status === "Cancelled") {
+    throw new ApiError(400, "Cannot accept a cancelled sale bill");
+  }
+
+  if (invoice.inwardStatus === "ACCEPTED") {
+    throw new ApiError(
+      400,
+      `This consignment has already been accepted as purchase bill #${invoice.inwardPurchaseBillNo || ""}`
+    );
+  }
+
+  // 1. Resolve Destination Branch
+  let resolvedBranchId = targetBranchId || options.branchId || null;
+  if (!resolvedBranchId) {
+    try {
+      const activeBranches = await branchRepository.getCompanyBranches(destinationCompanyId);
+      if (Array.isArray(activeBranches) && activeBranches.length > 0) {
+        resolvedBranchId = activeBranches[0]._id;
+      }
+    } catch {}
+  }
+
+  // 2. Resolve or provision Supplier record in destination company
+  const originCompany = await Company.findById(invoice.companyId).lean();
+  const originGst = (originCompany?.gstin || originCompany?.gstNumber || "").trim().toUpperCase();
+  const originName = (originCompany?.name || originCompany?.legalName || "").trim();
+
+  let supplier = null;
+  if (originGst || originName) {
+    supplier = await Supplier.findOne({
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      companyId: new mongoose.Types.ObjectId(destinationCompanyId),
+      isDeleted: false,
+      $or: [
+        ...(originGst ? [{ gstNumber: originGst }] : []),
+        ...(originName ? [{ businessName: { $regex: new RegExp(`^${escapeRegex(originName)}$`, "i") } }] : []),
+      ],
+    });
+  }
+
+  if (!supplier) {
+    const nextCode = `SUP-${Date.now().toString().slice(-4)}`;
+    supplier = await Supplier.create({
+      workspaceId,
+      companyId: destinationCompanyId,
+      branchId: resolvedBranchId || null,
+      supplierCode: nextCode,
+      businessName: originName || "Inter-Company Supplier",
+      gstNumber: originGst || null,
+      panNumber: originGst && originGst.length >= 10 ? originGst.substring(2, 12) : null,
+      contactPerson: originName || "Inter-Company",
+      address: originCompany?.address || {},
+      creditDays: 30,
+      supplierType: "Distributor",
+    });
+  }
+
+  // 3. Map line items
+  const mappedItems = (invoice.items || []).map((it) => {
+    const qty = Number(it.qty || it.quantity || 0);
+    const freeQty = Number(it.freeQty || 0);
+    const rate = Number(it.rate || it.unitPrice || it.price || 0);
+    const mrp = Number(it.mrp || rate);
+    const gst = Number(it.gst || it.gstRate || it.hsnTaxpercent || 0);
+    const disc = Number(it.disc || it.discount || it.itemDiscount || 0);
+    const amount = Number(it.amount || it.total || (qty * rate));
+    const hsn = it.hsn || it.hsnCode || "";
+    const pack = it.pack || it.packSize || "";
+    const name = it.name || it.productName || it.displayName || "Medicine";
+    const batch = it.batch || it.batchNo || "";
+    const expiry = it.expiry || it.expDate || it.expiryDate || "";
+
+    return {
+      productId: it.productId || it.product_id || it.workspaceProductId || null,
+      name,
+      pack,
+      batch,
+      expiry,
+      qty,
+      freeQty,
+      schPct: Number(it.schPct || 0),
+      disc,
+      cRatePct: 0,
+      mrp,
+      hsn,
+      gst,
+      rate,
+      amount,
+      rateA: Number(it.rateA || 0),
+      rateB: Number(it.rateB || 0),
+      rateC: Number(it.rateC || 0),
+      finalRateA: Number(it.finalRateA || 0),
+      finalRateB: Number(it.finalRateB || 0),
+      finalRateC: Number(it.finalRateC || 0),
+      saleScheme: Number(it.saleScheme || 0),
+    };
+  });
+
+  // 4. Create Purchase Bill
+  const billPayload = {
+    supplierId: supplier._id,
+    branchId: resolvedBranchId,
+    supplierInvoiceNo: invoice.invoiceNo,
+    invoiceDate: invoice.date ? new Date(invoice.date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10),
+    rateBasis: "PTS",
+    items: mappedItems,
+    grossTotal: invoice.subtotal || invoice.grandTotal,
+    schemeDiscount: 0,
+    tradeDiscount: invoice.discount || 0,
+    taxableSubtotal: invoice.subtotal || 0,
+    taxableAfterExtraDisc: invoice.subtotal || 0,
+    totalGst: invoice.tax || 0,
+    grandTotal: invoice.grandTotal || 0,
+    amountPaid: 0,
+    amountDue: invoice.grandTotal || 0,
+    isInterCompany: true,
+    originSaleInvoiceId: invoice._id,
+    originCompanyId: originCompany?._id || invoice.companyId,
+  };
+
+  const createdBill = await createPurchaseBill(workspaceId, destinationCompanyId, userId, billPayload);
+
+  // 5. Ingest stock if requested
+  if (options.ingestStock !== false) {
+    try {
+      await ingestPurchaseBill(createdBill._id, workspaceId, destinationCompanyId, resolvedBranchId, userId);
+      createdBill.inventoryMaterialized = true;
+      await createdBill.save();
+    } catch (ingestErr) {
+      console.warn("[Inward Acceptance] Auto-ingest warning:", ingestErr?.message);
+    }
+  }
+
+  // 6. Update SalesInvoice inward tracking fields
+  invoice.inwardStatus = "ACCEPTED";
+  invoice.inwardPurchaseBillId = createdBill._id;
+  invoice.inwardPurchaseBillNo = createdBill.purchaseBillNo;
+  invoice.inwardAcceptedAt = new Date();
+  invoice.inwardAcceptedBy = new mongoose.Types.ObjectId(userId);
+  await invoice.save();
+
+  return {
+    success: true,
+    purchaseBill: createdBill,
+    invoiceNo: invoice.invoiceNo,
+  };
+};
+
 const purchaseBillService = {
   createPurchaseBill,
   updatePurchaseBill,
@@ -739,6 +1250,8 @@ const purchaseBillService = {
   getPurchaseHistory,
   payPurchaseBill,
   bulkPayPurchaseBills,
+  getIncomingConsignments,
+  acceptIncomingConsignment,
 };
 
 export default purchaseBillService;

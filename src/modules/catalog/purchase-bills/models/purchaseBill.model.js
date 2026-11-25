@@ -105,6 +105,32 @@ const purchaseBillSchema = new mongoose.Schema(
       index: true,
     },
 
+    isInterCompany: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    originSaleInvoiceId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SalesInvoice",
+      default: null,
+      index: true,
+    },
+
+    originCompanyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Company",
+      default: null,
+      index: true,
+    },
+
+    inventoryMaterialized: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
