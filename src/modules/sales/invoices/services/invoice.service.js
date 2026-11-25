@@ -1682,6 +1682,23 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
       }
       if (!it.batch && it.batchNo) it.batch = it.batchNo;
       if (!it.batchNo && it.batch) it.batchNo = it.batch;
+
+      // Synchronize scheme fields for seamless inter-company consignment ingestion
+      const rawScheme = Number(
+        it.schemeDiscountPercent ||
+        it.schemePercent ||
+        it.saleScheme ||
+        it.schPct ||
+        it.schemeDisc ||
+        it.scheme ||
+        0
+      );
+      if (rawScheme > 0) {
+        it.schemeDiscountPercent = rawScheme;
+        it.schemePercent = rawScheme;
+        it.saleScheme = rawScheme;
+        it.schPct = rawScheme;
+      }
     }
   }
 
@@ -1729,6 +1746,7 @@ const recordCustomerSale = async (customerId, saleData, companyId, workspaceId, 
     inwardStatus,
     subtotal: saleData.subtotal || 0,
     discount: saleData.discount || 0,
+    schemeDiscount: Number(saleData.schemeDiscount) || 0,
     tax: saleData.tax || 0,
     grandTotal: saleData.grandTotal || 0,
     cashTendered: saleData.cashTendered || 0,

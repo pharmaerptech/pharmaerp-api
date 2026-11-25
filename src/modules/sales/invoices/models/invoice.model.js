@@ -64,6 +64,10 @@ const invoiceSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    schemeDiscount: {
+      type: Number,
+      default: 0,
+    },
     tax: {
       type: Number,
       default: 0,

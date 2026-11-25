@@ -292,7 +292,12 @@ export const parsePurchaseBillText = (rawText) => {
       rateB: Number(rateB) || Number(rate) || 0,
       rateC: Number(rate) || 0,
       disc: Number(disc) || 0,
-      schPct: 0,
+      schPct: (Number(qty) > 0 && Number(freeQty) > 0)
+        ? Number(((Number(freeQty) / (Number(qty) + Number(freeQty))) * 100).toFixed(2))
+        : 0,
+      saleScheme: (Number(qty) > 0 && Number(freeQty) > 0)
+        ? Number(((Number(freeQty) / (Number(qty) + Number(freeQty))) * 100).toFixed(2))
+        : 0,
       gst: Number(gst) || 5,
       amount: Number(amount) || (qty * rate),
       retailerMarginPercent: 20,

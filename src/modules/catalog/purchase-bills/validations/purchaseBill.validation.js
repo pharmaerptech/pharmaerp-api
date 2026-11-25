@@ -19,7 +19,7 @@ const itemSchema = Joi.object({
   disc: Joi.number().min(0).max(100).default(0),
   cRatePct: Joi.number().min(0).max(100).default(0),
   mrp: Joi.number().min(0.01).required(),
-  hsn: Joi.string().trim().max(20).allow("").optional(),
+  hsn: Joi.alternatives().try(Joi.string().trim().max(50).allow("", null), Joi.number()).optional(),
   gst: Joi.number().min(0).max(100).default(0),
   rate: Joi.number().min(0.01).required(),
   amount: Joi.number().min(0).default(0),
@@ -30,6 +30,7 @@ const itemSchema = Joi.object({
   finalRateB: Joi.number().min(0).default(0),
   finalRateC: Joi.number().min(0).default(0),
   saleScheme: Joi.number().min(0).default(0),
+  schemeDiscountPercent: Joi.number().min(0).default(0),
 });
 
 const gstSlabSchema = Joi.object({
@@ -64,6 +65,10 @@ export const createPurchaseBillSchema = Joi.object({
   amountDue: Joi.number().min(0).default(0),
 
   gstSlabs: Joi.array().items(gstSlabSchema).default([]),
+
+  isInterCompany: Joi.boolean().default(false),
+  originSaleInvoiceId: objectId.allow(null).optional(),
+  originCompanyId: objectId.allow(null).optional(),
 });
 
 export const updatePurchaseBillSchema = createPurchaseBillSchema;

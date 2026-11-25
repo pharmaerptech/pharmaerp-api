@@ -91,6 +91,7 @@ const resolveOrProvisionItems = async (workspaceId, items, userId) => {
 
     resolved.push({
       ...item,
+      hsn: item.hsn ? String(item.hsn).trim() : "3004",
       productId: resolvedProductId,
     });
   }
@@ -443,6 +444,24 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
 
     const formattedExpiry = formatExpiry(item.expiry);
 
+    // Calculate effective scheme percentage:
+    // 1. item.saleScheme (explicit sale scheme override if > 0)
+    // 2. item.schPct (direct scheme percentage entered on purchase bill)
+    // 3. item.schemeDiscountPercent / item.scheme
+    // 4. calculated from freeQty: (freeQty / (qty + freeQty)) * 100
+    const calculatedFreeScheme = (Number(item.qty) > 0 && Number(item.freeQty) > 0)
+      ? Number(((Number(item.freeQty) / (Number(item.qty) + Number(item.freeQty))) * 100).toFixed(2))
+      : 0;
+
+    const effectiveScheme = Number(
+      (Number(item.saleScheme) > 0 ? Number(item.saleScheme) : 0) ||
+      Number(item.schPct) ||
+      Number(item.schemeDiscountPercent) ||
+      Number(item.scheme) ||
+      calculatedFreeScheme ||
+      0
+    );
+
     // 1. Update or Create Batch strictly scoped to effectiveBranchId
     const batchFilter = {
       workspaceId,
@@ -467,7 +486,7 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
       batch.finalRateA = item.finalRateA || batch.finalRateA;
       batch.finalRateB = item.finalRateB || batch.finalRateB;
       batch.finalRateC = item.finalRateC || batch.finalRateC;
-      batch.schemeDiscountPercent = item.saleScheme || batch.schemeDiscountPercent;
+      batch.schemeDiscountPercent = effectiveScheme > 0 ? effectiveScheme : batch.schemeDiscountPercent;
       batch.purchaseBillId = bill._id;
       await batch.save();
     } else {
@@ -486,7 +505,7 @@ const ingestPurchaseBill = async (billId, workspaceId, companyId, branchId, user
         finalRateA: item.finalRateA || 0,
         finalRateB: item.finalRateB || 0,
         finalRateC: item.finalRateC || 0,
-        schemeDiscountPercent: item.saleScheme || 0,
+        schemeDiscountPercent: effectiveScheme,
         purchaseBillId: bill._id,
       });
     }
@@ -983,11 +1002,25 @@ const getIncomingConsignments = async (workspaceId, companyId, query = {}) => {
         const gst = Number(it.gst || it.gstRate || it.hsnTaxpercent || 0);
         const disc = Number(it.disc || it.discount || it.itemDiscount || 0);
         const amount = Number(it.amount || it.total || qty * rate);
-        const hsn = it.hsn || it.hsnCode || "3004";
+        const hsn = it.hsn ? String(it.hsn).trim() : (it.hsnCode ? String(it.hsnCode).trim() : "3004");
         const pack = it.pack || it.packSize || "";
         const name = it.name || it.productName || it.displayName || "Medicine";
         const batch = it.batch || it.batchNo || "";
         const expiry = it.expiry || it.expDate || it.expiryDate || "";
+
+        const calculatedSch = (qty > 0 && freeQty > 0)
+          ? Number(((freeQty / (qty + freeQty)) * 100).toFixed(2))
+          : 0;
+        const resolvedScheme = Number(
+          it.schPct ||
+          it.saleScheme ||
+          it.schemeDiscountPercent ||
+          it.schemePercent ||
+          it.schemeDisc ||
+          it.scheme ||
+          calculatedSch ||
+          0
+        );
 
         return {
           id: `${it.productId || it._id || Date.now()}-${Math.random()}`,
@@ -998,7 +1031,9 @@ const getIncomingConsignments = async (workspaceId, companyId, query = {}) => {
           expiry,
           qty,
           freeQty,
-          schPct: Number(it.schPct || 0),
+          schPct: resolvedScheme,
+          saleScheme: resolvedScheme,
+          schemeDiscountPercent: resolvedScheme,
           disc,
           cRatePct: Number(it.cRatePct || 0),
           mrp,
@@ -1035,6 +1070,7 @@ const getIncomingConsignments = async (workspaceId, companyId, query = {}) => {
         date: doc.date,
         subtotal: doc.subtotal,
         discount: doc.discount,
+        schemeDiscount: doc.schemeDiscount || 0,
         tax: doc.tax,
         grandTotal: doc.grandTotal,
         itemCount: (doc.items || []).length,
@@ -1159,11 +1195,25 @@ const acceptIncomingConsignment = async (
     const gst = Number(it.gst || it.gstRate || it.hsnTaxpercent || 0);
     const disc = Number(it.disc || it.discount || it.itemDiscount || 0);
     const amount = Number(it.amount || it.total || (qty * rate));
-    const hsn = it.hsn || it.hsnCode || "";
+    const hsn = it.hsn ? String(it.hsn).trim() : (it.hsnCode ? String(it.hsnCode).trim() : "3004");
     const pack = it.pack || it.packSize || "";
     const name = it.name || it.productName || it.displayName || "Medicine";
     const batch = it.batch || it.batchNo || "";
     const expiry = it.expiry || it.expDate || it.expiryDate || "";
+
+    const calculatedSch = (qty > 0 && freeQty > 0)
+      ? Number(((freeQty / (qty + freeQty)) * 100).toFixed(2))
+      : 0;
+    const resolvedScheme = Number(
+      it.saleScheme ||
+      it.schPct ||
+      it.schemeDiscountPercent ||
+      it.schemePercent ||
+      it.schemeDisc ||
+      it.scheme ||
+      calculatedSch ||
+      0
+    );
 
     return {
       productId: it.productId || it.product_id || it.workspaceProductId || null,
@@ -1173,7 +1223,7 @@ const acceptIncomingConsignment = async (
       expiry,
       qty,
       freeQty,
-      schPct: Number(it.schPct || 0),
+      schPct: resolvedScheme,
       disc,
       cRatePct: 0,
       mrp,
@@ -1187,7 +1237,8 @@ const acceptIncomingConsignment = async (
       finalRateA: Number(it.finalRateA || 0),
       finalRateB: Number(it.finalRateB || 0),
       finalRateC: Number(it.finalRateC || 0),
-      saleScheme: Number(it.saleScheme || 0),
+      saleScheme: resolvedScheme,
+      schemeDiscountPercent: resolvedScheme,
     };
   });
 
@@ -1200,7 +1251,7 @@ const acceptIncomingConsignment = async (
     rateBasis: "PTS",
     items: mappedItems,
     grossTotal: invoice.subtotal || invoice.grandTotal,
-    schemeDiscount: 0,
+    schemeDiscount: Number(invoice.schemeDiscount) || 0,
     tradeDiscount: invoice.discount || 0,
     taxableSubtotal: invoice.subtotal || 0,
     taxableAfterExtraDisc: invoice.subtotal || 0,
