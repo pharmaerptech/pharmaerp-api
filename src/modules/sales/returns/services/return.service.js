@@ -14,6 +14,8 @@ import gstLedgerRepository from "../../../finance/gst-ledger/repositories/gstLed
 import Company from "../../../organization/companies/models/company.model.js";
 import SalesInvoice from "../../invoices/models/invoice.model.js";
 import creditNoteService from "../../credit-notes/services/creditNote.service.js";
+import CreditNote from "../../credit-notes/models/creditNote.model.js";
+import { CREDIT_NOTE_STATUS } from "../../credit-notes/constants/creditNote.constant.js";
 import Customer from "../../../parties/customers/models/customer.model.js";
 import CustomerAdvanceTransaction from "../../../parties/customers/models/customerAdvanceTransaction.model.js";
 import CustomerCreditTransaction from "../../../parties/customers/models/customerCreditTransaction.model.js";
@@ -957,15 +959,36 @@ const recordCustomerReturn = async (
 
     const generalReturnItems = [];
     const scrapReturnItems = [];
+    const distinctMotives = new Set();
 
     for (const item of (newReturnBill.items || [])) {
-      const motive = String(item.motive || returnData.returnMotive || "general").toLowerCase().trim();
-      if (motive === "expired" || motive === "broken" || motive === "damaged") {
-        scrapReturnItems.push({ ...item, motive: motive === "broken" ? "broken" : "expired" });
+      const rawMotive = String(item.motive || item.condition || item.scrapType || returnData.returnMotive || "general").toLowerCase().trim();
+      let normMotive = "general";
+      if (rawMotive === "broken" || rawMotive === "damaged" || rawMotive.includes("broke") || rawMotive.includes("damag")) {
+        normMotive = "broken";
+      } else if (rawMotive === "expired" || rawMotive.includes("expir")) {
+        normMotive = "expired";
+      }
+
+      distinctMotives.add(normMotive);
+      item.motive = normMotive;
+      item.condition = normMotive;
+
+      if (normMotive === "expired" || normMotive === "broken") {
+        scrapReturnItems.push({ ...item, motive: normMotive });
       } else {
         generalReturnItems.push({ ...item, motive: "general" });
       }
     }
+
+    const calculatedReturnMotive = distinctMotives.size > 1
+      ? "mixed"
+      : (distinctMotives.values().next().value || returnData.returnMotive || "general");
+
+    savedReturn.returnMotive = calculatedReturnMotive;
+    savedReturn.items = newReturnBill.items;
+    savedReturn.transferOrderId = null;
+    savedReturn.transferOrderNo = null;
 
     // 7a. For General / Resellable items: increase current branch sellable stock
     if (generalReturnItems.length > 0) {
@@ -975,12 +998,9 @@ const recordCustomerReturn = async (
     // 7b. For Expired or Broken items: place directly in current branch's internal Scrap Bin (no transfer order, no separate branch)
     if (scrapReturnItems.length > 0) {
       await restockReturnInventory(scrapReturnItems, resolvedBranchId, resolvedWorkspaceId, session, true);
-
-      savedReturn.returnMotive = generalReturnItems.length > 0 ? "mixed" : (scrapReturnItems[0]?.motive || "expired");
-      savedReturn.transferOrderId = null;
-      savedReturn.transferOrderNo = null;
-      await savedReturn.save({ session });
     }
+
+    await savedReturn.save({ session });
 
     // 8. Decrease GST: Create GSTR-1 Credit Note Ledger Entry
     // (In GSTR-1 summary calculator, credit notes are placed under creditDebitParent and subtracted from gross GST)
@@ -1290,12 +1310,14 @@ const escapeRegex = (str) =>
  * Project an incoming Inter-Company PurchaseReturn into the standard SalesReturn shape.
  * Represents the return transaction from the recipient company's perspective (Customer Sales Return).
  */
-export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspaceId) => {
+export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspaceId, options = {}) => {
   if (!pr) return null;
+  const isSummary = options.isSummary === true;
+  const isDbConnected = mongoose.connection.readyState === 1;
 
   // 1. Resolve Origin Company (Buyer that initiated the return)
   let originCompany = pr.companyId;
-  if (!originCompany?.name && mongoose.Types.ObjectId.isValid(pr.companyId)) {
+  if (!originCompany?.name && mongoose.Types.ObjectId.isValid(pr.companyId) && isDbConnected) {
     originCompany = await Company.findById(pr.companyId)
       .select("name legalName gstin gstNumber code address phone")
       .lean();
@@ -1306,7 +1328,7 @@ export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspac
   const originGst = (originCompany?.gstin || originCompany?.gstNumber || "").trim().toUpperCase();
   const originName = (originCompany?.name || originCompany?.legalName || "").trim();
 
-  if (originGst || originName) {
+  if ((originGst || originName) && isDbConnected) {
     try {
       customer = await Customer.findOne({
         workspaceId: new mongoose.Types.ObjectId(workspaceId),
@@ -1345,7 +1367,7 @@ export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspac
     if (it.purchaseBillNo) candidateInvoiceNos.add(it.purchaseBillNo.trim());
   });
 
-  if (candidateInvoiceNos.size > 0) {
+  if (candidateInvoiceNos.size > 0 && isDbConnected) {
     try {
       const invRegexes = Array.from(candidateInvoiceNos).map(
         (n) => new RegExp(`^${escapeRegex(n)}$`, "i")
@@ -1370,39 +1392,127 @@ export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspac
     }
   }
 
-  // 4. Map line items to Sales Return format
-  const mappedItems = (pr.items || []).map((it, idx) => ({
-    _id: it._id || `item-${idx}`,
-    productId: it.productId,
-    productName: it.productName || "Product",
-    pack: it.pack || "",
-    batch: it.batchNo,
-    batchNo: it.batchNo,
-    expiry: it.expiry || "",
-    returnQty: it.returnQty,
-    quantity: it.returnQty,
-    rate: it.rate,
-    price: it.rate,
-    discount: it.discountPct || 0,
-    discountPct: it.discountPct || 0,
-    gstRate: it.gstPct || 0,
-    gstPct: it.gstPct || 0,
-    taxableAmount: it.taxableAmount,
-    tax: it.totalGst || 0,
-    totalGst: it.totalGst || 0,
-    total: it.totalAmount,
-    totalAmount: it.totalAmount,
-    sourceBin: it.sourceBin || "SELLABLE",
-    originalInvoiceNo: it.purchaseBillNo || originalInvoiceNo,
-    purchaseBillNo: it.purchaseBillNo || "",
-  }));
+  // Calculate distinct motives and total units across items
+  const distinctIcMotives = new Set();
+  let totalUnits = 0;
+  (pr.items || []).forEach((it) => {
+    let itemMotive = "general";
+    const srcBin = String(it.sourceBin || "").toUpperCase();
+    if (srcBin === "SCRAP_BROKEN" || srcBin.includes("BROKEN")) {
+      itemMotive = "broken";
+    } else if (srcBin === "SCRAP_EXPIRED" || srcBin.includes("EXPIRED")) {
+      itemMotive = "expired";
+    } else if (it.motive) {
+      itemMotive = String(it.motive).toLowerCase();
+    }
+    distinctIcMotives.add(itemMotive);
+    totalUnits += Number(it.returnQty) || 0;
+  });
+
+  const resolvedIcReturnMotive = distinctIcMotives.size > 1
+    ? "mixed"
+    : (distinctIcMotives.values().next().value || (pr.returnMotive || "sellable").toLowerCase());
 
   const refNo = pr.creditNoteNo || pr.debitNoteNo || pr.returnNo;
+
+  // Lightweight summary for list view
+  if (isSummary) {
+    return {
+      _id: pr._id,
+      returnNo: refNo,
+      invoiceNo: refNo,
+      debitNoteNo: pr.debitNoteNo || pr.returnNo || refNo,
+      isReturn: true,
+      isInterCompany: true,
+      isOriginalPurchaseReturn: true,
+      date: pr.creditNoteDate || pr.shippingDetails?.dispatchedAt || pr.returnDate || pr.createdAt,
+      createdAt: pr.createdAt,
+      updatedAt: pr.updatedAt,
+      billingMode: "B2B",
+      subtotal: pr.taxableSubtotal,
+      discount: 0,
+      tax: pr.totalGst,
+      roundOff: pr.roundOff || 0,
+      grandTotal: pr.grandTotal,
+      returnAmount: pr.grandTotal,
+      returnType: "credit_note",
+      paymentMethod: "Credit Note",
+      refundMethod: "Credit Note",
+      creditNoteNo: pr.creditNoteNo || refNo,
+      creditNoteDate: pr.creditNoteDate || pr.returnDate,
+      status: pr.status === "CONFIRMED" ? "Completed" : pr.status,
+      isApproved: Boolean(pr.isApproved),
+      approvedAt: pr.approvedAt || null,
+      approvedBy: pr.approvedBy || null,
+      approvedByName: pr.approvedByName || null,
+      approvalNote: pr.approvalNote || null,
+      returnMotive: resolvedIcReturnMotive,
+      reason: pr.reason || pr.remarks || "Inter-Company Return",
+      notes: pr.remarks || "",
+      customerId: customer,
+      customerName: customer.name || originName,
+      customerGst: customer.gstNumber || originGst,
+      branch: pr.branchId || null,
+      branchId: pr.shippingDetails?.destinationBranchId || pr.branchId,
+      originalInvoiceNo,
+      originalInvoiceId,
+      itemsCount: (pr.items || []).length,
+      totalUnits,
+    };
+  }
+
+  // 4. Map line items to full Sales Return format for Detail view
+  const mappedItems = (pr.items || []).map((it, idx) => {
+    let itemMotive = "general";
+    const srcBin = String(it.sourceBin || "").toUpperCase();
+    if (srcBin === "SCRAP_BROKEN" || srcBin.includes("BROKEN")) {
+      itemMotive = "broken";
+    } else if (srcBin === "SCRAP_EXPIRED" || srcBin.includes("EXPIRED")) {
+      itemMotive = "expired";
+    } else if (it.motive) {
+      itemMotive = String(it.motive).toLowerCase();
+    }
+    distinctIcMotives.add(itemMotive);
+
+    return {
+      _id: it._id || `item-${idx}`,
+      productId: it.productId,
+      productName: it.productName || "Product",
+      pack: it.pack || "",
+      batch: it.batchNo,
+      batchNo: it.batchNo,
+      expiry: it.expiry || "",
+      returnQty: it.returnQty,
+      quantity: it.returnQty,
+      rate: it.rate,
+      price: it.rate,
+      discount: it.discountPct || 0,
+      discountPct: it.discountPct || 0,
+      gstRate: it.gstPct || 0,
+      gstPct: it.gstPct || 0,
+      taxableAmount: it.taxableAmount,
+      tax: it.totalGst || 0,
+      totalGst: it.totalGst || 0,
+      total: it.totalAmount,
+      totalAmount: it.totalAmount,
+      sourceBin: it.sourceBin || "SELLABLE",
+      motive: itemMotive,
+      condition: itemMotive,
+      originalInvoiceNo: it.purchaseBillNo || originalInvoiceNo,
+      purchaseBillNo: it.purchaseBillNo || "",
+      subSupplierId: it.subSupplierId || (it.subSupplier?._id ? String(it.subSupplier._id) : null),
+      subSupplierName: it.subSupplierName || (it.subSupplier?.businessName || it.subSupplier?.name || ""),
+      subSupplierGst: it.subSupplierGst || (it.subSupplier?.gstNumber || ""),
+      boxNo: it.boxNo || it.packageNo || null,
+      boxLabel: it.boxLabel || null,
+    };
+  });
 
   return {
     _id: pr._id,
     returnNo: refNo,
     invoiceNo: refNo,
+    debitNoteNo: pr.debitNoteNo || pr.returnNo || refNo,
     isReturn: true,
     isInterCompany: true,
     isOriginalPurchaseReturn: true,
@@ -1422,12 +1532,21 @@ export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspac
     creditNoteNo: pr.creditNoteNo || refNo,
     creditNoteDate: pr.creditNoteDate || pr.returnDate,
     status: pr.status === "CONFIRMED" ? "Completed" : pr.status,
-    returnMotive: (pr.returnMotive || "sellable").toLowerCase(),
+    isApproved: Boolean(pr.isApproved),
+    approvedAt: pr.approvedAt || null,
+    approvedBy: pr.approvedBy || null,
+    approvedByName: pr.approvedByName || null,
+    approvalNote: pr.approvalNote || null,
+    returnMotive: resolvedIcReturnMotive,
     reason: pr.reason || pr.remarks || "Inter-Company Return",
     notes: pr.remarks || "",
     customerId: customer,
     customerName: customer.name || originName,
     customerGst: customer.gstNumber || originGst,
+    supplier: pr.supplier || null,
+    supplierId: pr.supplierId || null,
+    supplierName: pr.supplierName || (typeof pr.supplier === "object" ? pr.supplier?.businessName || pr.supplier?.name : null) || "",
+    supplierGst: pr.supplierGst || (typeof pr.supplier === "object" ? pr.supplier?.gstNumber : null) || "",
     originCompany: {
       _id: originCompany?._id || pr.companyId?._id || pr.companyId,
       name: originName,
@@ -1435,12 +1554,20 @@ export const projectPurchaseReturnToSalesReturn = async (pr, companyId, workspac
       gstin: originGst,
       code: originCompany?.code || "",
     },
+    companyId: pr.companyId || null,
+    branch: pr.branchId || null,
     branchId: pr.shippingDetails?.destinationBranchId || pr.branchId,
     originalInvoiceNo,
     originalInvoiceId,
     items: mappedItems,
     shippingDetails: pr.shippingDetails || {},
     ingestionDetails: pr.ingestionDetails || {},
+    scrapDetails: pr.scrapDetails || {
+      quarantined: false,
+      quarantinedAt: null,
+      quarantinedBy: null,
+      quarantinedBranchId: null,
+    },
   };
 };
 
@@ -1643,7 +1770,7 @@ const getAllCustomerReturns = async (companyId, workspaceId, filters = {}, pagin
 
   const query = { $and: andConditions };
 
-  const result = await salesReturnRepository.findSalesReturns(query, { page, limit });
+  const result = await salesReturnRepository.findSalesReturns(query, { page, limit, isSummary: true });
 
   // If no records found in dedicated sales_returns and first page, fallback to legacy SalesInvoice returns with matching query
   if (result.returns.length === 0 && page === 1) {
@@ -1752,6 +1879,9 @@ const getAllCustomerReturns = async (companyId, workspaceId, filters = {}, pagin
 
     const [legacyReturns, legacyTotal] = await Promise.all([
       SalesInvoice.find(legacyQuery)
+        .select(
+          "_id returnNo invoiceNo debitNoteNo originalInvoiceNo customerId branchId date createdAt grandTotal returnAmount returnType paymentMethod refundMethod status isApproved approvedAt approvedBy approvedByName approvalNote creditNoteNo creditNoteId billingMode isInterCompany"
+        )
         .populate("customerId", "name mobile phone customerCode gstNumber")
         .populate("doctorId", "name doctorCode specialty")
         .sort({ date: -1, createdAt: -1 })
@@ -1866,7 +1996,7 @@ const getAllCustomerReturns = async (companyId, workspaceId, filters = {}, pagin
 
       if (Array.isArray(icDocs) && icDocs.length > 0) {
         interCompanySalesReturns = await Promise.all(
-          icDocs.map((doc) => projectPurchaseReturnToSalesReturn(doc, companyId, workspaceId))
+          icDocs.map((doc) => projectPurchaseReturnToSalesReturn(doc, companyId, workspaceId, { isSummary: true }))
         );
       }
     }
@@ -1994,10 +2124,631 @@ const getReturnById = async (returnId, companyId, workspaceId) => {
   return returnDoc;
 };
 
+/**
+ * Ingest fresh / general return items directly into active shelf inventory (Stock Matrix)
+ * Works for both Inter-Company purchase returns and direct sales returns.
+ */
+const ingestFreshStockToStore = async (
+  returnId,
+  companyId,
+  targetBranchId,
+  workspaceId,
+  userId
+) => {
+  const isObjectId = mongoose.Types.ObjectId.isValid(returnId);
+  const prQuery = {
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    isDeleted: false,
+    ...(isObjectId
+      ? {
+          $or: [
+            { _id: new mongoose.Types.ObjectId(returnId) },
+            { returnNo: returnId },
+            { debitNoteNo: returnId },
+            { creditNoteNo: returnId },
+          ],
+        }
+      : {
+          $or: [
+            { returnNo: returnId },
+            { debitNoteNo: returnId },
+            { creditNoteNo: returnId },
+          ],
+        }),
+  };
+
+  const prDoc = await PurchaseReturn.findOne(prQuery);
+
+  if (prDoc) {
+    const { default: purchaseReturnService } = await import(
+      "../../../catalog/purchase-returns/services/purchaseReturn.service.js"
+    );
+    const updatedPr = await purchaseReturnService.ingestFreshStockToStore(
+      prDoc._id,
+      companyId,
+      targetBranchId,
+      workspaceId,
+      userId
+    );
+    return await projectPurchaseReturnToSalesReturn(updatedPr, companyId, workspaceId);
+  }
+
+  // Otherwise check SalesReturn collection
+  const srQuery = {
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    companyId: new mongoose.Types.ObjectId(companyId),
+    isDeleted: false,
+    ...(isObjectId
+      ? {
+          $or: [
+            { _id: new mongoose.Types.ObjectId(returnId) },
+            { returnNo: returnId },
+            { invoiceNo: returnId },
+          ],
+        }
+      : {
+          $or: [
+            { returnNo: returnId },
+            { invoiceNo: returnId },
+          ],
+        }),
+  };
+
+  const salesReturn = await SalesReturn.findOne(srQuery);
+
+  if (!salesReturn) {
+    throw new ApiError(404, "Return record not found for stock ingestion");
+  }
+
+  if (salesReturn.ingestionDetails?.ingestedToStore) {
+    throw new ApiError(400, "This return has already been ingested into store inventory");
+  }
+
+  // Ingestion of fresh/damaged/expired stock is only allowed after the return is approved
+  if (!salesReturn.isApproved && salesReturn.status !== "Approved") {
+    throw new ApiError(400, "Sales return must be approved before stock can be ingested into store inventory");
+  }
+
+  const resolvedBranchId = targetBranchId || salesReturn.branchId;
+
+  if (!resolvedBranchId) {
+    throw new ApiError(400, "Target store facility is required for ingestion");
+  }
+
+  const branchObjId = new mongoose.Types.ObjectId(resolvedBranchId);
+  const workspaceObjId = new mongoose.Types.ObjectId(workspaceId);
+
+  // Filter fresh general items
+  const freshItems = (salesReturn.items || []).filter((item) => {
+    const motive = String(
+      item.motive || item.condition || salesReturn.returnMotive || "general"
+    ).toLowerCase();
+    const isBroken = motive === "broken" || motive.includes("damag");
+    const isExpired = motive === "expired" || motive.includes("expir");
+    return !isBroken && !isExpired;
+  });
+
+  if (freshItems.length === 0) {
+    throw new ApiError(
+      400,
+      "No fresh general items found in this sales return eligible for shelf inventory ingestion"
+    );
+  }
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    for (const item of freshItems) {
+      const cleanBatchNo = String(
+        item.batch || item.batchNo || item.batchNumber || ""
+      ).replace(/\s*\[.*?\]\s*/g, "").trim();
+
+      const productObjId = new mongoose.Types.ObjectId(
+        item.productId || item.product || item.id
+      );
+      const qtyToIngest = Math.max(0, Number(item.qty || item.quantity || item.returnQty || 0));
+
+      if (qtyToIngest <= 0) continue;
+
+      // 1. Find or create sellable shelf batch in target branch
+      let shelfBatch = await Batch.findOne({
+        workspaceId: workspaceObjId,
+        branch_id: branchObjId,
+        product: productObjId,
+        batchNo: cleanBatchNo,
+        scrapType: { $in: ["NONE", null] },
+        isDeleted: false,
+      }).session(session);
+
+      if (shelfBatch) {
+        shelfBatch.batchQty = (Number(shelfBatch.batchQty) || 0) + qtyToIngest;
+        shelfBatch.isDeleted = false;
+        await shelfBatch.save({ session });
+      } else {
+        shelfBatch = new Batch({
+          workspaceId: workspaceObjId,
+          branch_id: branchObjId,
+          product: productObjId,
+          batchNo: cleanBatchNo,
+          originalBatchNo: cleanBatchNo,
+          scrapType: "NONE",
+          batchQty: qtyToIngest,
+          scrapQty: 0,
+          brokenQty: 0,
+          expiredQty: 0,
+          isIncoming: false,
+          mrp: Number(item.mrp || item.price || item.rate || 0),
+          MRP: Number(item.mrp || item.price || item.rate || 0),
+          rate: Number(item.rate || item.price || 0),
+          expiryDate: item.expiry || item.expDate || "",
+        });
+        await shelfBatch.save({ session });
+      }
+
+      // 2. Increment ProductFacility active inventory
+      let facility = await ProductFacility.findOne({
+        workspaceId: workspaceObjId,
+        facility_id: branchObjId,
+        product_id: productObjId,
+      }).session(session);
+
+      if (facility) {
+        facility.total_qty_available = (Number(facility.total_qty_available) || 0) + qtyToIngest;
+        facility.qoh = (Number(facility.qoh) || 0) + qtyToIngest;
+        facility.atp = (Number(facility.atp) || 0) + qtyToIngest;
+        await facility.save({ session });
+      } else {
+        facility = new ProductFacility({
+          workspaceId: workspaceObjId,
+          facility_id: branchObjId,
+          product_id: productObjId,
+          total_qty_available: qtyToIngest,
+          qoh: qtyToIngest,
+          atp: qtyToIngest,
+          scrapQty: 0,
+        });
+        await facility.save({ session });
+      }
+    }
+
+    salesReturn.ingestionDetails = {
+      ingestedToStore: true,
+      ingestedAt: new Date(),
+      ingestedBy: userId || null,
+      ingestedBranchId: branchObjId,
+    };
+    await salesReturn.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    return await getReturnById(salesReturn._id, companyId, workspaceId);
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    throw err;
+  }
+};
+
+/**
+ * Quarantine damaged and expired return items into the target facility's scrap bin
+ * Sets isIncoming: true with box reference so it displays with the 📦 badge in the scrap bin.
+ */
+const quarantineScrapToStore = async (
+  returnId,
+  companyId,
+  targetBranchId,
+  workspaceId,
+  userId
+) => {
+  const isObjectId = mongoose.Types.ObjectId.isValid(returnId);
+  const prQuery = {
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    isDeleted: false,
+    ...(isObjectId
+      ? {
+          $or: [
+            { _id: new mongoose.Types.ObjectId(returnId) },
+            { returnNo: returnId },
+            { debitNoteNo: returnId },
+            { creditNoteNo: returnId },
+          ],
+        }
+      : {
+          $or: [
+            { returnNo: returnId },
+            { debitNoteNo: returnId },
+            { creditNoteNo: returnId },
+          ],
+        }),
+  };
+
+  const prDoc = await PurchaseReturn.findOne(prQuery);
+
+  if (prDoc) {
+    const { default: purchaseReturnService } = await import(
+      "../../../catalog/purchase-returns/services/purchaseReturn.service.js"
+    );
+    const updatedPr = await purchaseReturnService.quarantineScrapToStore(
+      prDoc._id,
+      companyId,
+      targetBranchId,
+      workspaceId,
+      userId
+    );
+    return await projectPurchaseReturnToSalesReturn(updatedPr, companyId, workspaceId);
+  }
+
+  // Otherwise check SalesReturn collection
+  const srQuery = {
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    companyId: new mongoose.Types.ObjectId(companyId),
+    isDeleted: false,
+    ...(isObjectId
+      ? {
+          $or: [
+            { _id: new mongoose.Types.ObjectId(returnId) },
+            { returnNo: returnId },
+            { invoiceNo: returnId },
+          ],
+        }
+      : {
+          $or: [
+            { returnNo: returnId },
+            { invoiceNo: returnId },
+          ],
+        }),
+  };
+
+  const salesReturn = await SalesReturn.findOne(srQuery);
+
+  if (!salesReturn) {
+    throw new ApiError(404, "Return record not found for scrap quarantine");
+  }
+
+  if (salesReturn.scrapDetails?.quarantined) {
+    throw new ApiError(
+      400,
+      "Damaged and expired items have already been quarantined to scrap bin"
+    );
+  }
+
+  // Quarantine of broken/expired stock is only allowed after the return is approved
+  if (!salesReturn.isApproved && salesReturn.status !== "Approved") {
+    throw new ApiError(400, "Sales return must be approved before damaged/expired stock can be quarantined to scrap bin");
+  }
+
+  const resolvedBranchId = targetBranchId || salesReturn.branchId;
+
+  if (!resolvedBranchId) {
+    throw new ApiError(400, "Target store facility is required for scrap quarantine");
+  }
+
+  const branchObjId = new mongoose.Types.ObjectId(resolvedBranchId);
+  const workspaceObjId = new mongoose.Types.ObjectId(workspaceId);
+
+  // Filter broken and expired items
+  const scrapItems = (salesReturn.items || []).filter((item) => {
+    const motive = String(
+      item.motive || item.condition || salesReturn.returnMotive || "general"
+    ).toLowerCase();
+    return (
+      motive === "broken" ||
+      motive.includes("damag") ||
+      motive === "expired" ||
+      motive.includes("expir")
+    );
+  });
+
+  if (scrapItems.length === 0) {
+    throw new ApiError(
+      400,
+      "No damaged or expired items found in this return eligible for scrap bin quarantine"
+    );
+  }
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    for (const item of scrapItems) {
+      const cleanBatchNo = String(
+        item.batch || item.batchNo || item.batchNumber || ""
+      ).replace(/\s*\[.*?\]\s*/g, "").trim();
+
+      const productObjId = new mongoose.Types.ObjectId(
+        item.productId || item.product || item.id
+      );
+      const qtyToQuarantine = Math.max(
+        0,
+        Number(item.qty || item.quantity || item.returnQty || 0)
+      );
+
+      if (qtyToQuarantine <= 0) continue;
+
+      const motive = String(
+        item.motive || item.condition || salesReturn.returnMotive || "broken"
+      ).toLowerCase();
+      const isBroken = motive === "broken" || motive.includes("damag");
+      const resolvedScrapType = isBroken ? "BROKEN" : "EXPIRED";
+      const targetBatchNo = `${cleanBatchNo} [${resolvedScrapType}]`;
+
+      // 1. Find or create quarantine scrap batch in target branch
+      let scrapBatch = await Batch.findOne({
+        workspaceId: workspaceObjId,
+        branch_id: branchObjId,
+        product: productObjId,
+        batchNo: targetBatchNo,
+      }).session(session);
+
+      if (scrapBatch) {
+        scrapBatch.scrapQty = (Number(scrapBatch.scrapQty) || 0) + qtyToQuarantine;
+        if (resolvedScrapType === "BROKEN") {
+          scrapBatch.brokenQty = (Number(scrapBatch.brokenQty) || 0) + qtyToQuarantine;
+        } else {
+          scrapBatch.expiredQty = (Number(scrapBatch.expiredQty) || 0) + qtyToQuarantine;
+        }
+        scrapBatch.scrapType = resolvedScrapType;
+        scrapBatch.isIncoming = true;
+        scrapBatch.sourceBranchId = salesReturn.branchId;
+        scrapBatch.sourceCompanyId = salesReturn.companyId;
+        scrapBatch.sourceTransferOrderNo = salesReturn.returnNo || salesReturn.invoiceNo;
+        scrapBatch.isDeleted = false;
+        await scrapBatch.save({ session });
+      } else {
+        scrapBatch = new Batch({
+          workspaceId: workspaceObjId,
+          branch_id: branchObjId,
+          product: productObjId,
+          batchNo: targetBatchNo,
+          originalBatchNo: cleanBatchNo,
+          scrapType: resolvedScrapType,
+          batchQty: 0,
+          scrapQty: qtyToQuarantine,
+          brokenQty: resolvedScrapType === "BROKEN" ? qtyToQuarantine : 0,
+          expiredQty: resolvedScrapType === "EXPIRED" ? qtyToQuarantine : 0,
+          isIncoming: true,
+          sourceBranchId: salesReturn.branchId,
+          sourceCompanyId: salesReturn.companyId,
+          sourceTransferOrderNo: salesReturn.returnNo || salesReturn.invoiceNo,
+          mrp: Number(item.mrp || item.price || item.rate || 0),
+          MRP: Number(item.mrp || item.price || item.rate || 0),
+          rate: Number(item.rate || item.price || 0),
+          expiryDate: item.expiry || item.expDate || "",
+        });
+        await scrapBatch.save({ session });
+      }
+
+      // 2. Increment ProductFacility scrap inventory
+      let facility = await ProductFacility.findOne({
+        workspaceId: workspaceObjId,
+        facility_id: branchObjId,
+        product_id: productObjId,
+      }).session(session);
+
+      if (facility) {
+        facility.scrapQty = (Number(facility.scrapQty) || 0) + qtyToQuarantine;
+        if (resolvedScrapType === "BROKEN") {
+          facility.brokenQty = (Number(facility.brokenQty) || 0) + qtyToQuarantine;
+        } else {
+          facility.expiredQty = (Number(facility.expiredQty) || 0) + qtyToQuarantine;
+        }
+        await facility.save({ session });
+      } else {
+        facility = new ProductFacility({
+          workspaceId: workspaceObjId,
+          facility_id: branchObjId,
+          product_id: productObjId,
+          total_qty_available: 0,
+          qoh: 0,
+          atp: 0,
+          scrapQty: qtyToQuarantine,
+          brokenQty: resolvedScrapType === "BROKEN" ? qtyToQuarantine : 0,
+          expiredQty: resolvedScrapType === "EXPIRED" ? qtyToQuarantine : 0,
+        });
+        await facility.save({ session });
+      }
+    }
+
+    salesReturn.scrapDetails = {
+      quarantined: true,
+      quarantinedAt: new Date(),
+      quarantinedBy: userId || null,
+      quarantinedBranchId: branchObjId,
+    };
+    await salesReturn.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    return await getReturnById(salesReturn._id, companyId, workspaceId);
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    throw err;
+  }
+};
+
+/**
+ * Approve a sales return (or inter-company return) and synchronize approval note and status to the associated credit note
+ */
+const approveSalesReturn = async (returnId, { note = "" } = {}, user, companyId, workspaceId) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const isObjectId = mongoose.Types.ObjectId.isValid(returnId);
+    const trimmedNote = typeof note === "string" ? note.trim() : "";
+    const approvedAt = new Date();
+    const approvedBy = user?._id || user?.id || null;
+    const approvedByName = user?.fullName || user?.name || "Store Manager";
+
+    // 1. Try finding in dedicated SalesReturn
+    let salesReturn = await SalesReturn.findOne({
+      workspaceId: new mongoose.Types.ObjectId(workspaceId),
+      companyId: new mongoose.Types.ObjectId(companyId),
+      isDeleted: false,
+      ...(isObjectId
+        ? { $or: [{ _id: new mongoose.Types.ObjectId(returnId) }, { returnNo: returnId }, { invoiceNo: returnId }] }
+        : { $or: [{ returnNo: returnId }, { invoiceNo: returnId }] }),
+    }).session(session);
+
+    let purchaseReturnDoc = null;
+
+    if (!salesReturn) {
+      // Check legacy SalesInvoice return
+      const legacyReturn = await SalesInvoice.findOne({
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        companyId: new mongoose.Types.ObjectId(companyId),
+        isReturn: true,
+        isDeleted: false,
+        ...(isObjectId
+          ? { $or: [{ _id: new mongoose.Types.ObjectId(returnId) }, { invoiceNo: returnId }] }
+          : { invoiceNo: returnId }),
+      }).session(session);
+
+      if (legacyReturn) {
+        legacyReturn.status = "Approved";
+        if (trimmedNote) {
+          legacyReturn.notes = legacyReturn.notes
+            ? `${legacyReturn.notes}\n[Approved]: ${trimmedNote}`
+            : `[Approved]: ${trimmedNote}`;
+        }
+        await legacyReturn.save({ session });
+      } else {
+        // Check incoming Inter-Company PurchaseReturn
+        purchaseReturnDoc = await PurchaseReturn.findOne({
+          workspaceId: new mongoose.Types.ObjectId(workspaceId),
+          "shippingDetails.destinationCompanyId": new mongoose.Types.ObjectId(companyId),
+          companyId: { $ne: new mongoose.Types.ObjectId(companyId) },
+          isDeleted: false,
+          ...(isObjectId
+            ? {
+                $or: [
+                  { _id: new mongoose.Types.ObjectId(returnId) },
+                  { returnNo: returnId },
+                  { debitNoteNo: returnId },
+                  { creditNoteNo: returnId },
+                ],
+              }
+            : {
+                $or: [
+                  { returnNo: returnId },
+                  { debitNoteNo: returnId },
+                  { creditNoteNo: returnId },
+                ],
+              }),
+        }).session(session);
+
+        if (purchaseReturnDoc) {
+          purchaseReturnDoc.isApproved = true;
+          purchaseReturnDoc.approvedAt = approvedAt;
+          purchaseReturnDoc.approvedBy = approvedBy;
+          purchaseReturnDoc.approvedByName = approvedByName;
+          purchaseReturnDoc.approvalNote = trimmedNote;
+          if (trimmedNote) {
+            purchaseReturnDoc.remarks = purchaseReturnDoc.remarks
+              ? `${purchaseReturnDoc.remarks}\n[Approved]: ${trimmedNote}`
+              : `[Approved]: ${trimmedNote}`;
+          }
+          await purchaseReturnDoc.save({ session });
+        }
+      }
+    }
+
+    if (!salesReturn && !purchaseReturnDoc) {
+      throw new ApiError(404, "Sales return record not found");
+    }
+
+    if (salesReturn) {
+      salesReturn.isApproved = true;
+      salesReturn.approvedAt = approvedAt;
+      salesReturn.approvedBy = approvedBy;
+      salesReturn.approvedByName = approvedByName;
+      salesReturn.approvalNote = trimmedNote;
+      salesReturn.status = "Approved";
+      await salesReturn.save({ session });
+    }
+
+    // 2. Reflect Note and Approved in the Credit Note
+    const candidateCreditNoteIds = [];
+    const candidateCreditNoteNos = [];
+    const candidateSourceReturnNos = [];
+
+    if (salesReturn?.creditNoteId) candidateCreditNoteIds.push(salesReturn.creditNoteId);
+    if (salesReturn?.creditNoteNo) candidateCreditNoteNos.push(salesReturn.creditNoteNo);
+    if (purchaseReturnDoc?.creditNoteNo) candidateCreditNoteNos.push(purchaseReturnDoc.creditNoteNo);
+
+    if (salesReturn?.returnNo) candidateSourceReturnNos.push(salesReturn.returnNo);
+    if (salesReturn?.invoiceNo) candidateSourceReturnNos.push(salesReturn.invoiceNo);
+    if (purchaseReturnDoc?.returnNo) candidateSourceReturnNos.push(purchaseReturnDoc.returnNo);
+    if (purchaseReturnDoc?.debitNoteNo) candidateSourceReturnNos.push(purchaseReturnDoc.debitNoteNo);
+
+    const cnOrConditions = [];
+    if (candidateCreditNoteIds.length > 0) {
+      cnOrConditions.push({ _id: { $in: candidateCreditNoteIds } });
+    }
+    if (candidateCreditNoteNos.length > 0) {
+      cnOrConditions.push({ creditNoteNo: { $in: candidateCreditNoteNos } });
+    }
+    if (salesReturn?._id) {
+      cnOrConditions.push({ sourceReturnId: salesReturn._id });
+    }
+    if (purchaseReturnDoc?._id) {
+      cnOrConditions.push({ sourceReturnId: purchaseReturnDoc._id });
+    }
+    if (candidateSourceReturnNos.length > 0) {
+      cnOrConditions.push({ sourceReturnNo: { $in: candidateSourceReturnNos } });
+    }
+
+    if (cnOrConditions.length > 0) {
+      const linkedCreditNotes = await CreditNote.find({
+        workspaceId: new mongoose.Types.ObjectId(workspaceId),
+        isDeleted: false,
+        $or: cnOrConditions,
+      }).session(session);
+
+      for (const cn of linkedCreditNotes) {
+        cn.isApproved = true;
+        cn.approvedAt = approvedAt;
+        cn.approvedBy = approvedBy;
+        cn.approvedByName = approvedByName;
+        cn.approvalNote = trimmedNote;
+        if (trimmedNote) {
+          cn.notes = cn.notes
+            ? `${cn.notes}\n[Approved]: ${trimmedNote}`
+            : `[Approved]: ${trimmedNote}`;
+        }
+        if (
+          cn.status !== CREDIT_NOTE_STATUS.CANCELLED &&
+          cn.status !== CREDIT_NOTE_STATUS.EXPIRED &&
+          cn.status !== CREDIT_NOTE_STATUS.FULLY_REDEEMED
+        ) {
+          cn.status = CREDIT_NOTE_STATUS.APPROVED;
+        }
+        await cn.save({ session });
+      }
+    }
+
+    await session.commitTransaction();
+    session.endSession();
+
+    return await getReturnById(returnId, companyId, workspaceId);
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    throw err;
+  }
+};
+
 export default {
   recordCustomerReturn,
   getNextReturnNumber,
   getAllCustomerReturns,
   getReturnById,
   projectPurchaseReturnToSalesReturn,
+  ingestFreshStockToStore,
+  quarantineScrapToStore,
+  approveSalesReturn,
 };

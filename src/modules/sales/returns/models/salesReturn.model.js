@@ -172,9 +172,33 @@ const salesReturnSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["Completed", "Draft", "Cancelled"],
+      enum: ["Completed", "Draft", "Cancelled", "Approved"],
       default: "Completed",
       index: true,
+    },
+    isApproved: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    approvedAt: {
+      type: Date,
+      default: null,
+    },
+    approvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    approvedByName: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    approvalNote: {
+      type: String,
+      default: null,
+      trim: true,
     },
     advanceTransactionId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -202,6 +226,48 @@ const salesReturnSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "GstLedgerEntry",
       default: null,
+    },
+    ingestionDetails: {
+      ingestedToStore: {
+        type: Boolean,
+        default: false,
+        index: true,
+      },
+      ingestedAt: {
+        type: Date,
+        default: null,
+      },
+      ingestedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        default: null,
+      },
+      ingestedBranchId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Branch",
+        default: null,
+      },
+    },
+    scrapDetails: {
+      quarantined: {
+        type: Boolean,
+        default: false,
+        index: true,
+      },
+      quarantinedAt: {
+        type: Date,
+        default: null,
+      },
+      quarantinedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        default: null,
+      },
+      quarantinedBranchId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Branch",
+        default: null,
+      },
     },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,

@@ -211,9 +211,9 @@ export const importWorkspaceProductsGst = asyncHandler(async (req, res) => {
 });
 
 export const getProductFacilityBatchesByQueryV2 = asyncHandler(async (req, res) => {
-  let { page = 1, limit = 10, filters = {}, search = "" } = req.body;
-  page = Number(page);
-  limit = Number(limit);
+  let { page = 1, limit = 10, filters = {}, search = "" } = req.body || {};
+  page = Math.max(1, parseInt(page, 10) || 1);
+  limit = Math.max(1, parseInt(limit, 10) || 10);
 
   const {
     product,
@@ -343,6 +343,109 @@ export const getProductFacilityBatchesByQueryV2 = asyncHandler(async (req, res) 
       if (unmaterializedReceivedReturns && unmaterializedReceivedReturns.length > 0) {
         for (const ret of unmaterializedReceivedReturns) {
           await purchaseReturnService.materializeConsignmentBatches(ret);
+        }
+      }
+
+      // Self-healing: ensure any quarantined or received returns have their scrap batches materialized into target branches
+      const scrapReturnsToHeal = await PurchaseReturn.find({
+        workspaceId: req.workspaceId,
+        $or: [
+          { "scrapDetails.quarantinedBranchId": { $in: targetBranchIds } },
+          { "shippingDetails.destinationBranchId": { $in: targetBranchIds } },
+          {
+            $and: [
+              { "scrapDetails.quarantined": true },
+              ...(extractedCompanyId ? [{ "shippingDetails.destinationCompanyId": extractedCompanyId }] : []),
+            ],
+          },
+        ],
+        isDeleted: false,
+      });
+
+      for (const ret of scrapReturnsToHeal) {
+        const destBranch =
+          ret.scrapDetails?.quarantinedBranchId ||
+          ret.shippingDetails?.destinationBranchId ||
+          targetBranchIds[0];
+
+        const scrapItems = (ret.items || []).filter((item) => {
+          const isBroken =
+            item.sourceBin === "SCRAP_BROKEN" ||
+            ret.returnMotive === "BROKEN" ||
+            (item.batchNo && item.batchNo.includes("[BROKEN]")) ||
+            item.motive === "broken" ||
+            item.condition === "broken" ||
+            String(item.condition || "").includes("damag");
+          const isExpired =
+            item.sourceBin === "SCRAP_EXPIRED" ||
+            ret.returnMotive === "EXPIRED" ||
+            (item.batchNo && item.batchNo.includes("[EXPIRED]")) ||
+            item.motive === "expired" ||
+            item.condition === "expired" ||
+            String(item.condition || "").includes("expir");
+          return isBroken || isExpired;
+        });
+
+        for (const item of scrapItems) {
+          const cleanBatchNo = String(item.batchNo || "").replace(/\s*\[.*?\]\s*/g, "").trim();
+          const isBroken =
+            item.sourceBin === "SCRAP_BROKEN" ||
+            ret.returnMotive === "BROKEN" ||
+            (item.batchNo && item.batchNo.includes("[BROKEN]")) ||
+            item.motive === "broken" ||
+            item.condition === "broken" ||
+            String(item.condition || "").includes("damag");
+          const resolvedScrapType = isBroken ? "BROKEN" : "EXPIRED";
+          const targetBatchNo = `${cleanBatchNo} [${resolvedScrapType}]`;
+
+          const existingBatch = await Batch.findOne({
+            workspaceId: req.workspaceId,
+            branch_id: { $in: targetBranchIds },
+            product: item.productId,
+            batchNo: targetBatchNo,
+          });
+
+          if (!existingBatch) {
+            const qty = Math.max(0, Number(item.returnQty || item.qty || 0));
+            if (qty > 0) {
+              const newScrapBatch = new Batch({
+                workspaceId: req.workspaceId,
+                branch_id: destBranch,
+                product: item.productId,
+                batchNo: targetBatchNo,
+                originalBatchNo: cleanBatchNo,
+                scrapType: resolvedScrapType,
+                batchQty: 0,
+                scrapQty: qty,
+                brokenQty: isBroken ? qty : 0,
+                expiredQty: !isBroken ? qty : 0,
+                isIncoming: true,
+                sourceBranchId: ret.branchId,
+                sourceCompanyId: ret.companyId,
+                sourceConsignmentId: ret._id,
+                sourceTransferOrderNo: ret.debitNoteNo || ret.returnNo,
+                expiryDate: item.expiry || "",
+                mrp: item.mrp || 0,
+                rate: item.rate || 0,
+              });
+              await newScrapBatch.save();
+
+              await ProductFacility.updateOne(
+                {
+                  workspaceId: req.workspaceId,
+                  facility_id: destBranch,
+                  product_id: item.productId,
+                },
+                {
+                  $inc: {
+                    scrapQty: qty,
+                    ...(isBroken ? { brokenQty: qty } : { expiredQty: qty }),
+                  },
+                },
+                { upsert: true }
+              );
+            }
+          }
         }
       }
 
@@ -650,9 +753,9 @@ export const getProductFacilityBatchesByQueryV2 = asyncHandler(async (req, res) 
     };
   });
 
-  // 5. Aggregate tab counts for expired/scrap registers
+  // 5. Aggregate tab counts for expired/scrap registers (only computed if explicitly requested via includeCounts: true)
   let counts = null;
-  if (motive !== undefined || scrapOnly || expiredOnly) {
+  if (req.body?.includeCounts) {
     const baseScope = {
       workspaceId: req.workspaceId,
       isDeleted: false,
@@ -668,7 +771,7 @@ export const getProductFacilityBatchesByQueryV2 = asyncHandler(async (req, res) 
       }
     }
 
-    const [totalScrapBin, totalShelfExpired, totalScrapExpired, totalBroken, totalFreshReturn] = await Promise.all([
+    const [totalScrapBin, totalShelfExpired, totalScrapExpired, totalBroken] = await Promise.all([
       Batch.countDocuments({
         ...baseScope,
         $or: [{ scrapQty: { $gt: 0 } }, { brokenQty: { $gt: 0 } }, { expiredQty: { $gt: 0 } }],
@@ -686,13 +789,6 @@ export const getProductFacilityBatchesByQueryV2 = asyncHandler(async (req, res) 
         ...baseScope,
         brokenQty: { $gt: 0 },
       }),
-      Batch.countDocuments({
-        ...baseScope,
-        $or: [
-          { scrapType: { $in: ["FRESH_RETURN", "SCRAP"] } },
-          { batchNo: { $regex: /\[(FRESH_RETURN|SCRAP)\]/i } },
-        ],
-      }),
     ]);
 
     counts = {
@@ -700,7 +796,6 @@ export const getProductFacilityBatchesByQueryV2 = asyncHandler(async (req, res) 
       shelfExpired: totalShelfExpired,
       scrapExpired: totalScrapExpired,
       broken: totalBroken,
-      freshReturn: totalFreshReturn,
     };
   }
 

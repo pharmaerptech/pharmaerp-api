@@ -292,7 +292,7 @@ export const redeemCreditNotesForInvoice = async (
         _id: cnId,
         customerId: customer._id,
         isDeleted: false,
-        status: { $in: [CREDIT_NOTE_STATUS.ACTIVE, CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED] },
+        status: { $in: [CREDIT_NOTE_STATUS.ACTIVE, CREDIT_NOTE_STATUS.APPROVED, CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED] },
         balanceAmount: { $gte: reqAmt - 0.01 },
       }).session(session);
 
@@ -698,7 +698,9 @@ export const getCustomerCreditNotes = async (customerId, companyId, workspaceId)
 
   const activeNotes = creditNotes.filter(
     (cn) =>
-      (cn.status === CREDIT_NOTE_STATUS.ACTIVE || cn.status === CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED) &&
+      (cn.status === CREDIT_NOTE_STATUS.ACTIVE ||
+        cn.status === CREDIT_NOTE_STATUS.APPROVED ||
+        cn.status === CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED) &&
       cn.balanceAmount > 0
   );
 
@@ -786,7 +788,16 @@ export const getCreditNoteSummaryStats = async (companyId, workspaceId, branchId
         totalActiveBalance: {
           $sum: {
             $cond: [
-              { $in: ["$status", [CREDIT_NOTE_STATUS.ACTIVE, CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED]] },
+              {
+                $in: [
+                  "$status",
+                  [
+                    CREDIT_NOTE_STATUS.ACTIVE,
+                    CREDIT_NOTE_STATUS.APPROVED,
+                    CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED,
+                  ],
+                ],
+              },
               "$balanceAmount",
               0,
             ],
@@ -795,7 +806,16 @@ export const getCreditNoteSummaryStats = async (companyId, workspaceId, branchId
         activeCount: {
           $sum: {
             $cond: [
-              { $in: ["$status", [CREDIT_NOTE_STATUS.ACTIVE, CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED]] },
+              {
+                $in: [
+                  "$status",
+                  [
+                    CREDIT_NOTE_STATUS.ACTIVE,
+                    CREDIT_NOTE_STATUS.APPROVED,
+                    CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED,
+                  ],
+                ],
+              },
               1,
               0,
             ],

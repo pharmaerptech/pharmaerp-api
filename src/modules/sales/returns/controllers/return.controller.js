@@ -92,9 +92,78 @@ export const getReturnById = asyncHandler(async (req, res) => {
     .json(new ApiResponse(200, "Return record fetched successfully", result));
 });
 
+export const ingestFreshStockToStore = asyncHandler(async (req, res) => {
+  const branchId =
+    req.body?.branchId ||
+    req.headers["x-branch-id"] ||
+    req.branchId ||
+    req.user?.branch_id;
+
+  const result = await returnService.ingestFreshStockToStore(
+    req.params.returnId,
+    req.companyId,
+    branchId,
+    req.workspaceId,
+    req.user?._id
+  );
+
+  return res
+    .status(200)
+    .json(
+      new ApiResponse(
+        200,
+        "Fresh return stock ingested into store shelf inventory successfully",
+        result
+      )
+    );
+});
+
+export const quarantineScrapToStore = asyncHandler(async (req, res) => {
+  const branchId =
+    req.body?.branchId ||
+    req.headers["x-branch-id"] ||
+    req.branchId ||
+    req.user?.branch_id;
+
+  const result = await returnService.quarantineScrapToStore(
+    req.params.returnId,
+    req.companyId,
+    branchId,
+    req.workspaceId,
+    req.user?._id
+  );
+
+  return res
+    .status(200)
+    .json(
+      new ApiResponse(
+        200,
+        "Damaged and expired return stock quarantined into scrap bin successfully",
+        result
+      )
+    );
+});
+
+export const approveSalesReturn = asyncHandler(async (req, res) => {
+  const result = await returnService.approveSalesReturn(
+    req.params.returnId,
+    { note: req.body?.note || req.body?.approvalNote || "" },
+    req.user,
+    req.companyId,
+    req.workspaceId
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, "Sales return approved successfully", result));
+});
+
 export default {
   recordCustomerReturn,
   getNextReturnNumber,
   getAllCustomerReturns,
   getReturnById,
+  ingestFreshStockToStore,
+  quarantineScrapToStore,
+  approveSalesReturn,
 };

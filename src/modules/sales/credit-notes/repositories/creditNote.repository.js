@@ -182,7 +182,7 @@ const findActiveCustomerCreditNotes = async (customerId, companyId, workspaceId,
     workspaceId: new mongoose.Types.ObjectId(workspaceId),
     companyId: new mongoose.Types.ObjectId(companyId),
     customerId: new mongoose.Types.ObjectId(customerId),
-    status: { $in: [CREDIT_NOTE_STATUS.ACTIVE, CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED] },
+    status: { $in: [CREDIT_NOTE_STATUS.ACTIVE, CREDIT_NOTE_STATUS.APPROVED, CREDIT_NOTE_STATUS.PARTIALLY_REDEEMED] },
     balanceAmount: { $gt: 0 },
     isDeleted: false,
   };

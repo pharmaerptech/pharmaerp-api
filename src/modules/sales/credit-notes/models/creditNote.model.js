@@ -254,6 +254,30 @@ const creditNoteSchema = new mongoose.Schema(
       default: null,
       trim: true,
     },
+    isApproved: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    approvedAt: {
+      type: Date,
+      default: null,
+    },
+    approvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    approvedByName: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    approvalNote: {
+      type: String,
+      default: null,
+      trim: true,
+    },
     cancelledAt: {
       type: Date,
       default: null,

@@ -273,6 +273,46 @@ const purchaseReturnSchema = new mongoose.Schema(
       },
     },
 
+    scrapDetails: {
+      quarantined: { type: Boolean, default: false, index: true },
+      quarantinedAt: { type: Date, default: null },
+      quarantinedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        default: null,
+      },
+      quarantinedBranchId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Branch",
+        default: null,
+      },
+    },
+
+    isApproved: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    approvedAt: {
+      type: Date,
+      default: null,
+    },
+    approvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    approvedByName: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    approvalNote: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

@@ -3406,6 +3406,237 @@ const ingestFreshStockToStore = async (
   }
 };
 
+/**
+ * Quarantine Broken & Expired items from an Inter-Company Debit Note into the target facility's Scrap Bin
+ */
+const quarantineScrapToStore = async (
+  returnId,
+  companyId,
+  targetBranchId,
+  workspaceId,
+  userId
+) => {
+  const returnDoc = await PurchaseReturn.findOne({
+    _id: returnId,
+    workspaceId: new mongoose.Types.ObjectId(workspaceId),
+    isDeleted: false,
+  });
+
+  if (!returnDoc) {
+    throw new ApiError(404, "Debit Note / Purchase Return record not found");
+  }
+
+  if (returnDoc.scrapDetails?.quarantined) {
+    throw new ApiError(400, "Damaged and expired items have already been quarantined to scrap bin");
+  }
+
+  const resolvedBranchId =
+    targetBranchId ||
+    returnDoc.shippingDetails?.destinationBranchId ||
+    returnDoc.branchId;
+
+  if (!resolvedBranchId) {
+    throw new ApiError(400, "Target store facility is required for scrap quarantine");
+  }
+
+  const branchObjId = new mongoose.Types.ObjectId(resolvedBranchId);
+  const workspaceObjId = new mongoose.Types.ObjectId(workspaceId);
+
+  // Filter broken and expired items
+  const scrapItems = (returnDoc.items || []).filter((item) => {
+    const isBroken =
+      item.sourceBin === "SCRAP_BROKEN" ||
+      returnDoc.returnMotive === "BROKEN" ||
+      (item.batchNo && item.batchNo.includes("[BROKEN]")) ||
+      item.motive === "broken" ||
+      item.condition === "broken" ||
+      String(item.condition || "").includes("damag");
+    const isExpired =
+      item.sourceBin === "SCRAP_EXPIRED" ||
+      returnDoc.returnMotive === "EXPIRED" ||
+      (item.batchNo && item.batchNo.includes("[EXPIRED]")) ||
+      item.motive === "expired" ||
+      item.condition === "expired" ||
+      String(item.condition || "").includes("expir");
+    return isBroken || isExpired;
+  });
+
+  if (scrapItems.length === 0) {
+    throw new ApiError(
+      400,
+      "No damaged or expired items found in this Debit Note eligible for scrap bin quarantine"
+    );
+  }
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    for (const item of scrapItems) {
+      const cleanBatchNo = stripBatchTags(item.batchNo);
+      const productObjId = new mongoose.Types.ObjectId(item.productId);
+      const qtyToQuarantine = Math.max(0, Number(item.returnQty || item.qty || 0));
+
+      if (qtyToQuarantine <= 0) continue;
+
+      const isBroken =
+        item.sourceBin === "SCRAP_BROKEN" ||
+        returnDoc.returnMotive === "BROKEN" ||
+        (item.batchNo && item.batchNo.includes("[BROKEN]")) ||
+        item.motive === "broken" ||
+        item.condition === "broken" ||
+        String(item.condition || "").includes("damag");
+      const resolvedScrapType = isBroken ? "BROKEN" : "EXPIRED";
+      const targetBatchNo = `${cleanBatchNo} [${resolvedScrapType}]`;
+
+      // Find source batch if any to copy rates/expiry/mrp
+      let sourceBatch = null;
+      try {
+        if (item.batchId) {
+          sourceBatch = await Batch.findById(item.batchId).session(session);
+        }
+        if (!sourceBatch) {
+          sourceBatch = await Batch.findOne({
+            workspaceId: workspaceObjId,
+            product: productObjId,
+            batchNo: item.batchNo,
+          }).session(session);
+        }
+      } catch {
+        // Non-blocking
+      }
+
+      const originalBatchNo = sourceBatch?.originalBatchNo || cleanBatchNo;
+      const resolvedExpiry = item.expiry || sourceBatch?.expiryDate || "";
+
+      // 1. Find or create quarantine scrap batch in target branch
+      let scrapBatch = await Batch.findOne({
+        workspaceId: workspaceObjId,
+        branch_id: branchObjId,
+        product: productObjId,
+        batchNo: targetBatchNo,
+      }).session(session);
+
+      if (scrapBatch) {
+        scrapBatch.scrapQty = (Number(scrapBatch.scrapQty) || 0) + qtyToQuarantine;
+        if (resolvedScrapType === "BROKEN") {
+          scrapBatch.brokenQty = (Number(scrapBatch.brokenQty) || 0) + qtyToQuarantine;
+        } else {
+          scrapBatch.expiredQty = (Number(scrapBatch.expiredQty) || 0) + qtyToQuarantine;
+        }
+        scrapBatch.scrapType = resolvedScrapType;
+        scrapBatch.originalBatchNo = originalBatchNo;
+        scrapBatch.isIncoming = true;
+        scrapBatch.sourceBranchId = returnDoc.branchId;
+        scrapBatch.sourceCompanyId = returnDoc.companyId;
+        scrapBatch.sourceConsignmentId = returnDoc._id;
+        scrapBatch.sourceTransferOrderNo = returnDoc.debitNoteNo || returnDoc.returnNo;
+        scrapBatch.isDeleted = false;
+        if (!scrapBatch.expiryDate && resolvedExpiry) {
+          scrapBatch.expiryDate = resolvedExpiry;
+        }
+        await scrapBatch.save({ session });
+      } else {
+        scrapBatch = new Batch({
+          workspaceId: workspaceObjId,
+          branch_id: branchObjId,
+          product: productObjId,
+          batchNo: targetBatchNo,
+          originalBatchNo,
+          scrapType: resolvedScrapType,
+          batchQty: 0,
+          scrapQty: qtyToQuarantine,
+          brokenQty: resolvedScrapType === "BROKEN" ? qtyToQuarantine : 0,
+          expiredQty: resolvedScrapType === "EXPIRED" ? qtyToQuarantine : 0,
+          isIncoming: true,
+          sourceBranchId: returnDoc.branchId,
+          sourceCompanyId: returnDoc.companyId,
+          sourceConsignmentId: returnDoc._id,
+          sourceTransferOrderNo: returnDoc.debitNoteNo || returnDoc.returnNo,
+          mrp: sourceBatch?.mrp || sourceBatch?.MRP || item.mrp || 0,
+          MRP: sourceBatch?.MRP || sourceBatch?.mrp || item.mrp || 0,
+          ptr: sourceBatch?.ptr || item.rate || 0,
+          pts: sourceBatch?.pts || 0,
+          rate: sourceBatch?.rate || item.rate || 0,
+          finalRateA: sourceBatch?.finalRateA || item.rate || 0,
+          finalRateB: sourceBatch?.finalRateB || 0,
+          finalRateC: sourceBatch?.finalRateC || 0,
+          rateA: sourceBatch?.rateA || item.rate || 0,
+          rateB: sourceBatch?.rateB || 0,
+          rateC: sourceBatch?.rateC || 0,
+          rateD: sourceBatch?.rateD || 0,
+          rateE: sourceBatch?.rateE || 0,
+          rateAPercentage: sourceBatch?.rateAPercentage || 0,
+          expiryDate: resolvedExpiry,
+        });
+        await scrapBatch.save({ session });
+      }
+
+      // 2. Increment ProductFacility scrap inventory
+      let facility = await ProductFacility.findOne({
+        workspaceId: workspaceObjId,
+        facility_id: branchObjId,
+        product_id: productObjId,
+      }).session(session);
+
+      if (facility) {
+        facility.scrapQty = (Number(facility.scrapQty) || 0) + qtyToQuarantine;
+        if (resolvedScrapType === "BROKEN") {
+          facility.brokenQty = (Number(facility.brokenQty) || 0) + qtyToQuarantine;
+        } else {
+          facility.expiredQty = (Number(facility.expiredQty) || 0) + qtyToQuarantine;
+        }
+        await facility.save({ session });
+      } else {
+        facility = new ProductFacility({
+          workspaceId: workspaceObjId,
+          facility_id: branchObjId,
+          product_id: productObjId,
+          total_qty_available: 0,
+          qoh: 0,
+          atp: 0,
+          scrapQty: qtyToQuarantine,
+          brokenQty: resolvedScrapType === "BROKEN" ? qtyToQuarantine : 0,
+          expiredQty: resolvedScrapType === "EXPIRED" ? qtyToQuarantine : 0,
+        });
+        await facility.save({ session });
+      }
+    }
+
+    // 3. Mark PurchaseReturn scrapDetails and shippingDetails
+    returnDoc.scrapDetails = {
+      quarantined: true,
+      quarantinedAt: new Date(),
+      quarantinedBy: userId || null,
+      quarantinedBranchId: branchObjId,
+    };
+    if (returnDoc.shippingDetails) {
+      if (!returnDoc.shippingDetails.destinationBranchId) {
+        returnDoc.shippingDetails.destinationBranchId = branchObjId;
+      }
+      returnDoc.shippingDetails.inventoryMaterialized = true;
+    }
+    await returnDoc.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    const updated = await PurchaseReturn.findById(returnDoc._id)
+      .populate("companyId", "name legalName")
+      .populate("branchId", "name branchCode address")
+      .populate("supplierId", "businessName gstNumber")
+      .populate("scrapDetails.quarantinedBranchId", "name branchCode")
+      .populate("scrapDetails.quarantinedBy", "name")
+      .lean();
+
+    return updated;
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    throw err;
+  }
+};
+
 const purchaseReturnService = {
   ensurePurchaseAccounts,
   getEligibleBatchesForReturn,
@@ -3417,6 +3648,7 @@ const purchaseReturnService = {
   syncPurchaseReturnLedger,
   receiveReturnBox,
   ingestFreshStockToStore,
+  quarantineScrapToStore,
   materializeConsignmentBatches,
   resolveOriginalPurchaseBillForDestination,
   resolveSubSupplierFromPurchaseBill,

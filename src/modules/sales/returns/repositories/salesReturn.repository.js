@@ -58,9 +58,18 @@ const findSalesReturns = async (query = {}, options = {}) => {
   const limit = Math.max(1, parseInt(options.limit, 10) || 50);
   const skip = (page - 1) * limit;
   const sort = options.sort || { date: -1, createdAt: -1 };
+  const isSummary = options.isSummary !== false;
+
+  let queryBuilder = SalesReturn.find(query);
+
+  if (isSummary) {
+    queryBuilder = queryBuilder.select(
+      "_id returnNo invoiceNo debitNoteNo originalInvoiceNo originalInvoiceId customerId doctorId branchId returnDate date createdAt updatedAt billingMode subtotal discount tax roundOff grandTotal returnAmount returnType paymentMethod refundMethod status isApproved approvedAt approvedBy approvedByName approvalNote creditNoteNo creditNoteId isInterCompany returnMotive reason notes"
+    );
+  }
 
   const [returns, total] = await Promise.all([
-    SalesReturn.find(query)
+    queryBuilder
       .populate("customerId", "name mobile phone customerCode gstNumber")
       .populate("doctorId", "name doctorCode specialty")
       .populate("branchId", "name branchCode")
